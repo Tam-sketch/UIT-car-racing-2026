@@ -50,20 +50,17 @@ Bật game sang chế độ Manual Mode. Khởi động file thu thập để l�
 python collect_data.py --scene snow_map --drive manual --max 1200
 ```
 
-**Bước 2: Auto-label & Đóng gói Data**
-Sử dụng công cụ nhận diện màu mặt đường để tự động tô viền (Mask). Sau đó đóng gói ra file ZIP.
+**Bước 2: Đóng gói ảnh thô (Raw Data)**
+Bỏ qua bước label thủ công tại máy tính. Do địa hình phức tạp, chúng ta sẽ đẩy thẳng toàn bộ ảnh thô lên Google Colab để dùng trí tuệ nhân tạo (SAM) label với độ chính xác tuyệt đối.
+Tại terminal, chạy lệnh nén thư mục ảnh gốc:
 ```bash
-# Label tự động (xoá label cũ nếu có)
-rm -rf /workspace/my_code/dataset/mask/snow_map/
-python auto_label.py --scene snow_map --mode snow
-
-# Đóng gói ZIP
-python prepare_dataset.py --scene snow_map
+cd /workspace/my_code/dataset/raw
+zip -r Raw_Snow_Map.zip snow_map/
 ```
 
-**Bước 3: Train trên Google Colab**
-1. Tải file `UCR2026_snow_map_Dataset.zip` lên thư mục `Train_UCR2026` trên Google Drive.
-2. Mở Colab (chọn GPU T4) và chạy script (Tham khảo file KNOWLEDGE_BASE.md hoặc WORKFLOW.md để lấy đoạn code mẫu chuẩn).
+**Bước 3: Auto-Label bằng SAM & Train trên Google Colab**
+1. Tải file `Raw_Snow_Map.zip` lên thư mục `Train_UCR2026` trên Google Drive.
+2. Mở Colab (chọn GPU T4) và chạy script tự động rải lưới SAM để label và train (Xem file `WORKFLOW.md` để lấy đoạn code chuẩn). Quá trình này sẽ mất khoảng 20 phút.
 
 **Bước 4: Thay thế Model**
 Tải file `best.pt` trên Drive về, chép đè vào thư mục `/workspace/my_code/Road_Seg_Model/modelYolo/weights/best3.pt` và chạy lại `maycay.py`.
