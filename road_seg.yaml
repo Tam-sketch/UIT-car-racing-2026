@@ -1,0 +1,7 @@
+# YOLO Road Segmentation Dataset Configuration
+path: /workspace/unet        # Đường dẫn gốc tới thư mục tập dữ liệu
+train: images/train          # Thư mục chứa ảnh RGB huấn luyện
+val: images/val              # Thư mục chứa ảnh RGB đánh giá
+
+names:
+  0: road                    # Lớp 0 tương ứng với mặt đường (road)

@@ -1,0 +1,12 @@
+# YOLO Traffic Sign Segmentation Dataset Configuration
+path: /workspace/signtrain   # Đường dẫn gốc tới thư mục tập dữ liệu biển báo
+
+train: images/train          # Thư mục chứa ảnh RGB huấn luyện
+val: images/val              # Thư mục chứa ảnh RGB đánh giá
+
+names:
+  0: di_thang                # Đi thẳng
+  1: re_trai                 # Rẽ trái
+  2: re_phai                 # Rẽ phải
+  3: cam_re_trai             # Cấm rẽ trái
+  4: cam_re_phai             # Cấm rẽ phải
