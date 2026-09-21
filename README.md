@@ -1,10 +1,9 @@
 # 🏎️ UIT CAR RACING 2026 - AUTONOMOUS DRIVING
 
-Dự án phát triển xe tự lái cho cuộc thi UIT Car Racing 2026. Phiên bản này đã được nâng cấp hoàn toàn để chạy mượt mà trên **Linux Native (Ubuntu/Docker)**, không còn phụ thuộc vào Windows hay WSL2, giải quyết dứt điểm các lỗi kết nối mạng.
-
+Dự án phát triển xe tự lái cho cuộc thi UIT Car Racing 2026. Phiên bản này đã được nâng cấp hoàn toàn để chạy mượt mà trên **Linux Native (Ubuntu/Docker)**
 ---
 
-## 🚀 Tính năng nổi bật của bản cập nhật (Tháng 9/2026)
+## 🚀 Tính năng
 
 - Hỗ trợ Native Linux Socket: Chạy thẳng game trên Linux không cần socat.
 - X11 Forwarding: Hỗ trợ hiển thị giao diện Camera (OpenCV) trực tiếp từ trong Docker ra màn hình host.
@@ -60,7 +59,7 @@ zip -r Raw_Snow_Map.zip snow_map/
 
 **Bước 3: Auto-Label bằng SAM & Train trên Google Colab**
 1. Tải file `Raw_Snow_Map.zip` lên thư mục `Train_UCR2026` trên Google Drive.
-2. Mở Colab (chọn GPU T4) và chạy script tự động rải lưới SAM để label và train (Xem file `WORKFLOW.md` để lấy đoạn code chuẩn). Quá trình này sẽ mất khoảng 20 phút.
+2. Mở Colab (chọn GPU T4) và chạy script tự động rải lưới SAM để label và train (Xem file `WORKFLOW.md` để lấy đoạn code chuẩn).
 
 **Bước 4: Thay thế Model**
 Tải file `best.pt` trên Drive về, chép đè vào thư mục `/workspace/my_code/Road_Seg_Model/modelYolo/weights/best3.pt` và chạy lại `maycay.py`.
