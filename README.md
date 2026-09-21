@@ -1,1 +1,72 @@
-# UIT-car-racing-2026
+# 🏎️ UIT CAR RACING 2026 - AUTONOMOUS DRIVING
+
+Dự án phát triển xe tự lái cho cuộc thi UIT Car Racing 2026. Phiên bản này đã được nâng cấp hoàn toàn để chạy mượt mà trên **Linux Native (Ubuntu/Docker)**, không còn phụ thuộc vào Windows hay WSL2, giải quyết dứt điểm các lỗi kết nối mạng.
+
+---
+
+## 🚀 Tính năng nổi bật của bản cập nhật (Tháng 9/2026)
+
+- Hỗ trợ Native Linux Socket: Chạy thẳng game trên Linux không cần socat.
+- X11 Forwarding: Hỗ trợ hiển thị giao diện Camera (OpenCV) trực tiếp từ trong Docker ra màn hình host.
+- Auto-Label thông minh: Hỗ trợ tự động label bằng màu sắc (HSV) cho map tuyết hoặc SAM (Segment Anything Model) độ chính xác cao.
+- Tự động mở khoá quyền: Khắc phục lỗi "Permission denied" do Docker root sinh ra.
+- Train Model tối ưu: Script đóng gói data tự động cho Google Colab.
+
+---
+
+## 🛠️ Hướng dẫn cài đặt & Chạy xe
+
+### 1. Khởi động môi trường & Game
+1. Mở Terminal thật trên máy bạn, chạy lệnh cấp quyền vẽ giao diện cho Docker:
+   ```bash
+   xhost +local:root
+   ```
+2. Khởi động file thực thi của Game Unity (ví dụ: `V1_demo_Linux.x86_64`). Bật sang chế độ **Autonomous Mode**.
+3. Mở Terminal trong Docker, vào thư mục code:
+   ```bash
+   cd /workspace/my_code
+   ```
+
+### 2. Chạy xe tự lái (Inference)
+Chạy script `maycay.py`. Script này sẽ tự động tải file trọng số `best.pt` mới nhất trong thư mục weights và điều khiển xe.
+```bash
+python maycay.py
+```
+Nếu bạn gặp lỗi hiển thị đồ hoạ (GUI) do xhost chưa nhận, bạn có thể tắt GUI bằng lệnh:
+```bash
+export ENABLE_GUI=0
+python maycay.py
+```
+
+---
+
+## 📦 Quy trình tự tạo Model cho Map Mới (Data Pipeline)
+
+Nếu xe chạy qua map mới (vd: map tuyết, ban đêm) và bị mù, bạn cần làm theo 4 bước sau:
+
+**Bước 1: Thu thập ảnh (Collect Data)**
+Bật game sang chế độ Manual Mode. Khởi động file thu thập để lấy ảnh tự động khi bạn lái xe bằng tay:
+```bash
+python collect_data.py --scene snow_map --drive manual --max 1200
+```
+
+**Bước 2: Auto-label & Đóng gói Data**
+Sử dụng công cụ nhận diện màu mặt đường để tự động tô viền (Mask). Sau đó đóng gói ra file ZIP.
+```bash
+# Label tự động (xoá label cũ nếu có)
+rm -rf /workspace/my_code/dataset/mask/snow_map/
+python auto_label.py --scene snow_map --mode snow
+
+# Đóng gói ZIP
+python prepare_dataset.py --scene snow_map
+```
+
+**Bước 3: Train trên Google Colab**
+1. Tải file `UCR2026_snow_map_Dataset.zip` lên thư mục `Train_UCR2026` trên Google Drive.
+2. Mở Colab (chọn GPU T4) và chạy script (Tham khảo file KNOWLEDGE_BASE.md hoặc WORKFLOW.md để lấy đoạn code mẫu chuẩn).
+
+**Bước 4: Thay thế Model**
+Tải file `best.pt` trên Drive về, chép đè vào thư mục `/workspace/my_code/Road_Seg_Model/modelYolo/weights/best3.pt` và chạy lại `maycay.py`.
+
+---
+*Developed for UIT Car Racing 2026*
