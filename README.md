@@ -51,7 +51,7 @@ Nếu xe chạy qua map mới (vd: map tuyết, ban đêm) và bị mù, bạn c
 **Bước 1: Thu thập ảnh (Collect Data)**
 Bật game sang chế độ Manual Mode. Khởi động file thu thập để lấy ảnh tự động khi bạn lái xe bằng tay:
 ```bash
-python collect_data.py --scene snow_map --drive manual --max 1200
+python collect_data.py --scene map1 --drive manual --max 1200
 ```
 
 **Bước 2: Đóng gói ảnh thô (Raw Data)**
