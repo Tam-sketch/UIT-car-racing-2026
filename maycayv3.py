@@ -38,7 +38,7 @@ print(f"[log] writing to {LOG_PATH}")
 # ------------------------------------------------------------
 # PERCEPTION — YOLOv8 (Fixed from ONNX)
 # ------------------------------------------------------------
-MODEL_PATH = "/workspace/my_code/Road_Seg_Model/modelYolo/weights/best7.pt"
+MODEL_PATH = "/workspace/best7.pt"
 
 model = YOLO(MODEL_PATH)
 print(f"[perception] YOLO loaded: {MODEL_PATH}")
@@ -304,7 +304,7 @@ def draw_debug(gray, row_centers, lane_cx, blended_error, speed, curve_ratio,
 # MAIN LOOP
 # ------------------------------------------------------------
 if __name__ == "__main__":
-    MAX_SPEED = 45.0
+    MAX_SPEED = 40.0
     MIN_SPEED = 22.0
 
     pid = SteeringPID(
@@ -329,6 +329,7 @@ if __name__ == "__main__":
     prev_curve = 0.0
 
     try:
+        print("Ready!\n")
         while True:
             state = GetStatus()
             raw_image = GetRaw()
@@ -377,27 +378,27 @@ if __name__ == "__main__":
             AVControl(speed, angle)
 
             # Log this frame
-            log_writer.writerow([
-                time.time(),
-                blended_error, near_e, far_e, curve_e,
-                speed, angle,
-                pid.last_p, pid.last_i, pid.last_d, pid.last_raw,
-                coverage,
-            ])
+            # log_writer.writerow([
+            #     time.time(),
+            #     blended_error, near_e, far_e, curve_e,
+            #     speed, angle,
+            #     pid.last_p, pid.last_i, pid.last_d, pid.last_raw,
+            #     coverage,
+            # ])
 
             # Debug overlay
             lane_cx = row_pts[-1][0] if row_pts else 160
-            draw_debug(
-                gray_for_width, row_pts, lane_cx,
-                blended_error, speed, curve_ratio,
-                angle, near_e, far_e, width_est, pid, coverage,
-            )
+            # draw_debug(
+            #     gray_for_width, row_pts, lane_cx,
+            #     blended_error, speed, curve_ratio,
+            #     angle, near_e, far_e, width_est, pid, coverage,
+            # )
 
             # Console line
-            print(f"err={blended_error:+.1f}  near={near_e:+.0f}  far={far_e:+.0f}  "
-                  f"curve={curve_ratio:.2f}  speed={speed:.1f}  angle={angle:+.2f}  "
-                  f"P={pid.last_p:+.1f} I={pid.last_i:+.1f} D={pid.last_d:+.1f}  "
-                  f"cov={coverage:.2f}")
+            # print(f"err={blended_error:+.1f}  near={near_e:+.0f}  far={far_e:+.0f}  "
+            #       f"curve={curve_ratio:.2f}  speed={speed:.1f}  angle={angle:+.2f}  "
+            #       f"P={pid.last_p:+.1f} I={pid.last_i:+.1f} D={pid.last_d:+.1f}  "
+            #       f"cov={coverage:.2f}")
 
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -405,7 +406,7 @@ if __name__ == "__main__":
     finally:
         print("Closing socket and windows...")
         AVControl(0, 0)
-        log_file.close()
-        print(f"[log] saved {LOG_PATH}")
+        # log_file.close()
+        # print(f"[log] saved {LOG_PATH}")
         CloseSocket()
         cv2.destroyAllWindows()
