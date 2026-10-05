@@ -26,10 +26,7 @@ Run this line on bash / powershell to attach the docker environment to VScode.
 docker run --name it-car -it -p 11000:11000 --network="host" -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix --gpus all <imageid>
 ```
 3. Khởi động file thực thi của Game Unity (ví dụ: `V1_demo_Linux.x86_64`). Bật sang chế độ **Autonomous Mode**.
-4. Mở Terminal trong Docker, vào thư mục code:
-   ```bash
-   cd /workspace
-   ```
+
 
 ### 2. Chạy xe tự lái (Inference)
 Chạy script `maycay.py`. Script này sẽ tự động tải file trọng số `best.pt` mới nhất trong thư mục weights và điều khiển xe.
