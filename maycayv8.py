@@ -21,7 +21,7 @@ from ultralytics import YOLO
 # ==============================================================
 # CONFIG
 # ==============================================================
-ROAD_MODEL_PATH = "/workspace/best14.pt"
+ROAD_MODEL_PATH = "/workspace/best12.pt"
 SIGN_MODEL_PATH = "/workspace/sign.pt"
 
 ROAD_IMGSZ = 320
