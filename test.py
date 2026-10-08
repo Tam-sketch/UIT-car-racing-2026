@@ -1,15 +1,11 @@
 # ==============================================================
-# UIT CAR RACING 2026 - VÒNG 2 (V4.6.1)
-# Base: V4.5
-# Changes vs V4.5:
-#   [V4.6.1-1] get_topology / get_early_topology trả thêm
-#              'top_half_empty' + 'top_half_coverage'
-#   [V4.6.1-2] no_turn_left / no_turn_right:
-#              - Nếu nửa trên ảnh (y=0..H/2) TRỐNG mask
-#                → FORCE rẽ ngược hướng cấm.
-#              - Nếu nửa trên có mask (thấy đường thẳng phía xa)
-#                → đi thẳng.
-#   [V4.6.1-3] _forced_opposite bypass topo gate khi trigger STOPPING.
+# UIT CAR RACING 2026 - VÒNG 2 (V4.6.2)
+# Base: V4.6.1
+# Changes vs V4.6.1:
+#   [V4.6.2-1] SignVoter có blacklist: sau khi turn xong, class sign
+#              đã tiêu thụ bị block SIGN_BLACKLIST_FRAMES frame,
+#              tránh re-trigger SLOW_DOWN → FORCE turn → loop.
+#   [V4.6.2-2] reset() KHÔNG clear blacklist (chủ ý).
 # ==============================================================
 
 from ucr_lib import GetStatus, GetRaw, AVControl, CloseSocket
@@ -115,6 +111,10 @@ EARLY_TRIGGER_CONFIRM = 2
 # --- Voter ---
 SIGN_TIMEOUT_FRAMES = 300
 
+# --- V4.6.2: Sign blacklist after turn ---
+# Sau khi turn xong, block sign đã tiêu thụ để tránh re-trigger loop.
+SIGN_BLACKLIST_FRAMES = 300   # ~15s @ 20 FPS
+
 # --- Log ---
 LOG_PATH = "/workspace/my_code/pid_log_v3.csv"
 LOG_FLUSH_EVERY = 10
@@ -124,8 +124,8 @@ ENABLE_GUI = os.environ.get("ENABLE_GUI", "1") != "0"
 # --- V4.6.1: Top-half emptiness check ---
 # Nếu vùng trên ảnh (y = 0 → TOP_HALF_RATIO*H) có mật độ mask
 # < TOP_HALF_EMPTY_THRESH → coi như KHÔNG có đường thẳng phía trước.
-TOP_HALF_RATIO = 0.5            # lấy nửa trên (y = 0 → 90 với H=180)
-TOP_HALF_EMPTY_THRESH = 0.02    # < 2% pixel có mask → coi là trống
+TOP_HALF_RATIO = 0.5
+TOP_HALF_EMPTY_THRESH = 0.02
 
 
 # ==============================================================
@@ -248,10 +248,18 @@ class LastSpeed:
 
 
 class SignVoter:
-    def __init__(self, min_frames=4, max_gap=3, timeout=SIGN_TIMEOUT_FRAMES):
+    """
+    V4.6.2:
+      - Thêm blacklist: sign đã tiêu thụ sau turn bị block
+        SIGN_BLACKLIST_FRAMES frame để tránh re-trigger loop.
+      - reset() KHÔNG clear blacklist.
+    """
+    def __init__(self, min_frames=4, max_gap=3, timeout=SIGN_TIMEOUT_FRAMES,
+                 blacklist_frames=SIGN_BLACKLIST_FRAMES):
         self.min_frames = min_frames
         self.max_gap = max_gap
         self.timeout = timeout
+        self.blacklist_frames = blacklist_frames
         self.current_class = None
         self.count = 0
         self.gap = 0
@@ -259,8 +267,26 @@ class SignVoter:
         self._age = 0
         self._commit_age = 0
         self._prev_classes = set()
+        self._blacklist = {}          # {cls: remaining_frames}
+
+    def block(self, cls):
+        """V4.6.2: block 1 sign class trong SIGN_BLACKLIST_FRAMES frame."""
+        if cls is None:
+            return
+        self._blacklist[cls] = self.blacklist_frames
+        print(f"[VOTER] blacklist '{cls}' for {self.blacklist_frames} frames")
 
     def update(self, classes):
+        # V4.6.2: tick down blacklist
+        for k in list(self._blacklist.keys()):
+            self._blacklist[k] -= 1
+            if self._blacklist[k] <= 0:
+                del self._blacklist[k]
+
+        # V4.6.2: bỏ qua class đang bị blacklist
+        if self._blacklist:
+            classes = [c for c in classes if c not in self._blacklist]
+
         current_set = set(classes)
         newly_appeared = current_set - self._prev_classes
 
@@ -319,6 +345,7 @@ class SignVoter:
         self._age = 0
         self._commit_age = 0
         self._prev_classes = set()
+        # KHÔNG clear self._blacklist — chủ ý của V4.6.2
 
 
 class IntersectionDetector:
@@ -361,12 +388,12 @@ class IntersectionDetector:
 
 class SlowStopTurnNavigator:
     """
-    V4.6.1:
+    V4.6.2:
       - slow_down → stopping chỉ khi mask_trigger + topo match hướng
       - no_turn_left / no_turn_right:
           * Nửa trên ảnh (y=0..H/2) CÓ mask  → đi thẳng.
           * Nửa trên ảnh TRỐNG mask         → FORCE rẽ ngược hướng cấm.
-      - Exit turning khi bottom_cx quay về gần W/2 (new lane detected)
+      - Turn xong → blacklist sign đã tiêu thụ (V4.6.2).
     """
     def __init__(self, voter):
         self.voter = voter
@@ -433,7 +460,6 @@ class SlowStopTurnNavigator:
                 'left':     bool(topo.get('left')     or self._early_topo.get('left')),
                 'straight': bool(topo.get('straight') or self._early_topo.get('straight')),
                 'right':    bool(topo.get('right')    or self._early_topo.get('right')),
-                # Các field phụ chỉ tin frame hiện tại
                 'straight_ratio':    float(topo.get('straight_ratio', 1.0)),
                 'top_half_empty':    bool(topo.get('top_half_empty', False)),
                 'top_half_coverage': float(topo.get('top_half_coverage', 1.0)),
@@ -479,7 +505,6 @@ class SlowStopTurnNavigator:
                 (current_topo_match or safe_geometry)
             )
 
-            # V4.6.1: forced opposite + hình học đủ rộng → cho phép fire luôn
             if self._forced_opposite and safe_geometry and potential_dir != 0:
                 topo_trigger = True
 
@@ -493,7 +518,6 @@ class SlowStopTurnNavigator:
                 elif potential_dir == 0:
                     mask_topo_match = True
 
-                # V4.6.1: forced opposite → tin sign, bypass topo gate
                 if not mask_topo_match and self._forced_opposite and potential_dir != 0:
                     print(
                         f"[NAV] forced-opposite — bypass topo gate "
@@ -528,6 +552,8 @@ class SlowStopTurnNavigator:
                     self._topo_match_cnt = 0
                     self._forced_opposite = False
 
+                    # V4.6.2: blacklist sign straight để không re-trigger
+                    self.voter.block(committed)
                     self.voter.reset()
 
                     return 0, 0, False
@@ -737,11 +763,16 @@ class SlowStopTurnNavigator:
                       f"crossed={self._crossed_zero} "
                       f"new_lane_cnt={self._new_lane_cnt} "
                       f"err={blended_error:+.1f}")
+
+                # V4.6.2: blacklist sign đã tiêu thụ để tránh re-trigger
+                consumed_sign = self._final_commit
+
                 self.state = 'cooldown'
                 self._cnt = 0
                 self._stable_cnt = 0
                 self._new_lane_cnt = 0
                 self.voter.reset()
+                self.voter.block(consumed_sign)
                 self.just_entered_cooldown = True
 
             return TURN_SPEED, angle, True
@@ -897,7 +928,6 @@ def get_topology(mask, W, H,
                  min_branch_width=MIN_BRANCH_WIDTH):
     """
     Topology V4.6.1
-
     Tra ve:
         {'left': bool, 'straight': bool, 'right': bool,
          'straight_ratio': float,
