@@ -38,7 +38,7 @@ MASK_MIN_AREA_RATIO      = 0.005
 SKEL_S_VERIFY_X_HALF     = 15
 SKEL_S_VERIFY_ROW_MIN_PX = 3
 SKEL_S_VERIFY_MARGIN     = 8
-TOPO_CONFIRM_FRAMES      = 4
+TOPO_CONFIRM_FRAMES      = 3
 
 VOTER_ACTIVATE_FRAMES = 10 #5
 VOTER_TIMEOUT_FRAMES  = 100
@@ -46,8 +46,8 @@ VOTER_TIMEOUT_FRAMES  = 100
 RESET_DEBOUNCE_FRAMES = 15
 
 FORCE_ANGLE               = 25.0
-TURN_CONDITION_Y_LO_RATIO = 0.7
-TURN_CONDITION_COVERAGE   = 0.82 #0.82
+TURN_CONDITION_Y_LO_RATIO = 0.69
+TURN_CONDITION_COVERAGE   = 0.80 #0.82
 
 HEADING_RESET_DEG = 45.0
 
@@ -939,18 +939,18 @@ def check_turn_condition(seg_mask, H, W):
 # MAIN
 # ==============================================================
 if __name__ == "__main__":
-    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-    log_file = open(LOG_PATH, "w", newline="", buffering=1)
-    log_writer = csv.writer(log_file)
-    log_writer.writerow([
-        "t", "frame", "commit", "counts", "sign_seen_rec",
-        "force_active", "force_dir",
-        "topo_L", "topo_S", "topo_R",
-        "cover_bottom",
-        "heading", "d_heading",
-        "max_speed", "speed", "angle",
-    ])
-    print(f"[log] {LOG_PATH}")
+    # os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    # log_file = open(LOG_PATH, "w", newline="", buffering=1)
+    # log_writer = csv.writer(log_file)
+    # log_writer.writerow([
+    #     "t", "frame", "commit", "counts", "sign_seen_rec",
+    #     "force_active", "force_dir",
+    #     "topo_L", "topo_S", "topo_R",
+    #     "cover_bottom",
+    #     "heading", "d_heading",
+    #     "max_speed", "speed", "angle",
+    # ])
+    # print(f"[log] {LOG_PATH}")
 
     topo_latch     = TopoLatch(confirm_frames=TOPO_CONFIRM_FRAMES)
     voter          = SignVoter()
@@ -1067,19 +1067,19 @@ if __name__ == "__main__":
                   f"force={int(force_active)}({force_dir}) "
                   f"ang={angle:+.2f} spd={speed:.2f}")
 
-            log_writer.writerow([
-                f"{time.time():.3f}", frame_idx,
-                commit if commit else "",
-                str(voter.counts),
-                int(sign_seen_recently),
-                int(force_active), force_dir,
-                int(topo['left']), int(topo['straight']), int(topo['right']),
-                f"{cover_bottom:.3f}",
-                f"{cur_heading:.1f}",
-                f"{d_heading:+.1f}",
-                f"{cur_max_speed:.1f}",
-                f"{speed:.2f}", f"{angle:+.2f}",
-            ])
+            # log_writer.writerow([
+            #     f"{time.time():.3f}", frame_idx,
+            #     commit if commit else "",
+            #     str(voter.counts),
+            #     int(sign_seen_recently),
+            #     int(force_active), force_dir,
+            #     int(topo['left']), int(topo['straight']), int(topo['right']),
+            #     f"{cover_bottom:.3f}",
+            #     f"{cur_heading:.1f}",
+            #     f"{d_heading:+.1f}",
+            #     f"{cur_max_speed:.1f}",
+            #     f"{speed:.2f}", f"{angle:+.2f}",
+            # ])
 
             if ENABLE_GUI:
                 cv2.imshow('Raw', raw_image)
