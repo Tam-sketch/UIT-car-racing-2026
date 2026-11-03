@@ -1,1 +1,242 @@
+#include "hardware/Camera.h"
+#include "hardware/Motor.h"
+#include "hardware/Servo.h"
+#include "common/Logger.h"
 
+#include <NvInfer.h>
+#include <cuda_runtime_api.h>
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <cmath>
+#include <csignal>
+
+// Cấu hình đường dẫn model (File Engine của TensorRT)
+static const char *MODEL_PATH = "/home/car4/Downloads/road/khang.onnx";
+
+volatile std::sig_atomic_t g_stopSignal = 0;
+void SignalHandler(int) { g_stopSignal = 1; }
+
+// Logger cho TensorRT
+class TrtLogger : public nvinfer1::ILogger {
+public:
+    void log(Severity severity, const char* msg) noexcept override {
+        if (severity != Severity::kINFO) std::cerr << "[TRT] " << msg << std::endl;
+    }
+} gTrtLogger;
+
+// Đọc file engine
+std::vector<char> readEngineFile(const std::string& filename) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file) throw std::runtime_error("Cannot open engine file: " + filename);
+    file.seekg(0, std::ios::end);
+    size_t size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    std::vector<char> buffer(size);
+    file.read(buffer.data(), size);
+    return buffer;
+}
+
+// ============================================================
+// ROAD MODEL CLASS (TENSORRT)
+// ============================================================
+class RoadModel {
+public:
+    bool Init(const std::string &modelPath) {
+        try {
+            auto engineData = readEngineFile(modelPath);
+            runtime_ = nvinfer1::createInferRuntime(gTrtLogger);
+            engine_ = runtime_->deserializeCudaEngine(engineData.data(), engineData.size());
+            context_ = engine_->createExecutionContext();
+
+            // Tìm Input và Output Binding
+            for (int i = 0; i < engine_->getNbBindings(); ++i) {
+                if (engine_->bindingIsInput(i)) inputIndex_ = i;
+                else outputIndex_ = i;
+            }
+
+            nvinfer1::Dims inputDims = engine_->getBindingDimensions(inputIndex_);
+            nvinfer1::Dims outputDims = engine_->getBindingDimensions(outputIndex_);
+
+            inputHeight_ = inputDims.d[2];
+            inputWidth_ = inputDims.d[3];
+
+            size_t inputSize = 1;
+            for (int i = 0; i < inputDims.nbDims; i++) inputSize *= inputDims.d[i];
+            
+            size_t outputSize = 1;
+            for (int i = 0; i < outputDims.nbDims; i++) outputSize *= outputDims.d[i];
+
+            cudaMalloc(&buffers_[inputIndex_], inputSize * sizeof(float));
+            cudaMalloc(&buffers_[outputIndex_], outputSize * sizeof(float));
+
+            inputData_.resize(inputSize);
+            outputData_.resize(outputSize);
+
+            cudaStreamCreate(&stream_);
+
+            std::cout << "TensorRT Engine loaded! Input: " << inputWidth_ << "x" << inputHeight_ << "\n";
+            return true;
+        } catch (const std::exception &e) {
+            std::cerr << "Error loading engine: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    bool Predict(const cv::Mat &frame, cv::Mat &mask) {
+        if (frame.empty()) return false;
+
+        // 1. Tiền xử lý
+        cv::Mat blob;
+        cv::dnn::blobFromImage(frame, blob, 1.0 / 255.0, cv::Size(inputWidth_, inputHeight_), cv::Scalar(), true, false);
+        
+        // HWC -> CHW (blobFromImage đã làm việc này)
+        std::memcpy(inputData_.data(), blob.ptr<float>(), inputData_.size() * sizeof(float));
+
+        // 2. Copy lên GPU và chạy Inference
+        cudaMemcpyAsync(buffers_[inputIndex_], inputData_.data(), inputData_.size() * sizeof(float), cudaMemcpyHostToDevice, stream_);
+        context_->enqueueV2(buffers_, stream_, nullptr);
+        cudaMemcpyAsync(outputData_.data(), buffers_[outputIndex_], outputData_.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_);
+        cudaStreamSynchronize(stream_);
+
+        // 3. Hậu xử lý (Giả sử output shape [1, 2, H, W])
+        int h = inputHeight_;
+        int w = inputWidth_;
+        int size = h * w;
+
+        cv::Mat smallMask(h, w, CV_8UC1);
+        for (int i = 0; i < size; i++) {
+            // So sánh kênh 0 (Nền) và kênh 1 (Đường)
+            smallMask.at<uchar>(i) = (outputData_[size + i] > outputData_[i]) ? 255 : 0;
+        }
+
+        // Resize và làm mượt mask
+        cv::resize(smallMask, mask, frame.size(), 0, 0, cv::INTER_LINEAR);
+        cv::threshold(mask, mask, 127, 255, cv::THRESH_BINARY);
+        
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(15, 15));
+        cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+
+        return true;
+    }
+
+    ~RoadModel() {
+        if (engine_) {
+            cudaFree(buffers_[inputIndex_]);
+            cudaFree(buffers_[outputIndex_]);
+            cudaStreamDestroy(stream_);
+            delete context_;
+            delete engine_;
+            delete runtime_;
+        }
+    }
+
+private:
+    nvinfer1::IRuntime* runtime_ = nullptr;
+    nvinfer1::ICudaEngine* engine_ = nullptr;
+    nvinfer1::IExecutionContext* context_ = nullptr;
+    void* buffers_[2] = {nullptr, nullptr};
+    cudaStream_t stream_ = nullptr;
+    std::vector<float> inputData_;
+    std::vector<float> outputData_;
+    int inputIndex_ = -1, outputIndex_ = -1;
+    int inputWidth_ = 0, inputHeight_ = 0;
+};
+
+// ============================================================
+// MAIN
+// ============================================================
+int main() {
+    std::signal(SIGINT, SignalHandler);
+    std::signal(SIGTERM, SignalHandler);
+
+    // 1. Khởi tạo phần cứng
+    Camera camera;
+    if (!camera.Init()) { std::cerr << "Cannot init camera\n"; return -1; }
+
+    Motor motor;
+    if (!motor.Init()) { std::cerr << "Cannot init motor\n"; return -1; }
+
+    Servo servo;
+    if (!servo.Init() || !servo.SetPWMFreq(50)) { std::cerr << "Cannot init servo\n"; return -1; }
+
+    motor.SetSpeedCms(0.0f);
+    servo.SetAngle(0);
+
+    // 2. Khởi tạo AI (TensorRT)
+    RoadModel roadModel;
+    if (!roadModel.Init(MODEL_PATH)) return -1;
+
+    // 3. Biến điều khiển
+    float currentSpeed = 0.0f;
+    int currentSteer = 0;
+    const float SPEED_STEP = 5.0f;   
+    const int STEER_STEP = 15;        
+    const float MAX_SPEED = 20.0f;   
+    const int MAX_STEER = 45;        
+
+    std::cout << "W/S : Speed +/- 5 cm/s\n";
+    std::cout << "A/D : Steering Left/Right\n";
+    std::cout << "C   : Center Steering\n";
+    std::cout << "SPACE: STOP (Emergency)\n";
+    std::cout << "ESC : Quit\n";
+
+    cv::namedWindow("Road Mask", cv::WINDOW_NORMAL);
+    cv::resizeWindow("Road Mask", 800, 450);
+
+    cv::Mat frame, mask;
+
+    // 4. Vòng lặp chính
+    while (!g_stopSignal) {
+        camera.GetFrame(frame);
+        if (frame.empty()) continue;
+
+        if (roadModel.Predict(frame, mask)) {
+            cv::imshow("Road Mask", mask);
+        }
+
+        int key = cv::waitKey(1) & 0xFF;
+
+        if (key == 27 || key == 'q' || key == 'Q') break;
+        else if (key == 'w' || key == 'W') {
+            currentSpeed += SPEED_STEP;
+            if (currentSpeed > MAX_SPEED) currentSpeed = MAX_SPEED;
+            std::cout << "Speed: " << currentSpeed << " cm/s\n";
+        }
+        else if (key == 's' || key == 'S') {
+            currentSpeed -= SPEED_STEP;
+            if (currentSpeed < 0) currentSpeed = 0;
+            std::cout << "Speed: " << currentSpeed << " cm/s\n";
+        }
+        else if (key == 'a' || key == 'A') {
+            currentSteer -= STEER_STEP;
+            if (currentSteer < -MAX_STEER) currentSteer = -MAX_STEER;
+            std::cout << "Steer: " << currentSteer << " deg\n";
+        }
+        else if (key == 'd' || key == 'D') {
+            currentSteer += STEER_STEP;
+            if (currentSteer > MAX_STEER) currentSteer = MAX_STEER;
+            std::cout << "Steer: " << currentSteer << " deg\n";
+        }
+        else if (key == 'c' || key == 'C') {
+            currentSteer = 0;
+            std::cout << "Steer: Centered\n";
+        }
+        else if (key == ' ' || key == 'x' || key == 'X') {
+            currentSpeed = 0.0f;
+            currentSteer = 0;
+            std::cout << "EMERGENCY STOP!\n";
+        }
+
+        motor.SetSpeedCms(currentSpeed);
+        servo.SetAngle(currentSteer);
+    }
+
+    std::cout << "Stopping safely...\n";
+    motor.SetSpeedCms(0.0f);
+    servo.SetAngle(0);
+    cv::destroyAllWindows();
+
+    return 0;
+}
