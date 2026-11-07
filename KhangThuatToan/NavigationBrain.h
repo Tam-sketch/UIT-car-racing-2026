@@ -70,9 +70,7 @@ public:
             latched_avoid_bias_ = 0.0f;
         }
 
-        // ----------------------------------------------------
         // 1. GẶP PARKING: DỪNG XE TẠM THỜI
-        // ----------------------------------------------------
         if (dec.active_sign == "parking") {
             dec.action = NavAction::STOP_PARKING;
             dec.target_speed = 0.0f;
@@ -81,20 +79,16 @@ public:
             return dec;
         }
 
-        // ----------------------------------------------------
-        // 2. PHÂN TÍCH NHÁNH ĐƯỜNG PHÍA TRƯỚC (JUNCTION ANALYSIS)
-        // ----------------------------------------------------
+        // 2. PHÂN TÍCH NHÁNH ĐƯỜNG PHÍA TRƯỚC BẰNG VÙNG (ZONE ANALYSIS)
         bool has_left_branch = false;
         bool has_right_branch = false;
         bool has_straight_path = false;
 
         if (!roadMask.empty()) {
-            AnalyzeJunctions(roadMask, has_left_branch, has_right_branch, has_straight_path);
+            AnalyzeJunctionsZone(roadMask, has_left_branch, has_right_branch, has_straight_path);
         }
 
-        // ----------------------------------------------------
         // 3. XỬ LÝ QUY TẮC TỪNG BIỂN BÁO
-        // ----------------------------------------------------
         if (dec.active_sign == "turn_left") {
             dec.action = NavAction::FORCE_LEFT;
             dec.steer_bias_px = -65.0f; 
@@ -129,15 +123,18 @@ public:
             dec.action = NavAction::AVOID_CONSTRUCTION;
             dec.target_speed = 11.0f;
             
-            // Chỉ quyết định hướng rẽ ở frame đầu tiên khi mới gặp biển, sau đó khóa cứng!
+            // Chốt hướng rẽ né công trường ở frame đầu tiên
             if (std::abs(latched_avoid_bias_) < 1.0f) {
                 if (has_right_branch && !has_left_branch) {
                     latched_avoid_bias_ = +55.0f;
                 } else if (has_left_branch && !has_right_branch) {
                     latched_avoid_bias_ = -55.0f;
                 } else if (has_right_branch) {
+                    // Nếu có cả 2 nhánh, ưu tiên rẽ phải
                     latched_avoid_bias_ = +55.0f;
                 } else {
+                    // Nếu phân tích vùng bị nhiễu không thấy rõ nhánh nào, 
+                    // ép mặc định tránh trái
                     latched_avoid_bias_ = -55.0f;
                 }
             }
@@ -157,31 +154,39 @@ public:
     }
 
 private:
-    void AnalyzeJunctions(const cv::Mat& mask, bool& has_left, bool& has_right, bool& has_straight) {
+    // Quét nhiều dòng liên tiếp (Zone) để khắc phục nhược điểm của 1 đường cắt đơn
+    void AnalyzeJunctionsZone(const cv::Mat& mask, bool& has_left, bool& has_right, bool& has_straight) {
         int w = mask.cols;
         int h = mask.rows;
-        int scan_y = h * 0.45; // Quét ở tầm nhìn xa vừa phải
+        
+        int start_y = static_cast<int>(h * 0.40);
+        int end_y   = static_cast<int>(h * 0.50);
 
-        const uchar* row = mask.ptr<uchar>(scan_y);
         int left_white_count = 0;
         int center_white_count = 0;
         int right_white_count = 0;
 
-        for (int x = 0; x < w; ++x) {
-            if (row[x] > 0) {
-                if (x < w * 0.35) left_white_count++;
-                else if (x > w * 0.65) right_white_count++;
-                else center_white_count++;
+        for (int y = start_y; y <= end_y; y += 2) {
+            const uchar* row = mask.ptr<uchar>(y);
+            for (int x = 0; x < w; ++x) {
+                if (row[x] > 0) {
+                    if (x < w * 0.35) left_white_count++;
+                    else if (x > w * 0.65) right_white_count++;
+                    else center_white_count++;
+                }
             }
         }
 
-        has_left     = (left_white_count > 15);
-        has_right    = (right_white_count > 15);
-        has_straight = (center_white_count > 15);
+        // Ngưỡng tính toán cần cao hơn vì đếm theo vùng (Zone)
+        int threshold = (end_y - start_y) * 5; 
+        
+        has_left     = (left_white_count > threshold);
+        has_right    = (right_white_count > threshold);
+        has_straight = (center_white_count > threshold);
     }
 
     std::string latched_sign_ = "NONE";
     float latched_avoid_bias_ = 0.0f;
     int latch_cooldown_frames_ = 0;
-    static constexpr int LATCH_DURATION_FRAMES = 50; // Duy trì hành vi ~7-8 giây sau khi thấy biển
+    static constexpr int LATCH_DURATION_FRAMES = 50; 
 };
