@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-#include "perception/SignDetector.h"   // for SIGN_TURN_LEFT / SIGN_TURN_RIGHT
+#include "perception/SignClass.h"   // for SIGN_TURN_LEFT / SIGN_TURN_RIGHT
 
 namespace ucr {
 namespace control {
@@ -17,8 +17,8 @@ float TurnStateMachine::WrapDelta(float d) {
 }
 
 int TurnStateMachine::DecideDir(int sign) const {
-    if (sign == perception::SIGN_TURN_LEFT)  return -1;
-    if (sign == perception::SIGN_TURN_RIGHT) return +1;
+    if (sign == ucr::perception::SIGN_TURN_LEFT)  return -1;
+    if (sign == ucr::perception::SIGN_TURN_RIGHT) return +1;
     // no_left / no_right / new classes: no turn triggered.
     // (The Round-3 T-junction "must take right because no_left" rule
     //  is not implemented here — deferred with the new-sign work.)
@@ -42,8 +42,8 @@ TurnStateMachine::Output TurnStateMachine::Update(int   sign_committed,
         if (px_mid_ema_ < 0.0f) {
             px_mid_ema_ = static_cast<float>(px_mid);
         } else {
-            px_mid_ema_ = TURN_BASELINE_ALPHA * px_mid_ema_
-                        + (1.0f - TURN_BASELINE_ALPHA) * static_cast<float>(px_mid);
+            px_mid_ema_ = ucr::config::TURN_BASELINE_ALPHA * px_mid_ema_
+                        + (1.0f - ucr::config::TURN_BASELINE_ALPHA) * static_cast<float>(px_mid);
         }
     }
 
@@ -58,9 +58,9 @@ TurnStateMachine::Output TurnStateMachine::Update(int   sign_committed,
                 const float raw_base = (px_mid_ema_ >= 0.0f)
                                      ? px_mid_ema_
                                      : static_cast<float>(px_mid);
-                frozen_baseline_ = std::max(TURN_BASELINE_FLOOR, raw_base);
-                brake_thresh_    = frozen_baseline_ * TURN_BRAKE_MULT;
-                turn_thresh_     = frozen_baseline_ * TURN_TURN_MULT;
+                frozen_baseline_ = std::max(ucr::config::TURN_BASELINE_FLOOR, raw_base);
+                brake_thresh_    = frozen_baseline_ * ucr::config::TURN_BRAKE_MULT;
+                turn_thresh_     = frozen_baseline_ * ucr::config::TURN_TURN_MULT;
 
                 ResetApproach();
                 state_ = APPROACH;
@@ -94,7 +94,7 @@ TurnStateMachine::Output TurnStateMachine::Update(int   sign_committed,
         // --- v28 trigger: meaningful drop below running peak ---
         if (px_mid_peak_ >= 0.0f
             && px_mid_peak_ > turn_thresh_
-            && (px_mid_peak_ - static_cast<float>(px_mid)) >= TURN_PEAK_DROP_PX)
+            && (px_mid_peak_ - static_cast<float>(px_mid)) >= ucr::config::TURN_PEAK_DROP_PX)
         {
             state_         = TURNING;
             entry_heading_ = heading;
@@ -106,7 +106,7 @@ TurnStateMachine::Output TurnStateMachine::Update(int   sign_committed,
         //     near baseline → false positive, unblock so it can re-arm ---
         if (px_mid_peak_ >= 0.0f
             && px_mid_peak_ <= turn_thresh_
-            && static_cast<float>(px_mid) < frozen_baseline_ * TURN_BAIL_FRAC_OF_BASELINE)
+            && static_cast<float>(px_mid) < frozen_baseline_ * ucr::config::TURN_BAIL_FRAC_OF_BASELINE)
         {
             voter_.Block(sign_at_commit_);
             voter_.Reset();
@@ -127,7 +127,7 @@ TurnStateMachine::Output TurnStateMachine::Update(int   sign_committed,
                 braking_ = true;
                 // TODO (E45): log APPROACH -> BRAKING
             }
-            out.speed_cms = TURN_BRAKING_SPEED;
+            out.speed_cms = ucr::config::TURN_BRAKING_SPEED;
             return out;
         }
         if (braking_) {
@@ -140,7 +140,7 @@ TurnStateMachine::Output TurnStateMachine::Update(int   sign_committed,
     // ---------------- TURNING ----------------
     if (state_ == TURNING) {
         const float delta    = WrapDelta(heading - entry_heading_);
-        const float progress = std::fabs(delta) / std::max(TURN_TARGET_YAW, 1.0f);
+        const float progress = std::fabs(delta) / std::max(ucr::config::TURN_TARGET_YAW, 1.0f);
 
         if (progress >= 1.0f) {
             state_     = NORMAL;
@@ -159,15 +159,15 @@ TurnStateMachine::Output TurnStateMachine::Update(int   sign_committed,
         }
 
         float angle;
-        if (progress < TURN_TAPER_START) {
-            angle = TURN_SHARP_ANGLE * static_cast<float>(turn_dir_);
+        if (progress < ucr::config::TURN_TAPER_START) {
+            angle = ucr::config::TURN_SHARP_ANGLE * static_cast<float>(turn_dir_);
         } else {
-            const float t = (progress - TURN_TAPER_START)
-                          / (1.0f - TURN_TAPER_START);
-            angle = TURN_SHARP_ANGLE * static_cast<float>(turn_dir_) * (1.0f - t);
+            const float t = (progress - ucr::config::TURN_TAPER_START)
+                          / (1.0f - ucr::config::TURN_TAPER_START);
+            angle = ucr::config::TURN_SHARP_ANGLE * static_cast<float>(turn_dir_) * (1.0f - t);
         }
         out.angle_deg    = angle;
-        out.speed_cms    = TURN_TURNING_SPEED;
+        out.speed_cms    = ucr::config::TURN_TURNING_SPEED;
         out.in_turn_ctrl = true;
         return out;
     }

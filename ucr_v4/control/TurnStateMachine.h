@@ -66,9 +66,9 @@ private:
     float entry_heading_       = 0.0f;
     int   sign_at_commit_      = -1;
     float px_mid_ema_          = -1.0f;                     // -1 = uninit
-    float frozen_baseline_     = TURN_BASELINE_FLOOR;
-    float brake_thresh_        = TURN_BASELINE_FLOOR * TURN_BRAKE_MULT;
-    float turn_thresh_         = TURN_BASELINE_FLOOR * TURN_TURN_MULT;
+    float frozen_baseline_     = ucr::config::TURN_BASELINE_FLOOR;
+    float brake_thresh_        = ucr::config::TURN_BASELINE_FLOOR * ucr::config::TURN_BRAKE_MULT;
+    float turn_thresh_         = ucr::config::TURN_BASELINE_FLOOR * ucr::config::TURN_TURN_MULT;
     bool  braking_             = false;
     float px_mid_peak_         = -1.0f;
     float last_drop_from_peak_ = 0.0f;
