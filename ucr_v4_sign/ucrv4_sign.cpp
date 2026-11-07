@@ -3,7 +3,7 @@
 #include "perception/SignDetector.h"
 #include "mission/MissionStateMachine.h"
 
-// Include Hardware
+// Include Hardware (Đã sửa lại đường dẫn chuẩn theo repo)
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
 #include "hardware/Servo.h"
@@ -17,7 +17,7 @@
 #include <algorithm>
 #include <csignal>
 
-// Biến toàn cục để xử lý Ctrl+C
+// Biến toàn cục để xử lý Ctrl+C an toàn
 volatile std::sig_atomic_t g_running = 1;
 void SignalHandler(int) { g_running = 0; }
 
@@ -117,8 +117,8 @@ int main() {
         float heading = 0.0f;
         BNO055::Data imu_data;
         if (imu.read(imu_data)) {
-            // Sử dụng eulerDeg.x (hoặc .z tùy thuộc vào cách gắn IMU)
-            heading = static_cast<float>(imu_data.eulerDeg.x); 
+            // CHỈ SỬ DỤNG TRỤC Y CHO HEADING THEO YÊU CẦU
+            heading = static_cast<float>(imu_data.eulerDeg.y); 
         }
 
         // B. Chạy AI
