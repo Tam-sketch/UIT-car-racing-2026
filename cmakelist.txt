@@ -1,0 +1,249 @@
+cmake_minimum_required(VERSION 3.10)
+
+project(UCR2026 LANGUAGES C CXX)
+
+# ============================================================
+# C++ CONFIGURATION
+# ============================================================
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+find_package(Threads REQUIRED)
+find_package(OpenCV REQUIRED)
+
+# ============================================================
+# CUDA
+# ============================================================
+
+set(CUDA_ROOT "/usr/local/cuda")
+
+find_path(CUDA_INCLUDE_DIR
+    cuda_runtime_api.h
+    PATHS
+        ${CUDA_ROOT}/include
+    NO_DEFAULT_PATH
+)
+
+find_library(CUDART_LIBRARY
+    NAMES cudart
+    PATHS
+        ${CUDA_ROOT}/lib64
+        ${CUDA_ROOT}/lib
+    NO_DEFAULT_PATH
+)
+
+if(NOT CUDA_INCLUDE_DIR OR NOT CUDART_LIBRARY)
+    message(FATAL_ERROR "CUDA Toolkit not found")
+endif()
+
+# ============================================================
+# TENSORRT 8.2.1
+# ============================================================
+
+find_path(TENSORRT_INCLUDE_DIR
+    NvInfer.h
+    PATHS
+        /usr/include/aarch64-linux-gnu
+        /usr/include
+        /usr/local/TensorRT/include
+)
+
+find_library(TENSORRT_LIBRARY
+    NAMES nvinfer
+    PATHS
+        /usr/lib/aarch64-linux-gnu
+        /usr/lib
+        /usr/local/TensorRT/lib
+        /usr/local/TensorRT/lib64
+)
+
+if(NOT TENSORRT_INCLUDE_DIR OR NOT TENSORRT_LIBRARY)
+    message(FATAL_ERROR "TensorRT not found")
+endif()
+
+# ============================================================
+# ONNX RUNTIME
+# ============================================================
+
+set(ONNXRUNTIME_ROOT "/usr/local/onnxruntime")
+
+find_path(ONNXRUNTIME_INCLUDE_DIR
+    onnxruntime_cxx_api.h
+    PATHS
+        ${ONNXRUNTIME_ROOT}/include
+)
+
+find_library(ONNXRUNTIME_LIBRARY
+    NAMES onnxruntime
+    PATHS
+        ${ONNXRUNTIME_ROOT}/lib
+)
+
+if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIBRARY)
+    message(FATAL_ERROR "ONNX Runtime not found")
+endif()
+
+# ============================================================
+# BUILD OPTIONS
+# ============================================================
+
+option(BUILD_TEST_TOOLS
+    "Build standalone hardware test tools"
+    ON
+)
+
+# ============================================================
+# SOURCE CORE
+# ============================================================
+
+add_subdirectory(src)
+
+# ============================================================
+# COMMON LINK FUNCTIONS
+# ============================================================
+
+# Lưu ý: Đã thêm ${PROJECT_SOURCE_DIR}/src vào để tìm thấy "control/LaneFollowerV20.h"
+
+function(link_tensorrt target)
+
+    target_include_directories(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/src      # <-- QUAN TRỌNG
+        ${PROJECT_SOURCE_DIR}/include
+        ${OpenCV_INCLUDE_DIRS}
+        ${CUDA_INCLUDE_DIR}
+        ${TENSORRT_INCLUDE_DIR}
+    )
+
+    target_link_libraries(${target} PRIVATE
+        app_core
+        Threads::Threads
+        ${OpenCV_LIBS}
+        ${TENSORRT_LIBRARY}
+        ${CUDART_LIBRARY}
+	opencv_dnn
+    )
+
+    set_target_properties(${target} PROPERTIES
+        BUILD_RPATH
+        "/usr/local/cuda/lib64;/usr/lib/aarch64-linux-gnu"
+    )
+
+endfunction()
+
+function(link_onnxruntime target)
+
+    target_include_directories(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/src      # <-- QUAN TRỌNG
+        ${PROJECT_SOURCE_DIR}/include
+        ${OpenCV_INCLUDE_DIRS}
+        ${ONNXRUNTIME_INCLUDE_DIR}
+    )
+
+    target_link_libraries(${target} PRIVATE
+        app_core
+        Threads::Threads
+        ${OpenCV_LIBS}
+        ${ONNXRUNTIME_LIBRARY}
+        opencv_dnn
+    )
+
+    set_target_properties(${target} PROPERTIES
+        BUILD_RPATH
+        "/usr/local/onnxruntime/lib"
+    )
+
+endfunction()
+
+function(link_both_ai target)
+
+    target_include_directories(${target} PRIVATE
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/src      # <-- QUAN TRỌNG
+        ${PROJECT_SOURCE_DIR}/include
+        ${OpenCV_INCLUDE_DIRS}
+        ${CUDA_INCLUDE_DIR}
+        ${TENSORRT_INCLUDE_DIR}
+        ${ONNXRUNTIME_INCLUDE_DIR}
+    )
+
+    target_link_libraries(${target} PRIVATE
+        app_core
+        Threads::Threads
+        ${OpenCV_LIBS}
+        ${TENSORRT_LIBRARY}
+        ${CUDART_LIBRARY}
+        ${ONNXRUNTIME_LIBRARY}
+        opencv_dnn
+    )
+
+    set_target_properties(${target} PROPERTIES
+        BUILD_RPATH
+        "/usr/local/onnxruntime/lib;/usr/local/cuda/lib64;/usr/lib/aarch64-linux-gnu"
+    )
+
+endfunction()
+
+# ============================================================
+# MAIN EXECUTABLE
+# ============================================================
+
+add_executable(main main.cpp)
+link_tensorrt(main)
+
+# ============================================================
+# AI TEST TOOLS
+# ============================================================
+
+# ONNX Runtime + TensorRT
+add_executable(test_sign test_sign.cpp)
+link_both_ai(test_sign)
+
+# TriLiteNet TensorRT + CUDA + OpenCV
+# Không cần ONNX Runtime
+add_executable(test_road_move test_road_move.cpp)
+link_tensorrt(test_road_move)
+
+# Test Run (Chạy PID v20 với TwinLiteNet thường)
+add_executable(test_run test_run.cpp)
+link_both_ai(test_run)
+
+# Test Run Plus (Chạy PID v20 với TwinLiteNet+)
+add_executable(test_run_plus test_run_plus.cpp)
+link_both_ai(test_run_plus)
+
+# Test Run Plus (Chạy PID v20 với TwinLiteNet+)
+add_executable(khangcode khangcode.cpp)
+link_both_ai(khangcode)
+
+
+add_executable(ucrv3 ucrv3.cpp)
+link_both_ai(ucrv3)
+
+# ============================================================
+# HARDWARE TESTS
+# ============================================================
+
+if(BUILD_TEST_TOOLS)
+    add_subdirectory(tests)
+endif()
+
+# ============================================================
+# BUILD INFORMATION
+# ============================================================
+
+message(STATUS "===================================")
+message(STATUS "OpenCV:        ${OpenCV_VERSION}")
+message(STATUS "CUDA Include:  ${CUDA_INCLUDE_DIR}")
+message(STATUS "CUDA Library:  ${CUDART_LIBRARY}")
+message(STATUS "TensorRT:      ${TENSORRT_INCLUDE_DIR}")
+message(STATUS "TensorRT Lib:  ${TENSORRT_LIBRARY}")
+message(STATUS "ONNX Runtime:  ${ONNXRUNTIME_LIBRARY}")
+message(STATUS "===================================")
