@@ -3,74 +3,104 @@
 #include "perception/SignDetector.h"
 #include "mission/MissionStateMachine.h"
 
+// Include Hardware
+#include "Camera.h"
+#include "Motor.h"
+#include "Servo.h"
+#include "BNO055.h"
+
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <chrono>
 #include <thread>
 #include <cmath>
 #include <algorithm>
+#include <csignal>
 
-// TODO: Include các header phần cứng của bạn
-// #include "hardware/Camera.h"
-// #include "hardware/Motor.h"
-// #include "hardware/Servo.h"
-// #include "hardware/IMU.h"
+// Biến toàn cục để xử lý Ctrl+C
+volatile std::sig_atomic_t g_running = 1;
+void SignalHandler(int) { g_running = 0; }
 
-float ApplySteeringCalibration(float pid_angle) {
+// Hàm hiệu chuẩn góc lái từ dữ liệu hồi quy
+int16_t ApplySteeringCalibration(float pid_angle) {
     float cmd = 0.0f;
     if (pid_angle < 0.0f) {
-        // Bánh trái: y = 0.96x - 6.2  =>  x = (y + 6.2) / 0.96
+        // Bánh trái: x = (y + 6.2) / 0.96
         cmd = (pid_angle + 6.2f) / 0.96f;
     } else if (pid_angle > 0.0f) {
-        // Bánh phải: y = 0.71x + 2.5  =>  x = (y - 2.5) / 0.71
+        // Bánh phải: x = (y - 2.5) / 0.71
         cmd = (pid_angle - 2.5f) / 0.71f;
     }
     
+    // Đảo chiều servo nếu cần (kiểm tra thực tế trên xe)
     if (ucr::config::INVERT_STEER) cmd = -cmd;
-    return std::clamp(cmd, -ucr::config::MAX_STEER_DEG, ucr::config::MAX_STEER_DEG);
+    
+    // Clamp và ép kiểu về int16_t cho Servo
+    cmd = std::clamp(cmd, -ucr::config::MAX_STEER_DEG, ucr::config::MAX_STEER_DEG);
+    return static_cast<int16_t>(cmd);
 }
 
 int main() {
     std::cout << "=== UCR2026 V3: Sign & Mission ===\n";
+    std::signal(SIGINT, SignalHandler);
 
-    // 1. Khởi tạo phần cứng (Mở comment và điền API thật)
-    // ucr::hardware::Camera camera;
-    // ucr::hardware::Motor motor;
-    // ucr::hardware::Servo servo;
-    // ucr::hardware::IMU imu;
+    // 1. Khởi tạo phần cứng
+    Camera camera;
+    if (!camera.Init()) {
+        std::cerr << "Camera Init Failed\n";
+        return -1;
+    }
+
+    Motor motor("/dev/ttyTHS1");
+    if (!motor.Init()) {
+        std::cerr << "Motor Init Failed\n";
+        return -1;
+    }
+
+    Servo servo(0x40);
+    if (!servo.Init()) {
+        std::cerr << "Servo Init Failed\n";
+        return -1;
+    }
+
+    BNO055 imu;
+    if (!imu.initialize()) {
+        std::cerr << "[WARN] IMU Init Failed. Fallback heading = 0\n";
+    }
 
     // 2. Khởi tạo Perception
     ucr::perception::RoadSegmenter road_seg;
     if (!road_seg.Init(ucr::config::ROAD_ENGINE_PATH)) {
-        std::cerr << "Failed to init RoadSegmenter\n";
+        std::cerr << "RoadSegmenter Init Failed\n";
         return -1;
     }
     
     ucr::perception::SignDetector sign_det;
     if (!sign_det.Init(ucr::config::SIGN_ENGINE_PATH)) {
-        std::cerr << "Failed to init SignDetector\n";
+        std::cerr << "SignDetector Init Failed\n";
         return -1;
     }
 
-    // 3. Cấu hình LaneFollower (Tắt post_pid_gain cũ)
+    // 3. Cấu hình LaneFollower (Tắt post_pid_gain)
     v20::Config lane_cfg;
-    lane_cfg.post_pid_gain = 1.0f;  // QUAN TRỌNG: Tắt gain 2.2 cũ
+    lane_cfg.post_pid_gain = 1.0f; // Tắt gain cũ để dùng hồi quy
     lane_cfg.max_speed = ucr::config::MAX_SPEED_CMS;
     lane_cfg.min_speed = ucr::config::MIN_SPEED_CMS;
-    // lane_cfg.min_rows = ucr::config::MIN_ROWS; (nếu cần)
-    // lane_cfg.coverage_threshold = ucr::config::COVERAGE_THRESHOLD;
+    lane_cfg.min_rows = ucr::config::MIN_ROWS;
+    lane_cfg.coverage_threshold = ucr::config::COVERAGE_THRESHOLD;
+    lane_cfg.curve_scale = ucr::config::CURVE_SCALE;
 
-    // 4. Khởi tạo Mission với cấu hình mới
+    // 4. Khởi tạo Mission
     ucr::mission::MissionStateMachine mission(lane_cfg);
 
-    // 5. Biến vòng lặp
+    // 5. Vòng lặp chính
     int frame_idx = 0;
     float current_speed = 0.0f;
     auto next_tick = std::chrono::steady_clock::now();
     
     std::cout << "[Main] Bắt đầu vòng lặp 10 Hz...\n";
 
-    while (true) {
+    while (g_running) {
         auto now = std::chrono::steady_clock::now();
         if (now < next_tick) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -79,12 +109,17 @@ int main() {
         next_tick += std::chrono::milliseconds(ucr::config::CONTROL_PERIOD_MS);
         frame_idx++;
 
-        // A. Lấy dữ liệu (Thay bằng code thật)
-        // cv::Mat frame = camera.GetFrame();
-        // float heading = imu.GetHeading();
-        
-        cv::Mat frame(384, 640, CV_8UC3, cv::Scalar(0,0,0)); 
+        // A. Lấy dữ liệu
+        cv::Mat frame;
+        camera.GetFrame(frame);
+        if (frame.empty()) continue;
+
         float heading = 0.0f;
+        BNO055::Data imu_data;
+        if (imu.read(imu_data)) {
+            // Sử dụng eulerDeg.x (hoặc .z tùy thuộc vào cách gắn IMU)
+            heading = static_cast<float>(imu_data.eulerDeg.x); 
+        }
 
         // B. Chạy AI
         cv::Mat mask;
@@ -96,7 +131,7 @@ int main() {
         // C. Ra quyết định
         auto cmd = mission.Update(mask, signs, heading, frame_idx);
 
-        // D. Soft-start cho tốc độ (Giới hạn gia tốc)
+        // D. Soft-start (Giới hạn gia tốc)
         float target_speed = cmd.speed;
         float max_delta = ucr::config::MAX_ACCEL_CMS2 * (ucr::config::CONTROL_PERIOD_MS / 1000.0f);
         if (target_speed > current_speed) {
@@ -105,26 +140,26 @@ int main() {
             current_speed = target_speed;
         }
 
-        // E. Hiệu chuẩn góc lái (Áp dụng phương trình hồi quy)
-        float servo_angle = ApplySteeringCalibration(cmd.angle);
+        // E. Hiệu chuẩn góc lái
+        int16_t servo_angle = ApplySteeringCalibration(cmd.angle);
 
-        // F. Gửi lệnh xuống phần cứng (Thay bằng code thật)
-        // servo.SetAngle(servo_angle);
-        // motor.SetSpeedCms(current_speed);
+        // F. Gửi lệnh xuống phần cứng
+        servo.SetAngle(servo_angle);
+        motor.SetSpeedCms(current_speed);
 
         // Log debug
         std::cout << "[" << frame_idx << "] "
                   << "Spd=" << current_speed << " "
                   << "PID=" << cmd.angle << " "
                   << "Servo=" << servo_angle << " "
-                  << "Heading=" << heading << "\n";
-
-        // G. Thoát (Thay bằng cv::waitKey)
-        // if (cv::waitKey(1) == 'q') break;
+                  << "Head=" << heading << " "
+                  << "Signs=" << signs.size() << "\n";
     }
 
-    // Dừng xe an toàn
-    // motor.SetSpeedCms(0);
-    // servo.SetAngle(0);
+    // Dừng xe an toàn khi thoát
+    std::cout << "\n[Main] Dừng xe an toàn...\n";
+    motor.SetSpeedCms(0);
+    servo.SetAngle(0);
+    
     return 0;
 }
