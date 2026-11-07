@@ -1,38 +1,48 @@
-# `README.md`
+Dưới đây là file `README.md` hoàn chỉnh dành cho phiên bản V3+ (đã tích hợp Mission State Machine và Sign Detection). Bạn lưu file này ở thư mục gốc của `ucr_v3`.
 
 ```markdown
-# UCR 2026 — Jetson Nano Autonomous Car
+# UCR 2026 — Jetson Nano Autonomous Car (V3+)
 
-Autonomous road-following on the physical round-3 car. Perception is a
-TensorRT road-segmentation model; control is a port of the proven
-`ucr_main_v20.py` PID. Everything runs on a fixed 10 Hz control tick so
-the sim-tuned constants keep their meaning on the real robot.
+Autonomous road-following on the physical round-3 car. Perception combines a
+TensorRT road-segmentation model and a YOLO-based sign detector. Control uses
+a port of the proven `ucr_main_v20.py` PID, gated by a deterministic Mission
+State Machine that handles intersection turns via sign commands. 
+
+Everything runs on a fixed 10 Hz control tick so the sim-tuned constants keep
+their meaning on the real robot.
 
 ---
 
 ## Architecture at a glance
 
 ```
-Camera (BGR 640×384)
+Camera (BGR 640×384) + IMU (BNO055)
+│
+├─► RoadSegmenter (TensorRT) ──► CV_8UC1 road mask
+│
+└─► SignDetector (TensorRT)  ──► vector<Detection> (class_id, conf, bbox)
 │
 ▼
-RoadSegmenter          ← TensorRT engine + BGR→RGB + argmax
-│  (CV_8UC1 mask at model output resolution)
-▼
-LaneFollowerV20        ← keep_largest → centerline → near/far/curve
-│                     → occlusion gate → asymmetry → PID → speed
-│  (v20::LaneFollower::Output)
-▼
-main loop              ← fixed 10 Hz tick, soft-start ramp, servo/motor
+MissionStateMachine ──► Quyết định trạng thái:
+│                        - LANE_FOLLOW (dùng LaneFollowerV20)
+│                        - FORCE_TURN  (dùng TurnController + IMU heading)
 │
 ▼
-Motor / Servo
+main loop ──► Fixed 10 Hz tick, hiệu chuẩn góc lái (Regression), motor/servo
+│
+▼
+Motor (UART) / Servo (I2C PWM)
 ```
 
-The control loop ticks at a **fixed period**, regardless of how fast
-inference runs. This is intentional — every rate limit and EMA inside
-`LaneFollowerV20` is *per step*, so the tick rate defines their real
-behavior.
+### Luồng hoạt động (Data Flow)
+1. **10 Hz Tick**: Cứ mỗi 100ms, lấy ảnh từ Camera và góc Heading từ IMU.
+2. **Perception**: Chạy song song `RoadSegmenter` (lấy mask đường) và `SignDetector` (lấy biển báo).
+3. **Sign Voting**: `SignVoter` tích lũy biển báo qua 5 frame. Nếu đủ tin cậy, nó "Commit" (chốt) quyết định.
+4. **Mission State Machine**: 
+   - Nếu đang `LANE_FOLLOW`: Đưa mask cho `LaneFollowerV20`.
+   - Nếu có biển báo rẽ VÀ đường đủ rộng (Bottom Coverage > 78%): Chuyển sang `FORCE_TURN`.
+   - Nếu đang `FORCE_TURN`: Giao quyền cho `TurnController` bẻ lái cứng dựa trên góc Heading thực tế của IMU.
+5. **Steering Calibration**: Góc PID thô (hoặc góc Force Turn) được đưa qua **Phương trình hồi quy** để bù trừ hao hụt cơ khí trước khi gửi xuống Servo.
 
 ---
 
@@ -40,259 +50,93 @@ behavior.
 
 ```
 config/
-  RobotConfig.h           ← every tunable constant (one place)
+  RobotConfig.h           ← Mọi hằng số hệ thống, đường dẫn model, phương trình hồi quy
 perception/
-  TrtSession.h            ← generic TensorRT engine wrapper (no model logic)
-  RoadSegmenter.h         ← TwinLiteNet road segmentation (uses TrtSession)
+  TrtSession.h            ← Generic TensorRT engine wrapper
+  RoadSegmenter.h         ← TwinLiteNet road segmentation
+  SignDetector.h          ← YOLO sign detection (decode bounding box + NMS)
 control/
-  LaneFollowerV20.h       ← the v20 PID stack (header-only, cohesive)
-main.cpp                  ← hardware init + control loop + UI
+  LaneFollowerV20.h       ← The v20 PID stack (near/far/occl/asym)
+  SignVoter.h             ← Vote & Commit logic (chống nhiễu biển báo)
+  TurnController.h        ← Force turn phases (ENTRY → TURNING → EXIT)
+mission/
+  MissionStateMachine.h   ← Bộ não trung tâm (FOLLOW vs FORCE_TURN)
+main.cpp / ucrv3.cpp      ← Khởi tạo hardware, chạy vòng lặp 10Hz, áp dụng Regression
 ```
 
-### What goes where
+---
 
-| Concern | File |
-|---|---|
-| Engine load / buffer / stream | `TrtSession.h` |
-| BGR→RGB, argmax, confidence margin | `RoadSegmenter.h` |
-| Near/far split, occlusion, PID, speed | `LaneFollowerV20.h` |
-| Constants you actually tune | `RobotConfig.h` |
-| Wiring, timing, hardware order | `main.cpp` |
+## Steering Calibration (Thay thế `POST_PID_GAIN`)
 
-**Rule of thumb:** if a piece of code touches only the TensorRT API, it
-belongs in `TrtSession.h`. If it also touches the model's tensor layout
-(BGR→RGB, argmax, NMS, class decode), it belongs in a model wrapper
-(`RoadSegmenter.h`, future `SignDetector.h`).
+Trong mô phỏng cũ, `POST_PID_GAIN = 2.2` được dùng để bù hao hụt. Trên xe thật, hao hụt là **phi tuyến tính** và **bất đối xứng**. Do đó, V3+ sử dụng phương trình hồi quy đo đạc thực tế:
+
+- **Bánh trái:** `y = 0.96x - 6.2`  ⇒  `x = (y + 6.2) / 0.96`
+- **Bánh phải:** `y = 0.71x + 2.5`  ⇒  `x = (y - 2.5) / 0.71`
+
+*(Trong đó: `y` là góc PID yêu cầu, `x` là góc thực tế cần gửi xuống servo).*
+
+**Lưu ý quan trọng:** Trong `ucrv3.cpp`, bạn **phải** khởi tạo `lane_cfg.post_pid_gain = 1.0f;` để tắt hệ số nhân 2.2 cũ. Hàm `ApplySteeringCalibration` sẽ đảm nhận việc chuyển đổi góc.
+
+---
+
+## Sign & Mission Configuration
+
+### Các loại biển báo được hỗ trợ (Class ID từ model `huy_sign.engine`)
+| ID | Class name | Hành động |
+|---|---|---|
+| 6 | `turn_left` | Rẽ trái |
+| 7 | `turn_right` | Rẽ phải |
+| 0 | `construction_ahead` | **Xử lý như `turn_left`** (theo yêu cầu bài toán) |
+| 1 | `no_left` | Không rẽ trái (mặc định rẽ phải hoặc đi thẳng) |
+| 2 | `no_right` | Không rẽ phải (mặc định rẽ trái hoặc đi thẳng) |
+| 5 | `traffic_light` | *Chưa xử lý* |
+| 3 | `parking` | *Chưa xử lý* (sẽ phát triển sau) |
+| 4 | `roundabout` | *Chưa xử lý* (sẽ phát triển sau) |
+
+### Các thông số cấu hình trong `RobotConfig.h`
+- `VOTER_ACTIVATE_FRAMES = 5`: Số frame liên tiếp phải thấy biển báo để xác nhận.
+- `VOTER_TIMEOUT_FRAMES = 100`: Nếu 100 frame không thấy lại, reset bộ vote.
+- `FORCE_ANGLE = 25.0`: Góc bẻ lái cứng khi Force Turn.
+- `HEADING_RESET_DEG = 56.0`: Góc IMU chênh lệch để xác nhận đã rẽ xong.
+- `TURN_CONDITION_COVERAGE = 0.78`: Vùng đường phía dưới phải phủ 78% diện tích mới cho phép kích hoạt Force Turn.
 
 ---
 
 ## Build
 
-The build system is unchanged from the `thisinh` scaffold.
-
 ```bash
 mkdir -p build && cd build
 cmake ..
-make -j$(nproc)
-sudo ./main
-```
-
-No new libraries are linked. `nvinfer`, `cudart`, OpenCV, and pthreads
-were already required.
-
----
-
-## Running
-
-```bash
-sudo ./main
-```
-
-Expected boot log:
-
-```
-=== UCR2026: Auto Run ===
-Engine: /home/car4/Downloads/road/kga2.engine
-Control period: 100 ms
-[RoadSegmenter] in 320x180 out 320x180
-```
-
-If you see:
-
-- `[TrtSession] Init error: ...` → engine file missing or incompatible
-  with the installed TensorRT version. Re-export the engine against the
-  Jetson's TensorRT.
-- `[RoadSegmenter] Expected 2 output channels` → the engine is not a
-  TwinLiteNet binary-segmentation model. Check the export.
-- `[RoadSegmenter] Dynamic dim ... not supported` → the engine has
-  dynamic shape bindings. Fix the export to use static shapes.
-
-Press `q` or `Esc` to stop.
-
----
-
-## The fixed-rate control tick
-
-`main.cpp` calls `LaneFollower::step()` **only** when
-`steady_clock::now() >= next_control`. Inference runs as fast as the
-hardware allows in between.
-
-Why this matters:
-
-- `rate_limit = 10` in the PID means **10° per step**, not 10° per
-  frame. At 10 Hz that is 100°/s, which is the value the sim was tuned
-  at. If you tick the PID every inference frame and inference happens
-  at 30 Hz, the effective steering rate triples.
-- Same for `derivative_alpha`, `d_far_ema_alpha`, `cov_ema_alpha`,
-  `asym_ema`, and the speed EMA.
-
-If you change `CONTROL_PERIOD_MS` in `RobotConfig.h`, **every
-per-step constant in `LaneFollowerV20.h` changes meaning**. Treat it as
-a lockstep value: if you need 20 Hz, halve the rate limits and re-tune
-the alphas with `alpha = 1 - exp(-dt / tau)`.
-
----
-
-## Adding a new perception model (sign detector, crosswalk, etc.)
-
-Copy `RoadSegmenter.h` as a template. Structure:
-
-```cpp
-class SignDetector {
-    TrtSession session_;          // reuse — do NOT reimplement
-    std::vector<float> inBuf_, outBuf_;
-    // ... model-specific dims
-public:
-    bool Init(const std::string& enginePath);
-    bool Predict(const cv::Mat& bgrFrame, SignResult& out);
-};
-```
-
-The sign model will need more post-processing (NMS, class decode,
-bbox regression). Keep all of it inside `SignDetector::Predict` — do
-not leak it into `TrtSession` and do not leak it into `main.cpp`.
-
-Then in `main.cpp`:
-
-```cpp
-ucr::perception::SignDetector sign;
-sign.Init(ucr::config::SIGN_ENGINE_PATH);
-
-// inside the loop, after road.Predict():
-ucr::perception::SignResult signs;
-sign.Predict(frame, signs);
-// → feed signs to a future MissionStateMachine
+make ucrv3 -j$(nproc)
+sudo ./ucrv3
 ```
 
 ---
 
-## Adding a new controller / mission state
+## The Fixed-Rate Control Tick
 
-When the sign detector is ready you will add a state machine between
-`LaneFollowerV20` and the motor/servo. Suggested layout:
-
-```
-mission/
-  MissionStateMachine.h    ← reads road + sign output, decides mode
-  TurnController.h         ← takes over servo during TURN_COMMITTED
-  ParkController.h         ← future
-```
-
-`main.cpp` becomes a dispatcher: it asks the state machine "who owns
-the actuator this tick?", and forwards the command from the right
-owner. Do **not** let a turn controller mutate `LaneFollowerV20`
-internals — feed its output back into the state machine, and let the
-state machine decide.
+`main.cpp` chỉ gọi `MissionStateMachine::Update()` khi `steady_clock::now() >= next_control`. 
+Mọi hằng số rate-limit (ví dụ `rate_limit = 10` trong PID) được hiểu là **10°/step**. Ở 10Hz, nó tương đương 100°/s. Không được thay đổi `CONTROL_PERIOD_MS` mà không re-tune toàn bộ alpha và rate limit.
 
 ---
 
-## Configuration guide
+## Verification Checklist (Trước khi chạy timed-run)
 
-All system-level constants live in `config/RobotConfig.h`. The
-`v20::LaneFollower` internal tuning (kp, kd, occlusion thresholds,
-asymmetry caps) stays in `control/LaneFollowerV20.h` because those are
-algorithm details, not system knobs.
-
-### The values you will actually touch
-
-| Constant | Meaning | Safe range |
-|---|---|---|
-| `MAX_SPEED_CMS` | Top forward speed | 5 → 25 |
-| `MIN_SPEED_CMS` | Floor speed during curves / occl | 2 → 8 |
-| `MAX_STEER_DEG` | Servo clamp | **verify ≤20 before going to 50** |
-| `INVERT_STEER` | Servo sign flip | must be empirically checked |
-| `CONTROL_PERIOD_MS` | PID tick period | leave at 100 unless re-tuning |
-| `MAX_ACCEL_CMS2` | Speed ramp on start | 10 → 40 |
-| `POST_PID_GAIN` | PID-to-servo scale | **calibrate empirically** |
-| `CURVE_SCALE` | How aggressive curve slowdown is | 80 (more) → 200 (less) |
-| `MIN_ROWS`, `COVERAGE_THRESHOLD` | Mask validity gate | tighten if garbage masks slip through |
-
-### Calibrate `POST_PID_GAIN`
-
-The current value (2.2) is a guess inherited from `test_run.cpp`. To
-replace it with a measured value:
-
-1. Park the car on a clear, flat surface.
-2. Command the servo manually (5°, 10°, 15°, 20°, 30°, 40°, 50°) and
-   let it hold for ~1 s each while rolling slowly forward at constant
-   speed.
-3. Record the yaw-rate from `BNO055::eulerDeg.x` for each angle.
-4. Compute what servo angle produces the same turn radius that the
-   sim's PID output of "1.0" was tuned to. That ratio is
-   `POST_PID_GAIN`.
+- [ ] `sudo ./ucrv3` boot thành công, in ra `[SignDetector] in 640x640 out ...`.
+- [ ] Camera frame hiển thị, mask đường overlay đúng.
+- [ ] Biển báo được vẽ bounding box (debug UI) khi đưa vào camera.
+- [ ] Servo bẻ đúng hướng: PID ra âm → bánh quay trái, PID ra dương → bánh quay phải (kiểm tra hàm `ApplySteeringCalibration`).
+- [ ] Khi có biển `turn_left`, xe giảm tốc, bẻ lái cứng 25°, đi đúng 56° (IMU) rồi trả lái về bám làn.
+- [ ] Emergency stop: Ctrl-C dừng xe, motor = 0, servo = 0.
 
 ---
 
-## Verification checklist
+## Future Work (Round 3 Scope)
 
-Before any timed run:
-
-- [ ] `sudo ./main` boots, prints `[RoadSegmenter] in WxH out WxH`
-- [ ] Camera frame shows in UI, mask overlays road correctly
-- [ ] Centerline (red) follows the road center visually
-- [ ] `kf` in UI ≈ 1.00 on open road, drops at junctions / obstacles
-- [ ] `INV` flag off when mask is healthy, on when lost
-- [ ] Motor at 0 → car does not move; at `MIN_SPEED_CMS` → smooth creep
-- [ ] Servo at `+N°` → car turns in the direction you expect
-- [ ] Emergency stop test: kill `main` (Ctrl-C) → motor stops, servo centers
-
----
-
-## What NOT to do
-
-- **Do not** tick the PID at inference rate. Use the fixed-period gate.
-- **Do not** reset `LaneFollower` on a single dropped road-mask frame
-  (current code resets on `inferOK=false` — a TensorRT *failure*, not a
-  lost mask; a lost mask yields `valid=false` but does not reset).
-- **Do not** put model-specific code in `TrtSession.h`.
-- **Do not** put hardware logic (camera, motor, servo) in
-  `RoadSegmenter` or `LaneFollower` — those should be pure.
-- **Do not** split `LaneFollowerV20.h`. It is cohesive; the near/far/
-  curve/occl/asym signals feed the PID and only exist in that context.
-
----
-
-## Future work (round 3 scope)
-
-Ordered by dependency:
-
-1. **Sign detector** — `perception/SignDetector.h` on top of `TrtSession`
-2. **Mission state machine** — `mission/MissionStateMachine.h`
-3. **Turn controller** — `mission/TurnController.h`, uses IMU heading for
-   completion (requires fixing E38: `integrateYawRate` is never called
-   in `SensorThread`)
-4. **Bridge handling** — new state, possibly no new model
-5. **Pedestrian stop** — needs the crosswalk detector; needs a
-   safe-resume policy
-6. **Parallel parking** — `mission/ParkController.h`, needs ToF
-   clearance logic and reverse motion
-
-Each of (1)–(6) is additive: new files under `perception/` and
-`mission/`, one new line in `main.cpp` to wire it in, and (once more
-than 2 owners exist) a small dispatcher in `main.cpp`.
-
----
-
-## Logs and debugging
-
-Currently the only visibility is the on-screen overlay (`SHOW_UI =
-true`). The overlay shows:
-
-```
-FPS <fps> | spd <applied>/<target> | PID <pre-gain> | out <post-clamp> | kf <kept_frac> [INV]
-```
-
-- `spd <applied>/<target>` — soft-start ramped value vs. what the
-  follower wanted
-- `PID <pre-gain>` — raw PID output before `POST_PID_GAIN`
-- `out <post-clamp>` — final servo command after gain, clamp, invert
-- `kf <kept_frac>` — largest-component fraction; drops at junctions
-- `INV` — mask is invalid but coverage is still > 2 %
-
-If you add a CSV logger later, the columns to capture are:
-`t_usec, valid, coverage, kept_frac, near_e, far_e, eff, curve_smooth,
-asym, occl, angle_pre_gain, angle, speed, tof[4], imu_yaw`.
+1. **Traffic Light**: Dừng xe khi đèn đỏ (cần nhận diện màu).
+2. **Pedestrian Crossing**: Dừng xe nhường đường (cần model crosswalk hoặc dùng ToF).
+3. **Parallel Parking**: `ParkController.h` sử dụng ToF và góc lùi.
+4. **Roundabout**: Cần state machine riêng để nhường đường và đi vòng.
+5. **Bridge Handling**: Xử lý khi mask đường bị mất ở hai bên (lan can cầu).
 ```
 ```
-
-That's the whole file. Save as `README.md` at the repo root (or in the round-3 source folder if you keep round-1/2 code in the same tree).
