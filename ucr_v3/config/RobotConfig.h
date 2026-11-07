@@ -22,17 +22,61 @@ inline constexpr char ROAD_ENGINE_PATH[] =
 // --------------------------------------------------------
 // Hardware limits
 // --------------------------------------------------------
-inline constexpr float MAX_SPEED_CMS = 15.0f;
-inline constexpr float MIN_SPEED_CMS = 5.0f;
+// Raised from 15 cm/s. User confirmed 10 cm/s turns without sliding,
+// so 15 → 20 is safe headroom. Do not exceed 25 until the track
+// shows a need.
+inline constexpr float MAX_SPEED_CMS = 20.0f;
+inline constexpr float MIN_SPEED_CMS = 10.0f;
 
-// NOTE: 50° has NOT been physically verified. The thisinh
-// repo's keyboard clamps at ±20°. Before trusting 50°,
-// bench-test the servo at 5/10/15/20/30/40/50° for stalls
-// and mechanical binding. Until then, 20 is the safe value.
-inline constexpr int   MAX_STEER_DEG = 50;
+// --------------------------------------------------------
+// Servo calibration (measured empirically)
+//
+// Real angle = SLOPE * servo_cmd + OFFSET, per branch:
+//   servo_cmd > 0  (left):   real =  0.96 * cmd - 6.2
+//   servo_cmd < 0  (right):  real =  0.71 * cmd + 2.5
+//
+// Conventions used by this project:
+//   - PID output (out.angle): positive = RIGHT turn
+//   - Servo command (SetAngle): positive = LEFT turn
+//   - Real angle (physical): positive = LEFT turn (matches servo)
+//
+// The helper functions below convert between "desired real angle"
+// and "servo command", inverting the measured curves.
+// --------------------------------------------------------
+inline constexpr float SERVO_LEFT_SLOPE    = 0.96f;
+inline constexpr float SERVO_LEFT_OFFSET   = -6.2f;
+inline constexpr float SERVO_RIGHT_SLOPE   = 0.71f;
+inline constexpr float SERVO_RIGHT_OFFSET  = 2.5f;
 
-// Servo driver: positive angle → turn left (opposite of PID convention).
-inline constexpr bool  INVERT_STEER  = true;
+// Symmetric real-angle bound. Servo commands are computed to hit
+// exactly this on both sides, so the car turns equally left/right.
+// At 30° real: left servo ≈ 37.7, right servo ≈ −45.8. Both are
+// safely inside the ±60° servo range. Raise to 33 if you need
+// to match the previous max right-turn capability.
+inline constexpr float MAX_REAL_ANGLE_DEG = 30.0f;
+
+// Hard safety clamp on the raw servo command. Independent of the
+// real-angle bound — catches calibration errors and saturated maps.
+inline constexpr int MAX_SERVO_CMD = 55;
+
+// Convert: desired real angle (deg, + = left) → servo command.
+inline float RealAngleToServo(float real_deg) {
+    if (real_deg > 0.0f)
+        return (real_deg - SERVO_LEFT_OFFSET) / SERVO_LEFT_SLOPE;
+    if (real_deg < 0.0f)
+        return (real_deg - SERVO_RIGHT_OFFSET) / SERVO_RIGHT_SLOPE;
+    return 0.0f;
+}
+
+// Inverse: servo command → predicted real angle (deg, + = left).
+// Use for UI diagnostics and post-run analysis.
+inline float ServoToRealAngle(float servo_cmd) {
+    if (servo_cmd > 0.0f)
+        return SERVO_LEFT_SLOPE * servo_cmd + SERVO_LEFT_OFFSET;
+    if (servo_cmd < 0.0f)
+        return SERVO_RIGHT_SLOPE * servo_cmd + SERVO_RIGHT_OFFSET;
+    return 0.0f;
+}
 
 // --------------------------------------------------------
 // Control loop

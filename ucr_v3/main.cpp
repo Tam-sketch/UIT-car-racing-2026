@@ -129,22 +129,38 @@ int main() {
             // --- Fixed-rate PID tick ---
             out = follower.step(small_mask);
 
-            // Speed
+            // --- Speed ---
             float speed = static_cast<float>(out.speed);
 
-            // Angle (out.angle already includes post_pid_gain)
-            int final_angle = static_cast<int>(std::lround(out.angle));
-            final_angle = std::clamp(final_angle,
-                                     -ucr::config::MAX_STEER_DEG,
-                                      ucr::config::MAX_STEER_DEG);
-            if (ucr::config::INVERT_STEER) final_angle = -final_angle;
+            // --- Steering ---
+            // out.angle is in PID convention (positive = right). Convert to
+            // real-angle convention (positive = left), bound symmetrically,
+            // then map through the servo calibration to a raw servo command.
+            float desired_real_left = -static_cast<float>(out.angle);
 
-            // Lost-mask creep (kept per user request)
+            desired_real_left = std::clamp(desired_real_left,
+                                        -ucr::config::MAX_REAL_ANGLE_DEG,
+                                            ucr::config::MAX_REAL_ANGLE_DEG);
+
+            float servo_cmd = ucr::config::RealAngleToServo(desired_real_left);
+
+            // Hard safety clamp on the raw servo value (independent of the
+            // real-angle bound — catches calibration errors).
+            servo_cmd = std::clamp(servo_cmd,
+                                -static_cast<float>(ucr::config::MAX_SERVO_CMD),
+                                    static_cast<float>(ucr::config::MAX_SERVO_CMD));
+
+            int final_angle = static_cast<int>(std::lround(servo_cmd));
+
+            // Predict what real angle this servo command will produce, for UI.
+            float predicted_real = ucr::config::ServoToRealAngle(servo_cmd);
+
+            // --- Lost-mask creep (unchanged) ---
             if (!out.valid && out.coverage > 0.02) {
                 speed = ucr::config::MIN_SPEED_CMS;
             }
 
-            // Soft-start: ramp up, snap down.
+            // --- Soft-start (unchanged) ---
             const float max_delta = ucr::config::MAX_ACCEL_CMS2 *
                                     (ucr::config::CONTROL_PERIOD_MS / 1000.0f);
             if (speed > applied_speed)
