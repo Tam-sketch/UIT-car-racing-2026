@@ -37,7 +37,7 @@ static constexpr float MAX_SPEED_CMS         = 18.0f;
 static constexpr int   MAX_STEER_DEG        = 50;
 static constexpr bool  INVERT_STEER         = true;
 static constexpr bool  SHOW_UI              = true;
-static constexpr bool  DA_CHANNEL           = 1; // Giữ nguyên kênh phân loại mặt đường 2-channel
+static constexpr bool  DA_CHANNEL           = 1; 
 static constexpr float MIN_SPEED_CMS        = 11.0f;
 static constexpr int   SIGN_INTERVAL_FRAMES = 5;
 static constexpr float PX_TO_CM             = 0.25f;
@@ -61,20 +61,12 @@ static TrtLogger gTrtLogger;
 // ============================================================
 // HÀM ÁNH XẠ GÓC LÁI TỪ THỰC NGHIỆM
 // ============================================================
-// Dựa trên thực nghiệm: Bánh trái y_L = 0.96x - 6.2 | Bánh phải y_R = 0.71x + 2.5
-// Trung bình 2 bánh: y_avg = 0.835x - 1.85 => Điểm 0 thực tế tại x0 = +2.22 độ
 static int MapWheelAngleToServoCmd(double desiredWheelDeg, bool invertSteer) {
-    // Đảo chiều trước nếu hệ quy ước PID và Servo ngược nhau
     double targetY = invertSteer ? -desiredWheelDeg : desiredWheelDeg;
-
-    // Bù bất đối xứng độ lợi cơ khí (0.96 bên âm vs 0.71 bên dương) + Offset điểm 0 (+2.22)
-    // Khi targetY = 0 -> x = +2.22 độ (giúp 2 bánh cân bằng ở -4.07 và +4.08 độ)
     double servoCmdX = 0.0;
     if (targetY >= 0.0) {
-        // Phía bánh phải chịu tải chính (gain cơ khí yếu 0.71 -> trung bình hiệu dụng ~0.78)
         servoCmdX = 2.22 + (targetY / 0.78);
     } else {
-        // Phía bánh trái chịu tải chính (gain cơ khí mạnh 0.96 -> trung bình hiệu dụng ~0.90)
         servoCmdX = 2.22 + (targetY / 0.90);
     }
 
@@ -306,7 +298,6 @@ int main() {
 
     NavigationBrain navBrain;
 
-    // Cấu hình PID V2.0 tối ưu đường hẹp / 1 làn
     v20::Config cfg;
     cfg.max_speed = MAX_SPEED_CMS;
     cfg.min_speed = MIN_SPEED_CMS;
@@ -315,11 +306,11 @@ int main() {
     cfg.coverage_threshold = 0.05;
 
     // --- HIỆU CHỈNH PID CHO TẦN SỐ THẤP (~6-10 FPS) ---
-    cfg.kp = 0.28;               // Hạ Kp để tránh vọt lố do trễ frame (~150ms)
-    cfg.kd = 0.45;               // Hạ Kd để không khuếch đại nhiễu do sampling
-    cfg.derivative_alpha = 0.25; // Lọc đạo hàm mượt hơn
-    cfg.output_limit = 28.0;     // Cho phép góc bánh xe mục tiêu tối đa +-28 độ
-    cfg.rate_limit = 8.0;        // Giới hạn thay đổi góc bánh xe tối đa 8 độ/frame (~50 độ/giây)
+    cfg.kp = 0.28;               
+    cfg.kd = 0.45;               
+    cfg.derivative_alpha = 0.25; 
+    cfg.output_limit = 28.0;     
+    cfg.rate_limit = 8.0;        
     cfg.emergency_rate_limit = 12.0; 
     cfg.deadband = 2.5;
 
@@ -329,10 +320,13 @@ int main() {
     cfg.early_curve_gain = 0.45; 
     cfg.early_curve_thresh = 10.0; 
 
-    // --- HIỆU CHỈNH WHEEL CLEARANCE & BẢO VỆ BÁNH XE ---
     cfg.narrow_road_width = 190.0;
     cfg.wheel_clearance_px = 110.0; 
     cfg.wheel_guard_gain = 1.10;    
+    
+    // Config bảo vệ lề đường (Dynamic Wheel Guard)
+    cfg.margin_safe_threshold_px = 16.0; // Khoảng ~4cm quy đổi ra pixel
+    cfg.margin_pushback_gain = 0.45;     // Lực nảy về nhẹ nhàng, tránh vọt lố
 
     v20::LaneFollower follower(cfg);
 
@@ -375,17 +369,15 @@ int main() {
         NavDecision dec;
 
         if (roadOK) {
-            // Lấy quyết định từ NavigationBrain
             dec = navBrain.Process(mask, follower.speed(), 200.0);
 
-            // Tích hợp steer_bias_px vào TRONG thuật toán PID của LaneFollower
+            // Bù steer_bias trực tiếp vào hàm step
             out = follower.step(mask, dec.steer_bias_px);
 
             if (dec.emergency_stop) {
                 speed = 0.0f;
                 final_angle = MapWheelAngleToServoCmd(0.0, INVERT_STEER);
             } else {
-                // Ánh xạ góc bánh mong muốn (out.angle) qua phương trình Servo thực nghiệm
                 final_angle = MapWheelAngleToServoCmd(out.angle, INVERT_STEER);
                 speed = std::clamp(dec.target_speed, MIN_SPEED_CMS, MAX_SPEED_CMS);
             }
@@ -412,7 +404,6 @@ int main() {
         const double elapsedMs = ((tCurrentTick - appStartTick) / cv::getTickFrequency()) * 1000.0;
 
         if (roadOK) {
-            // Truyền currentFps và totalFrames để ghi log chuẩn xác
             runLogger.LogStep(totalFrames, elapsedMs, currentFps, speed, final_angle, out, dec.active_sign, dec.steer_bias_px);
         }
 
