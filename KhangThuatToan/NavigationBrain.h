@@ -40,6 +40,11 @@ public:
                 // Bỏ qua traffic_light như yêu cầu
                 if (s.name == "traffic_light") continue;
 
+                // Nếu gặp biển mới khác biển cũ, reset chốt hướng rẽ
+                if (latched_sign_ != s.name) {
+                    latched_avoid_bias_ = 0.0f;
+                }
+
                 // Cập nhật biển báo mới và kích hoạt bộ chốt lệnh (Latch)
                 latched_sign_ = s.name;
                 latch_cooldown_frames_ = LATCH_DURATION_FRAMES;
@@ -62,6 +67,7 @@ public:
         } else {
             latched_sign_ = "NONE";
             dec.active_sign = "NONE";
+            latched_avoid_bias_ = 0.0f;
         }
 
         // ----------------------------------------------------
@@ -91,16 +97,15 @@ public:
         // ----------------------------------------------------
         if (dec.active_sign == "turn_left") {
             dec.action = NavAction::FORCE_LEFT;
-            dec.steer_bias_px = -65.0f; // Kéo tâm ngắm lệch mạnh sang trái
-            dec.target_speed = 11.5f;   // Giảm tốc để bo cua an toàn
+            dec.steer_bias_px = -65.0f; 
+            dec.target_speed = 11.5f;   
         }
         else if (dec.active_sign == "turn_right") {
             dec.action = NavAction::FORCE_RIGHT;
-            dec.steer_bias_px = +65.0f; // Kéo tâm ngắm lệch mạnh sang phải
+            dec.steer_bias_px = +65.0f; 
             dec.target_speed = 11.5f;
         }
         else if (dec.active_sign == "no_left") {
-            // Không được rẽ trái: Ưu tiên đi thẳng, nếu không có đường thẳng thì rẽ phải
             if (has_straight_path) {
                 dec.action = NavAction::FORCE_STRAIGHT;
                 dec.steer_bias_px = 0.0f;
@@ -111,7 +116,6 @@ public:
             }
         }
         else if (dec.active_sign == "no_right") {
-            // Không được rẽ phải: Ưu tiên đi thẳng, nếu không có đường thẳng thì rẽ trái
             if (has_straight_path) {
                 dec.action = NavAction::FORCE_STRAIGHT;
                 dec.steer_bias_px = 0.0f;
@@ -122,19 +126,24 @@ public:
             }
         }
         else if (dec.active_sign == "construction_ahead") {
-            // Có công trường: Tuyệt đối tránh đường chính/thẳng, lách sang nhánh phụ
             dec.action = NavAction::AVOID_CONSTRUCTION;
             dec.target_speed = 11.0f;
-            if (has_right_branch) {
-                dec.steer_bias_px = +60.0f; // Ưu tiên rẽ phải tránh chướng ngại
-            } else if (has_left_branch) {
-                dec.steer_bias_px = -60.0f; // Hoặc rẽ trái
-            } else {
-                dec.steer_bias_px = +45.0f; // Ép biên né chướng ngại
+            
+            // Chỉ quyết định hướng rẽ ở frame đầu tiên khi mới gặp biển, sau đó khóa cứng!
+            if (std::abs(latched_avoid_bias_) < 1.0f) {
+                if (has_right_branch && !has_left_branch) {
+                    latched_avoid_bias_ = +55.0f;
+                } else if (has_left_branch && !has_right_branch) {
+                    latched_avoid_bias_ = -55.0f;
+                } else if (has_right_branch) {
+                    latched_avoid_bias_ = +55.0f;
+                } else {
+                    latched_avoid_bias_ = -55.0f;
+                }
             }
+            dec.steer_bias_px = latched_avoid_bias_;
         }
         else if (dec.active_sign == "roundabout") {
-            // Bùng binh: Xe theo quy chuẩn nhập làn vòng xuyến (ôm nhẹ mép ngoài/bên phải)
             dec.action = NavAction::HANDLE_ROUNDABOUT;
             dec.steer_bias_px = +35.0f;
             dec.target_speed = 11.5f;
@@ -148,7 +157,6 @@ public:
     }
 
 private:
-    // Kiểm tra các nhánh rẽ ở khoảng 40% - 60% chiều cao khung hình mask
     void AnalyzeJunctions(const cv::Mat& mask, bool& has_left, bool& has_right, bool& has_straight) {
         int w = mask.cols;
         int h = mask.rows;
@@ -173,6 +181,7 @@ private:
     }
 
     std::string latched_sign_ = "NONE";
+    float latched_avoid_bias_ = 0.0f;
     int latch_cooldown_frames_ = 0;
     static constexpr int LATCH_DURATION_FRAMES = 50; // Duy trì hành vi ~7-8 giây sau khi thấy biển
 };
