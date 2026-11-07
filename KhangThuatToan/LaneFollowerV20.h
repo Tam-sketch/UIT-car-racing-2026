@@ -28,17 +28,21 @@ struct Config {
     double asym_strength = 0.15, asym_threshold = 8.0, asym_ema = 0.7;
     double asym_cap = 10.0, asym_decay = 0.80;
 
-    // BIÊN ĐỘ NHÌN XA & ĐÓN CUA
     double far_delta_clip = 45.0;
     double d_far_clip = 8.0, d_far_ema_alpha = 0.4, lead_rate_gain = 0.80;
 
-    // THUẬT TOÁN ĐÓN CUA SỚM & BẢO VỆ 2 BÁNH XE Ở 2 GÓC CUỐI
-    double early_curve_gain     = 0.55;  // Đón cua vừa đủ, không lấn át near_error
+    double early_curve_gain     = 0.55;  
     double early_curve_thresh   = 8.0;
-    double narrow_road_width    = 190.0; // Ngưỡng nhận diện đường hẹp (trên khung 320px)
+    double narrow_road_width    = 190.0; 
     double standard_road_width  = 260.0;
-    double wheel_clearance_px   = 120.0; // Khoảng cách an toàn từ tâm xe (160) ra mỗi vạch ở đáy
-    double wheel_guard_gain     = 1.35;  // Hệ số ép vạch biên về lại 2 góc cuối khi bánh xe lấn vạch
+    
+    double wheel_clearance_px   = 120.0; 
+    double wheel_guard_gain     = 1.55;  
+
+    // Ngưỡng an toàn lề đường khi rẽ (tương đương khoảng 4cm ngoài đời)
+    double margin_safe_threshold_px = 16.0; 
+    // Lực phản kháng kéo lại nếu vi phạm ngưỡng an toàn (phải mềm)
+    double margin_pushback_gain = 0.45;
 
     double hard_step_px = 30.0, err_step_px = 18.0, cov_drop = 0.22, jagged_px = 15.0;
     int    occl_hangover = 4;
@@ -49,8 +53,7 @@ struct Config {
     int emergency_streak_req = 2;
     int emg_hold_after_occl  = 5;
 
-    // --- PID ---
-    double kp = 0.42, ki = 0.0, kd = 0.65;
+    double kp = 0.45, ki = 0.0, kd = 0.70; 
     double integral_limit = 2.0, derivative_alpha = 0.30;
     double output_limit = 25.0, rate_limit = 24.0, deadband = 1.0;
     double emergency_output_limit = 25.0, emergency_rate_limit = 25.0, emergency_error_px = 26.0;
@@ -155,10 +158,17 @@ struct Centerline {
     std::vector<std::pair<int, int>> row_centers;
     std::vector<std::pair<int, int>> left_pts;
     std::vector<std::pair<int, int>> right_pts;
+    
     double road_width_near = 0.0;
     double road_width_far  = 0.0;
+    
     double dist_to_left    = 0.0;
     double dist_to_right   = 0.0;
+    int left_near_x        = -1;
+    int left_near_y        = -1;
+    int right_near_x       = -1;
+    int right_near_y       = -1;
+    
     double left_corner_x   = 0.0;
     double right_corner_x  = 0.0;
 };
@@ -183,6 +193,7 @@ inline Centerline extractCenterline(const cv::Mat& m, double prevCurveSmooth, co
     const int h = m.rows, w = m.cols;
     const double halfW = (w - 1) * 0.5;
     long nz = 0;
+    
     for (int y = h - 1; y >= 0; y--) {
         const uchar* row = m.ptr<uchar>(y);
         for (int x = 0; x < w; x++) nz += row[x] > 0;
@@ -207,11 +218,6 @@ inline Centerline extractCenterline(const cv::Mat& m, double prevCurveSmooth, co
     int yTop = percentileInt(ys, 0.02);
     int span = std::max(yBot - yTop, 1);
 
-    // Chia 4 vùng:
-    // 1. Corner Band: 18% sát đáy mask (ngang hai bánh trước ở 2 góc cuối)
-    // 2. Near Band:   35% dưới của mask
-    // 3. Mid Band:    35% - 70% của mask
-    // 4. Far Band:    30% trên cùng của mask
     int ySplitCorner = yBot - std::max(4, (int)(span * 0.18));
     int ySplitNear   = yBot - (int)(span * 0.35);
     int ySplitFar    = yTop + (int)(span * 0.30);
@@ -231,17 +237,23 @@ inline Centerline extractCenterline(const cv::Mat& m, double prevCurveSmooth, co
         if (y >= ySplitCorner) {
             cornerL.push_back(lx);
             cornerR.push_back(rx);
+            
+            if (r.left_near_x == -1) {
+                r.left_near_x = lx;
+                r.left_near_y = y;
+                r.right_near_x = rx;
+                r.right_near_y = y;
+            }
         }
 
         if (y >= ySplitNear) {
             nearC_all.push_back(cx);
-            // Ghi nhận những dòng không bị tràn cả 2 mép khung hình (tránh bẫy Near_Error = -1)
             if (lx > 2 || rx < w - 3) {
                 nearC_unclipped.push_back(cx);
             }
             nearWidths.push_back(width);
-            nearLefts.push_back(std::max(0, w / 2 - lx));
-            nearRights.push_back(std::max(0, rx - w / 2));
+            nearLefts.push_back(lx); 
+            nearRights.push_back(rx);
         } else if (y <= ySplitFar) {
             farC.push_back(cx);
             farWidths.push_back(width);
@@ -252,18 +264,22 @@ inline Centerline extractCenterline(const cv::Mat& m, double prevCurveSmooth, co
             }
         }
     }
+    
+    if (r.left_near_x == -1 && !r.left_pts.empty()) {
+        r.left_near_x = r.left_pts.front().first;
+        r.left_near_y = r.left_pts.front().second;
+        r.right_near_x = r.right_pts.front().first;
+        r.right_near_y = r.right_pts.front().second;
+    }
 
-    // Tọa độ 2 mép đường ở sát 2 góc cuối
     r.left_corner_x  = cornerL.empty() ? 0.0 : medianInts(cornerL);
     r.right_corner_x = cornerR.empty() ? (double)(w - 1) : medianInts(cornerR);
     r.corner_error   = 0.5 * (r.left_corner_x + r.right_corner_x) - halfW;
 
-    // Nếu vùng đáy bị tràn cả 2 góc (lx=0, rx=319), dùng các dòng unclipped để tránh mù hướng
     double nearCx = halfW;
     if (!nearC_unclipped.empty()) {
         double rawNearCx = nearC_all.empty() ? halfW : medianInts(nearC_all);
         double unclipCx  = medianInts(nearC_unclipped);
-        // Nếu đáy tràn toàn khung hình (rawNearCx ~ 159.5), pha 60% unclipCx để phát hiện lệch sớm
         if (r.left_corner_x <= 2.0 && r.right_corner_x >= w - 3.0) {
             nearCx = 0.40 * rawNearCx + 0.60 * unclipCx;
         } else {
@@ -285,8 +301,12 @@ inline Centerline extractCenterline(const cv::Mat& m, double prevCurveSmooth, co
 
     r.road_width_near = nearWidths.empty() ? 0.0 : medianInts(nearWidths);
     r.road_width_far  = farWidths.empty()  ? 0.0 : medianInts(farWidths);
-    r.dist_to_left    = std::max(0.0, halfW - r.left_corner_x);
-    r.dist_to_right   = std::max(0.0, r.right_corner_x - halfW);
+    
+    double avg_lx = nearLefts.empty() ? 0.0 : medianInts(nearLefts);
+    double avg_rx = nearRights.empty() ? (w-1) : medianInts(nearRights);
+    
+    r.dist_to_left    = avg_lx; 
+    r.dist_to_right   = (w - 1) - avg_rx; 
 
     r.valid = true;
     return r;
@@ -482,10 +502,17 @@ public:
         std::vector<std::pair<int, int>> centerline_pts;
         std::vector<std::pair<int, int>> left_line_pts;
         std::vector<std::pair<int, int>> right_line_pts;
+        
         double road_width_near = 0.0;
         double road_width_far  = 0.0;
         double dist_to_left    = 0.0;
         double dist_to_right   = 0.0;
+        
+        int left_near_x        = 0;
+        int left_near_y        = 0;
+        int right_near_x       = 0;
+        int right_near_y       = 0;
+        
         bool is_narrow_road    = false;
         bool is_curve_ahead    = false;
         int proc_width = 0;
@@ -504,7 +531,7 @@ public:
     double speed() const { return speed_; }
     void setSpeed(double s) { speed_ = s; }
 
-    Output step(const cv::Mat& roadMask) {
+    Output step(const cv::Mat& roadMask, double externalBiasPx = 0.0) {
         cv::Mat m = detail::preprocessMask(roadMask, c_);
         Output o;
         detail::Centerline cl;
@@ -515,31 +542,51 @@ public:
         curveSmooth_ = cl.curve_smooth;
         const bool valid = cl.valid;
 
-        // 1. NHẬN DIỆN ĐƯỜNG HẸP (ở gần hoặc sắp thu hẹp ở xa)
+        // 1. NHẬN DIỆN ĐƯỜNG HẸP & MẤT LÀN
         bool isNarrow = (cl.road_width_near > 0.0 && cl.road_width_near < c_.narrow_road_width) ||
                         (cl.road_width_far  > 0.0 && cl.road_width_far  < c_.narrow_road_width * 0.75);
 
-        // 2. BẢO VỆ 2 BÁNH XE Ở 2 GÓC CUỐI (WHEEL CLEARANCE GUARD)
-        // Trên đường hẹp, co ngưỡng an toàn theo 44% bề rộng thực tế để giữ 2 vạch cách đều 2 góc
-        double activeClearance = c_.wheel_clearance_px;
-        if (cl.road_width_near > 40.0) {
-            activeClearance = std::min(c_.wheel_clearance_px, 0.44 * cl.road_width_near);
-        }
+        bool missing_left  = (cl.dist_to_left <= 2.0);
+        bool missing_right = (cl.dist_to_right <= 2.0);
+        bool is_single_lane = (missing_left ^ missing_right) && isNarrow;
 
         double wheelGuardBias = 0.0;
-        // Nếu vạch trái lấn vào bánh trái (dist_to_left nhỏ hơn ngưỡng) -> đẩy dương (quẹo phải)
-        if (cl.dist_to_left < activeClearance) {
-            wheelGuardBias += c_.wheel_guard_gain * (activeClearance - cl.dist_to_left);
-        }
-        // Nếu vạch phải lấn vào bánh phải (dist_to_right nhỏ hơn ngưỡng) -> đẩy âm (quẹo trái)
-        if (cl.dist_to_right < activeClearance) {
-            wheelGuardBias -= c_.wheel_guard_gain * (activeClearance - cl.dist_to_right);
+
+        // 2. DYNAMIC WHEEL GUARD (CHỐNG OUTLINE KHI RẼ GẮT)
+        // Nếu externalBiasPx đang điều hướng rẽ trái/phải, ta giám sát khoảng cách lề tương ứng.
+        if (externalBiasPx < -5.0) { 
+            // Đang rẽ trái (Steer Bias Âm) -> Giám sát lề TRÁI
+            if (cl.dist_to_left > c_.margin_safe_threshold_px) {
+                // Vi phạm ngưỡng, đẩy mềm về phía mốc an toàn
+                wheelGuardBias = +c_.margin_pushback_gain * (cl.dist_to_left - c_.margin_safe_threshold_px);
+            }
+        } else if (externalBiasPx > 5.0) {
+            // Đang rẽ phải (Steer Bias Dương) -> Giám sát lề PHẢI
+            if (cl.dist_to_right > c_.margin_safe_threshold_px) {
+                // Vi phạm ngưỡng, đẩy mềm về phía mốc an toàn
+                wheelGuardBias = -c_.margin_pushback_gain * (cl.dist_to_right - c_.margin_safe_threshold_px);
+            }
+        } else {
+            // Trường hợp chạy thẳng thông thường
+            if (is_single_lane) {
+                double targetMargin = 45.0; 
+                if (missing_left && !missing_right) {
+                    wheelGuardBias = -c_.wheel_guard_gain * (cl.dist_to_right - targetMargin);
+                } else if (missing_right && !missing_left) {
+                    wheelGuardBias = +c_.wheel_guard_gain * (cl.dist_to_left - targetMargin);
+                }
+                wheelGuardBias = std::clamp(wheelGuardBias, -25.0, 25.0);
+            } else {
+                double marginDiff = cl.dist_to_left - cl.dist_to_right;
+                wheelGuardBias = 0.15 * marginDiff;
+            }
         }
 
-        // 3. SAI SỐ VỊ TRÍ THÂN XE (TRỌNG SỐ DƯƠNG TUYỆT ĐỐI, KHÔNG BAO GIỜ ĐẢO DẤU NEAR_E)
-        double posError = 0.55 * nearE + 0.30 * cl.corner_error + 0.15 * midE + wheelGuardBias;
+        // 3. TÍNH SAI SỐ TỔNG
+        double posError = 0.55 * nearE + 0.30 * cl.corner_error + 0.15 * midE 
+                        + wheelGuardBias + externalBiasPx;
 
-        // 4. ĐÓN CUA SỚM CÓ GIẢM SUY KHI XE ĐANG LỆCH BÁNH RA NGOÀI
+        // 4. ĐÓN CUA SỚM
         double rawCurveDiff = 0.50 * (midE - nearE) + 0.50 * (farE - midE);
         double clippedCurveDiff = std::clamp(rawCurveDiff, -c_.far_delta_clip, c_.far_delta_clip);
         bool isCurveAhead = std::abs(rawCurveDiff) > c_.early_curve_thresh;
@@ -550,12 +597,10 @@ public:
         prevFarE_ = farE;
 
         double curveLead = 0.0;
-        if (isCurveAhead) {
+        if (isCurveAhead && std::abs(externalBiasPx) < 1.0) {
             curveLead = c_.early_curve_gain * clippedCurveDiff + c_.lead_rate_gain * dFarFilt_;
         }
 
-        // Nếu xe đang lệch gần quá lớn (|nearE| > 22px) và curveLead ngược dấu với posError,
-        // khóa bớt curveLead để ưu tiên kéo 2 bánh xe về lại giữa 2 góc cuối trước!
         if (posError * curveLead < 0.0) {
             double offTrackRatio = std::clamp((std::abs(nearE) - 18.0) / 25.0, 0.0, 0.90);
             curveLead *= (1.0 - offTrackRatio);
@@ -573,21 +618,23 @@ public:
             if (std::abs(nearE) < 5.0 && std::abs(asymSmooth_) < c_.asym_cap) asymSmooth_ *= c_.asym_decay;
             asymSmooth_ = std::clamp(asymSmooth_, -c_.asym_cap, c_.asym_cap);
         }
+        
         double asymApplied = (std::abs(asymSmooth_) < c_.asym_threshold) ? 0.0 : c_.asym_strength * asymSmooth_;
         if (posError * asymApplied < 0.0 && std::abs(nearE) > 25.0) {
-            asymApplied = 0.0; // Không cho asym kéo ngược khi bánh xe đang out
+            asymApplied = 0.0;
         }
         double eff = blended + asymApplied;
 
-        // 5. TĂNG ĐỘ NHẠY KHI VÀO ĐƯỜNG HẸP HOẶC KHI LỆCH BÁNH
+        // 5. PID 
         double currentKp = c_.kp;
         double currentRateLim = c_.rate_limit;
+        
         if (isNarrow || std::abs(wheelGuardBias) > 5.0) {
-            currentKp = c_.kp * 1.20;      // Tăng lực giữ tâm ở đường hẹp
-            currentRateLim = c_.rate_limit; // Tuyệt đối không giảm rate_limit
+            currentKp = c_.kp * 1.30; 
+            currentRateLim = c_.rate_limit * 1.1; 
         }
 
-        bool forcedEmer = (emerHold_ > 0) || (std::abs(wheelGuardBias) > 18.0);
+        bool forcedEmer = (emerHold_ > 0);
         pid_.setForcedEmergency(forcedEmer);
 
         double angle;
@@ -617,8 +664,14 @@ public:
         o.right_line_pts = cl.right_pts;
         o.road_width_near = cl.road_width_near;
         o.road_width_far  = cl.road_width_far;
+        
         o.dist_to_left    = cl.dist_to_left;
         o.dist_to_right   = cl.dist_to_right;
+        o.left_near_x     = cl.left_near_x;
+        o.left_near_y     = cl.left_near_y;
+        o.right_near_x    = cl.right_near_x;
+        o.right_near_y    = cl.right_near_y;
+        
         o.is_narrow_road  = isNarrow;
         o.is_curve_ahead  = isCurveAhead;
         o.proc_width = m.cols;

@@ -1,8 +1,11 @@
-// test_run.cpp
+// ============================================================
+// main_run.cpp — UCR2026 Full Integrated (LaneFollower + SignDetector + NavigationBrain)
+// ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
 #include "hardware/Servo.h"
 #include "common/Logger.h"
+
 #include "control/LaneFollowerV20.h"
 #include "SignDetector.h"
 #include "NavigationBrain.h"
@@ -27,16 +30,17 @@
 #include <iomanip>
 #include <sstream>
 
-static const std::string ENGINE_PATH = "/home/car4/Downloads/road/kga2.engine";
+static const std::string ENGINE_PATH      = "/home/car4/Downloads/road/kga2.engine";
+static const std::string SIGN_ENGINE_PATH = "/home/car4/Downloads/sign/huy_sign.engine";
 
-static constexpr float MAX_SPEED_CMS = 18.0f;
-static constexpr int   MAX_STEER_DEG = 50;
-static constexpr bool  INVERT_STEER  = true;
-static constexpr bool  SHOW_UI       = true;
-static constexpr bool  DA_CHANNEL    = 1;
-static constexpr float STEER_GAIN    = 2.2f;
-static constexpr float MIN_SPEED_CMS = 11.0f;
-static constexpr float CURVE_SCALE   = 160.0f;
+static constexpr float MAX_SPEED_CMS         = 18.0f;
+static constexpr int   MAX_STEER_DEG        = 50;
+static constexpr bool  INVERT_STEER         = true;
+static constexpr bool  SHOW_UI              = true;
+static constexpr bool  DA_CHANNEL           = 1; 
+static constexpr float MIN_SPEED_CMS        = 11.0f;
+static constexpr int   SIGN_INTERVAL_FRAMES = 5;
+static constexpr float PX_TO_CM             = 0.25f;
 
 volatile std::sig_atomic_t g_stopSignal = 0;
 static void SignalHandler(int) { g_stopSignal = 1; }
@@ -54,6 +58,25 @@ public:
 };
 static TrtLogger gTrtLogger;
 
+// ============================================================
+// HÀM ÁNH XẠ GÓC LÁI TỪ THỰC NGHIỆM
+// ============================================================
+static int MapWheelAngleToServoCmd(double desiredWheelDeg, bool invertSteer) {
+    double targetY = invertSteer ? -desiredWheelDeg : desiredWheelDeg;
+    double servoCmdX = 0.0;
+    if (targetY >= 0.0) {
+        servoCmdX = 2.22 + (targetY / 0.78);
+    } else {
+        servoCmdX = 2.22 + (targetY / 0.90);
+    }
+
+    int finalCmd = static_cast<int>(std::lround(servoCmdX));
+    return std::clamp(finalCmd, -MAX_STEER_DEG, MAX_STEER_DEG);
+}
+
+// ============================================================
+// MODEL TENSORRT ĐƯỜNG LÀN
+// ============================================================
 class TrtModel {
 public:
     ~TrtModel() { Cleanup(); }
@@ -83,7 +106,6 @@ public:
             inputIndex_ = -1; outputIndex_ = -1;
 
             for (int i = 0; i < nb; ++i) {
-                const char* name = engine_->getBindingName(i);
                 const bool isIn = engine_->bindingIsInput(i);
                 nvinfer1::Dims d = engine_->getBindingDimensions(i);
                 size_t elems = 1;
@@ -104,7 +126,7 @@ public:
                 throw std::runtime_error("Missing binding");
 
             CheckCuda(cudaStreamCreate(&stream_), "cudaStreamCreate");
-            std::cout << "[TRT] Ready. Input: " << inputW_ << "x" << inputH_ << "\n";
+            std::cout << "[TRT] Road Ready. Input: " << inputW_ << "x" << inputH_ << "\n";
             return true;
         } catch (const std::exception& e) {
             std::cerr << "[Init Error] " << e.what() << "\n";
@@ -147,8 +169,8 @@ public:
             const size_t outPlane = (size_t)outputW_ * outputH_;
             const float* ch0 = outputData_.data();
             const float* ch1 = outputData_.data() + outPlane;
-            const float* da = (DA_CHANNEL == 1) ? ch1 : ch0;
-            const float* bg = (DA_CHANNEL == 1) ? ch0 : ch1;
+            const float* da  = (DA_CHANNEL == 1) ? ch1 : ch0;
+            const float* bg  = (DA_CHANNEL == 1) ? ch0 : ch1;
 
             cv::Mat small(outputH_, outputW_, CV_8UC1);
             for (int y = 0; y < outputH_; ++y) {
@@ -186,6 +208,9 @@ private:
     int inputW_ = 0, inputH_ = 0, outputW_ = 0, outputH_ = 0;
 };
 
+// ============================================================
+// BỘ GHI FILE LOG MỞ RỘNG
+// ============================================================
 class RunFileLogger {
 public:
     bool Init() {
@@ -202,15 +227,16 @@ public:
         file_.open(filename_, std::ios::out | std::ios::trunc);
         if (!file_.is_open()) return false;
 
-        file_ << "# AUTO CONTROL & BOUNDARY TELEMETRY LOG (UCR2026 LaneFollowerV20)\n";
+        file_ << "# AUTO CONTROL & TELEMETRY LOG (UCR2026 LaneFollowerV2.0 + NavigationBrain)\n";
         file_ << "# Columns: Frame,Timestamp_ms,FPS,Speed_cms,Servo_Angle,PID_Angle,"
-                 "Near_Error,Far_Error,Eff_Error,Coverage,IsValid,CurveAhead\n";
+                 "Near_Error,Far_Error,Dist_Left_px,Dist_Right_px,Active_Sign,Steer_Bias_px,IsValid,CurveAhead\n";
         file_.flush();
         return true;
     }
 
     void LogStep(long frameIdx, double elapsedMs, double fps, float speed, 
-                 int finalAngle, const v20::LaneFollower::Output& out) {
+                 int finalAngle, const v20::LaneFollower::Output& out, 
+                 const std::string& activeSign, float steerBias) {
         if (!file_.is_open()) return;
 
         file_ << frameIdx << ","
@@ -221,8 +247,10 @@ public:
               << std::setprecision(2) << out.angle << ","
               << std::setprecision(2) << out.near_e << ","
               << std::setprecision(2) << out.far_e << ","
-              << std::setprecision(2) << out.eff_error << ","
-              << std::setprecision(3) << out.coverage << ","
+              << std::setprecision(1) << out.dist_to_left << ","
+              << std::setprecision(1) << out.dist_to_right << ","
+              << activeSign << ","
+              << std::setprecision(1) << steerBias << ","
               << (out.valid ? 1 : 0) << ","
               << (out.is_curve_ahead ? 1 : 0) << "\n";
 
@@ -256,51 +284,67 @@ int main() {
     motor.SetSpeedCms(0.0f);
     servo.SetAngle(0);
 
-    TrtModel model;
-    if (!model.Init(ENGINE_PATH)) {
-        std::cerr << "Model init failed\n";
+    TrtModel roadModel;
+    if (!roadModel.Init(ENGINE_PATH)) {
+        std::cerr << "Road Model init failed\n";
         return -1;
     }
 
-    // --- CẤU HÌNH THUẬT TOÁN (ĐO ĐỘ UỐN MÉP ĐƯỜNG ĐÓN CUA SỚM) ---
-// CẤU HÌNH THUẬT TOÁN KHOÁ 2 GÓC ĐÁY & BẢO VỆ BÁNH XE ĐƯỜNG HẸP
+    SignDetector signDetector;
+    if (!signDetector.Init(SIGN_ENGINE_PATH)) {
+        std::cerr << "Sign Detector init failed\n";
+        return -1;
+    }
+
+    NavigationBrain navBrain;
+
     v20::Config cfg;
     cfg.max_speed = MAX_SPEED_CMS;
     cfg.min_speed = MIN_SPEED_CMS;
-    cfg.curve_scale = 140.0;
+    cfg.curve_scale = 160.0;
     cfg.min_rows = 5;
     cfg.coverage_threshold = 0.05;
 
-    cfg.kp = 0.42;
-    cfg.kd = 0.65;
-    cfg.derivative_alpha = 0.30;
-    cfg.lead_rate_gain = 0.80;
-    cfg.far_delta_clip = 45.0;
-    cfg.early_curve_gain = 0.55;      // Không để far_e đảo dấu near_e
-    cfg.early_curve_thresh = 8.0;
-    cfg.narrow_road_width = 190.0;    // Nhận diện sớm khúc đường hẹp trên khung 320px
-    cfg.wheel_clearance_px = 120.0;   // Giữ 2 vạch biên cách tâm xe >= 120px (sát 2 góc cuối)
-    cfg.wheel_guard_gain = 1.35;      // Lực đẩy mạnh khi 1 vạch tràn vào bánh xe
-    cfg.rate_limit = 24.0;
-    cfg.deadband = 1.0;
+    // --- HIỆU CHỈNH PID CHO TẦN SỐ THẤP (~6-10 FPS) ---
+    cfg.kp = 0.28;               
+    cfg.kd = 0.45;               
+    cfg.derivative_alpha = 0.25; 
+    cfg.output_limit = 28.0;     
+    cfg.rate_limit = 8.0;        
+    cfg.emergency_rate_limit = 12.0; 
+    cfg.deadband = 2.5;
+
+    // --- HIỆU CHỈNH ĐÓN CUA SỚM & LÀN ---
+    cfg.lead_rate_gain = 0.60;   
+    cfg.far_delta_clip = 35.0;   
+    cfg.early_curve_gain = 0.45; 
+    cfg.early_curve_thresh = 10.0; 
+
+    cfg.narrow_road_width = 190.0;
+    cfg.wheel_clearance_px = 110.0; 
+    cfg.wheel_guard_gain = 1.10;    
+    
+    // Config bảo vệ lề đường (Dynamic Wheel Guard)
+    cfg.margin_safe_threshold_px = 16.0; // Khoảng ~4cm quy đổi ra pixel
+    cfg.margin_pushback_gain = 0.45;     // Lực nảy về nhẹ nhàng, tránh vọt lố
 
     v20::LaneFollower follower(cfg);
 
     RunFileLogger runLogger;
     if (runLogger.Init()) {
-        std::cout << "[Logger] Writing telemetry to: " << runLogger.GetFilename() << "\n";
+        std::cout << "[Logger] Writing extended telemetry to: " << runLogger.GetFilename() << "\n";
     }
 
     cv::Mat frame, mask;
-    double fps = 0.0;
     long frameCount = 0;
+    long totalFrames = 0;
+    double currentFps = 0.0;
     auto tPrev = std::chrono::high_resolution_clock::now();
     const double appStartTick = static_cast<double>(cv::getTickCount());
+    std::vector<SignObject> cachedSigns;
 
-    std::cout << "\n=== UCR2026: Auto Run (Boundary Aware) ===\n"
-              << "Engine: " << ENGINE_PATH << "\n"
-              << "Steer Gain: " << STEER_GAIN << "x\n"
-              << "Press 'q' to quit\n\n";
+    std::cout << "\n=== UCR2026: Auto Run (Full Integrated) ===\n"
+              << "Press 'q' or ESC to quit\n\n";
 
     while (!g_stopSignal) {
         camera.GetFrame(frame);
@@ -311,24 +355,31 @@ int main() {
             continue;
         }
 
-        bool inferOK = model.Predict(frame, mask);
+        totalFrames++;
+
+        if (totalFrames % SIGN_INTERVAL_FRAMES == 0) {
+            cachedSigns = signDetector.Detect(frame, 0.70f);
+            navBrain.UpdateSign(cachedSigns);
+        }
+
+        bool roadOK = roadModel.Predict(frame, mask);
         v20::LaneFollower::Output out;
-        float speed = 0.0f;
+        float speed = MIN_SPEED_CMS;
         int final_angle = 0;
+        NavDecision dec;
 
-        if (inferOK) {
-            out = follower.step(mask);
+        if (roadOK) {
+            dec = navBrain.Process(mask, follower.speed(), 200.0);
 
-            speed = std::clamp((float)out.speed, MIN_SPEED_CMS, MAX_SPEED_CMS);
+            // Bù steer_bias trực tiếp vào hàm step
+            out = follower.step(mask, dec.steer_bias_px);
 
-            float raw_angle = out.angle * STEER_GAIN;
-            final_angle = static_cast<int>(std::lround(raw_angle));
-            final_angle = std::clamp(final_angle, -MAX_STEER_DEG, MAX_STEER_DEG);
-
-            if (INVERT_STEER) final_angle = -final_angle;
-
-            if (!out.valid && out.coverage > 0.02) {
-                speed = MIN_SPEED_CMS;
+            if (dec.emergency_stop) {
+                speed = 0.0f;
+                final_angle = MapWheelAngleToServoCmd(0.0, INVERT_STEER);
+            } else {
+                final_angle = MapWheelAngleToServoCmd(out.angle, INVERT_STEER);
+                speed = std::clamp(dec.target_speed, MIN_SPEED_CMS, MAX_SPEED_CMS);
             }
 
             motor.SetSpeedCms(speed);
@@ -336,7 +387,7 @@ int main() {
 
         } else {
             motor.SetSpeedCms(0.0f);
-            servo.SetAngle(0);
+            servo.SetAngle(MapWheelAngleToServoCmd(0.0, INVERT_STEER));
             follower.resetTracking();
         }
 
@@ -344,7 +395,7 @@ int main() {
         auto tNow = std::chrono::high_resolution_clock::now();
         double dt = std::chrono::duration<double>(tNow - tPrev).count();
         if (dt > 0.5) {
-            fps = frameCount / dt;
+            currentFps = frameCount / dt;
             frameCount = 0;
             tPrev = tNow;
         }
@@ -352,17 +403,13 @@ int main() {
         const double tCurrentTick = static_cast<double>(cv::getTickCount());
         const double elapsedMs = ((tCurrentTick - appStartTick) / cv::getTickFrequency()) * 1000.0;
 
-        if (inferOK) {
-            runLogger.LogStep(frameCount, elapsedMs, fps, speed, final_angle, out);
+        if (roadOK) {
+            runLogger.LogStep(totalFrames, elapsedMs, currentFps, speed, final_angle, out, dec.active_sign, dec.steer_bias_px);
         }
 
-        // =========================================================
-        // VẼ UI: 2 ĐƯỜNG MÉP BIÊN + ĐƯỜNG TIM
-        // =========================================================
         if (SHOW_UI) {
             cv::Mat overlay = frame.clone();
-            if (inferOK) {
-                // Phủ mask xanh lá mờ lên mặt đường
+            if (roadOK) {
                 cv::Mat green(frame.size(), frame.type(), cv::Scalar(0, 255, 0));
                 cv::Mat blended;
                 cv::addWeighted(frame, 0.65, green, 0.35, 0, blended);
@@ -372,47 +419,55 @@ int main() {
                     float scale_x = (float)frame.cols / out.proc_width;
                     float scale_y = (float)frame.rows / out.proc_height;
 
-                    // 1. Mép TRÁI (Cyan / Xanh biển nhạt)
-                    if (!out.left_line_pts.empty()) {
-                        for (size_t i = 0; i + 1 < out.left_line_pts.size(); ++i) {
-                            cv::Point p1(out.left_line_pts[i].first * scale_x, out.left_line_pts[i].second * scale_y);
-                            cv::Point p2(out.left_line_pts[i+1].first * scale_x, out.left_line_pts[i+1].second * scale_y);
-                            cv::line(overlay, p1, p2, cv::Scalar(255, 220, 0), 2);
-                        }
+                    for (size_t i = 0; i + 1 < out.left_line_pts.size(); ++i) {
+                        cv::Point p1(out.left_line_pts[i].first * scale_x, out.left_line_pts[i].second * scale_y);
+                        cv::Point p2(out.left_line_pts[i+1].first * scale_x, out.left_line_pts[i+1].second * scale_y);
+                        cv::line(overlay, p1, p2, cv::Scalar(255, 220, 0), 2);
+                    }
+                    for (size_t i = 0; i + 1 < out.right_line_pts.size(); ++i) {
+                        cv::Point p1(out.right_line_pts[i].first * scale_x, out.right_line_pts[i].second * scale_y);
+                        cv::Point p2(out.right_line_pts[i+1].first * scale_x, out.right_line_pts[i+1].second * scale_y);
+                        cv::line(overlay, p1, p2, cv::Scalar(0, 165, 255), 2);
+                    }
+                    for (size_t i = 0; i + 1 < out.centerline_pts.size(); ++i) {
+                        cv::Point p1(out.centerline_pts[i].first * scale_x, out.centerline_pts[i].second * scale_y);
+                        cv::Point p2(out.centerline_pts[i+1].first * scale_x, out.centerline_pts[i+1].second * scale_y);
+                        cv::line(overlay, p1, p2, cv::Scalar(0, 0, 255), 2);
                     }
 
-                    // 2. Mép PHẢI (Vàng cam / Magenta)
-                    if (!out.right_line_pts.empty()) {
-                        for (size_t i = 0; i + 1 < out.right_line_pts.size(); ++i) {
-                            cv::Point p1(out.right_line_pts[i].first * scale_x, out.right_line_pts[i].second * scale_y);
-                            cv::Point p2(out.right_line_pts[i+1].first * scale_x, out.right_line_pts[i+1].second * scale_y);
-                            cv::line(overlay, p1, p2, cv::Scalar(0, 165, 255), 2);
-                        }
-                    }
+                    if (out.left_near_y > 0 && out.right_near_y > 0) {
+                        cv::Point left_lane_pt(out.left_near_x * scale_x, out.left_near_y * scale_y);
+                        cv::Point right_lane_pt(out.right_near_x * scale_x, out.right_near_y * scale_y);
+                        
+                        cv::Point bottom_left(0, frame.rows - 1);
+                        cv::Point bottom_right(frame.cols - 1, frame.rows - 1);
 
-                    // 3. TIM ĐƯỜNG (Màu Đỏ)
-                    if (!out.centerline_pts.empty()) {
-                        for (size_t i = 0; i + 1 < out.centerline_pts.size(); ++i) {
-                            cv::Point p1(out.centerline_pts[i].first * scale_x, out.centerline_pts[i].second * scale_y);
-                            cv::Point p2(out.centerline_pts[i+1].first * scale_x, out.centerline_pts[i+1].second * scale_y);
-                            cv::line(overlay, p1, p2, cv::Scalar(0, 0, 255), 2);
-                        }
+                        cv::line(overlay, bottom_left, left_lane_pt, cv::Scalar(255, 0, 255), 3);
+                        cv::line(overlay, bottom_right, right_lane_pt, cv::Scalar(255, 0, 255), 3);
+
+                        float left_dist_cm  = std::max(0.0f, static_cast<float>(out.dist_to_left * scale_x) * PX_TO_CM);
+                        float right_dist_cm = std::max(0.0f, static_cast<float>(out.dist_to_right * scale_x) * PX_TO_CM);
+
+                        cv::putText(overlay, std::to_string((int)left_dist_cm) + "cm", 
+                                    cv::Point(left_lane_pt.x + 10, left_lane_pt.y - 10), 
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 2);
+                        cv::putText(overlay, std::to_string((int)right_dist_cm) + "cm", 
+                                    cv::Point(right_lane_pt.x - 60, right_lane_pt.y - 10), 
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 2);
                     }
                 }
             }
 
-            char text1[128], text2[128];
-            std::snprintf(text1, sizeof(text1),
-                "FPS: %.1f | Spd: %.1f | Steer: %d",
-                fps, speed, final_angle);
+            signDetector.Draw(overlay, cachedSigns);
 
-            std::snprintf(text2, sizeof(text2),
-                "Near_E: %.1f | Far_E: %.1f | Curve Ahead: %s",
-                out.near_e, out.far_e, out.is_curve_ahead ? "YES (EARLY TURN)" : "NO");
+            char text1[128], text2[128];
+            std::snprintf(text1, sizeof(text1), "FPS: %.1f | Spd: %.1f | Steer: %d | Sign: %s",
+                          currentFps, speed, final_angle, dec.active_sign.c_str());
+            std::snprintf(text2, sizeof(text2), "L_Dist: %.0fpx | R_Dist: %.0fpx | Bias: %.0fpx",
+                          out.dist_to_left, out.dist_to_right, dec.steer_bias_px);
 
             cv::putText(overlay, text1, {15, 30}, cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 255, 0), 2);
-            cv::putText(overlay, text2, {15, 60}, cv::FONT_HERSHEY_SIMPLEX, 0.65, 
-                        out.is_curve_ahead ? cv::Scalar(0, 165, 255) : cv::Scalar(0, 255, 255), 2);
+            cv::putText(overlay, text2, {15, 60}, cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 255, 255), 2);
 
             cv::imshow("Lane Follower", overlay);
             int key = cv::waitKey(1) & 0xFF;
@@ -423,7 +478,7 @@ int main() {
     }
 
     motor.SetSpeedCms(0.0f);
-    servo.SetAngle(0);
+    servo.SetAngle(MapWheelAngleToServoCmd(0.0, INVERT_STEER));
     if (SHOW_UI) cv::destroyAllWindows();
     std::cout << "\n[System] Stopped safely\n";
     return 0;
