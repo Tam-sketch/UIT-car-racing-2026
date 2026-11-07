@@ -39,7 +39,19 @@ public:
         float confidenceMargin = 0.02f;
     };
 
-    bool Init(const std::string& enginePath, const Config& cfg = {}) {
+    // Zero-arg overload.
+    //
+    // NOTE: this overload exists because GCC 7.5 (Jetpack 4.x on Jetson Nano)
+    // has a bug (GCC#92357) where a nested struct with default member
+    // initializers cannot be used as a default argument (`= {}`) in a sibling
+    // member function signature. Constructing Config in the body sidesteps
+    // the bug entirely; the struct is fully defined by then.
+    bool Init(const std::string& enginePath) {
+        return Init(enginePath, Config{});
+    }
+
+    // Config overload: original behaviour, no default argument.
+    bool Init(const std::string& enginePath, const Config& cfg) {
         cfg_ = cfg;
 
         if (!session_.Init(enginePath)) return false;
