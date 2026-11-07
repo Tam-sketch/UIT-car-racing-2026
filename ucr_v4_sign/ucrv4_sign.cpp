@@ -4,10 +4,10 @@
 #include "mission/MissionStateMachine.h"
 
 // Include Hardware
-#include "Camera.h"
-#include "Motor.h"
-#include "Servo.h"
-#include "BNO055.h"
+#include "hardware/Camera.h"
+#include "hardware/Motor.h"
+#include "hardware/Servo.h"
+#include "sensor/BNO055.h"
 
 #include <opencv2/opencv.hpp>
 #include <iostream>
