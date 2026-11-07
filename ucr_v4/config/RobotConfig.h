@@ -14,11 +14,8 @@ namespace config {
 // --------------------------------------------------------
 // Model paths
 // --------------------------------------------------------
-inline constexpr char ROAD_ENGINE_PATH[] =
-    "/home/car4/Downloads/road/kga2.engine";
-
-static constexpr const char* SIGN_ENGINE_PATH = 
-    "/home/car4/Downloads/sign/huy_sign.engine";
+inline constexpr char ROAD_ENGINE_PATH[] = "/home/car4/Downloads/road/kga2.engine";
+inline constexpr char SIGN_ENGINE_PATH[] = "/home/car4/Downloads/sign/huy_sign.engine";
 
 // --------------------------------------------------------
 // Hardware limits
