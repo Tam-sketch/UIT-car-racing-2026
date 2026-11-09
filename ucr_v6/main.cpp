@@ -59,18 +59,16 @@ static void SignalHandler(int) { g_stopSignal = 1; }
 // ============================================================
 static v21::SignState MakeSignState(int committed) {
     v21::SignState s;
-    if (committed < 0) return s;   // default: active=false, side=0, class=-1
+    if (committed < 0) return s;
 
     using namespace ucr::config::sign_class;
     s.class_id = committed;
     switch (committed) {
-        case TURN_LEFT:          s.active = true; s.side = -1; break;
-        case TURN_RIGHT:         s.active = true; s.side = +1; break;
-        case NO_LEFT:            s.active = true; s.side = +1; break; // must go right
-        case NO_RIGHT:           s.active = true; s.side = -1; break; // must go left
-        case CONSTRUCTION_AHEAD: s.active = true; s.side =  2; break; // both sides
-        // PARKING / ROUNDABOUT / TRAFFIC_LIGHT: detect only
-        default:                 s.active = false; s.side = 0; break;
+        case TURN_LEFT:  s.active = true; s.side = -1; break;
+        case TURN_RIGHT: s.active = true; s.side = +1; break;
+        case NO_LEFT:    s.active = true; s.side = +1; break;
+        case NO_RIGHT:   s.active = true; s.side = -1; break;
+        default:         s.active = false; s.side = 0; break;
     }
     return s;
 }
@@ -189,11 +187,21 @@ int main() {
             if (signReady && (tickIdx % ucr::config::SIGN_DETECT_EVERY) == 0) {
                 sign.Detect(frame, lastDets);
 
+                using namespace ucr::config::sign_class;
                 std::vector<int> classIds;
                 classIds.reserve(lastDets.size());
                 for (auto& d : lastDets) {
-                    if (d.confidence >= ucr::config::SIGN_CONF_THRESH)
-                        classIds.push_back(d.class_id);
+                    if (d.confidence < ucr::config::SIGN_CONF_THRESH) continue;
+
+                    // On this map, construction_ahead is physically a turn-left sign.
+                    int cls = (d.class_id == CONSTRUCTION_AHEAD) ? TURN_LEFT : d.class_id;
+
+                    // Only turn-related signs feed the voter.
+                    // parking / roundabout / traffic_light are ignored here.
+                    if (cls == TURN_LEFT || cls == TURN_RIGHT ||
+                        cls == NO_LEFT   || cls == NO_RIGHT) {
+                        classIds.push_back(cls);
+                    }
                 }
                 voter.Update(classIds, tickIdx);
             }
