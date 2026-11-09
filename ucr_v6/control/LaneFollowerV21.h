@@ -92,6 +92,10 @@ struct Config {
     int corner_radius  = 20;
     int min_turn_dist  = 4;
     int extend_len     = 80;
+
+    // --- Turn completion ---
+    float turn_complete_deg     = 60.0f;   // release when |Δheading| >= this
+    float turn_overshoot_deg    = 130.0f;  // hard safety cap regardless of min_ticks
 };
 
 // ============================================================
@@ -433,7 +437,12 @@ public:
         lastAngle_ = 0; curveSmooth_ = 0; prevValid_ = false;
         prevFarE_ = 0; dFarFilt_ = 0; asymSmooth_ = 0; emerHold_ = 0;
         turn_memory_ = TurnMemory();
+        turn_committed_ = false;
+        turn_committed_side_ = 0;
+        turn_tick_ = 0;
+        turn_straight_streak_ = 0;
     }
+
     void softReset() { pid_.softReset(); }
 
     Output step(const cv::Mat& rawMask, const SignState& sign) {
@@ -534,6 +543,61 @@ public:
             }
         }
 
+                // -------- Turn commit latch --------
+        // Once a turn is armed, stay on the bezier until the road looks
+        // straight again. This survives both opening loss and voter timeout.
+        if (should_turn && !turn_committed_) {
+            turn_committed_      = true;
+            turn_committed_side_ = target_opening.side;
+            turn_tick_           = 0;
+            turn_straight_streak_ = 0;
+        }
+
+        if (turn_committed_) {
+            ++turn_tick_;
+
+            const bool road_is_straight =
+                std::abs(cl.near_error) < c_.turn_straight_near_px &&
+                std::abs(cl.far_error - cl.near_error) < c_.turn_straight_far_px;
+
+            if (road_is_straight) ++turn_straight_streak_;
+            else                  turn_straight_streak_ = 0;
+
+            const bool release =
+                turn_tick_ >= c_.turn_max_ticks ||
+                (turn_tick_ >= c_.turn_min_ticks &&
+                 turn_straight_streak_ >= c_.turn_straight_ticks);
+
+            if (release) {
+                turn_committed_      = false;
+                turn_straight_streak_ = 0;
+                turn_tick_           = 0;
+            } else {
+                // Keep forcing the turn even if sign timed out or
+                // opening disappeared.
+                should_turn = true;
+
+                // If we lost the opening mid-turn, synthesize one from
+                // the current centerline so buildPathWithTurn still
+                // produces a curved path.
+                if (!has_valid_opening) {
+                    Point top_pt = centerline_pts.empty()
+                        ? Point{cleanMask.cols / 2, cleanMask.rows / 2}
+                        : centerline_pts.back();
+
+                    int synthW = (turn_memory_.turn_width > 20)
+                                ? turn_memory_.turn_width
+                                : c_.turn_synth_width_px;
+
+                    target_opening.side       = turn_committed_side_;
+                    target_opening.y_mid      = top_pt.y;
+                    target_opening.x_baseline = top_pt.x;
+                    target_opening.x_extreme  = top_pt.x +
+                        (turn_committed_side_ == -1 ? -synthW : synthW);
+                }
+            }
+        }
+
         if (should_turn) {
             final_path = buildPathWithTurn(centerline_pts, cleanMask,
                                            target_opening);
@@ -598,6 +662,11 @@ private:
     double speed_, lastAngle_, curveSmooth_, prevFarE_, dFarFilt_, asymSmooth_;
     bool prevValid_;
     int emerHold_;
+
+    bool turn_committed_      = false;
+    int  turn_committed_side_ = 0;
+    int  turn_tick_           = 0;
+    int  turn_straight_streak_ = 0;
 
     struct CenterlineInfo {
         double near_error = 0, far_error = 0, curve_error = 0;
