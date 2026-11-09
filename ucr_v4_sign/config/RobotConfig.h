@@ -39,7 +39,7 @@ constexpr float STEER_RIGHT_B = 2.5f;
 // ============================================================
 constexpr int   VOTER_ACTIVATE_FRAMES      = 5;
 constexpr int   VOTER_TIMEOUT_FRAMES       = 100;
-constexpr float SIGN_CONFIDENCE_THRESHOLD  = 0.25f;
+constexpr float SIGN_CONFIDENCE_THRESHOLD  = 0.7f;
 constexpr float SIGN_NMS_THRESHOLD         = 0.45f;
 
 // Force turn
