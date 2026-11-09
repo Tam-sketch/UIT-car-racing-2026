@@ -1,8 +1,7 @@
 #pragma once
 #include <string>
 
-namespace ucr {
-namespace config {
+namespace ucr { namespace config {
 
 // ============================================================
 // SYSTEM
@@ -12,7 +11,7 @@ constexpr float MAX_SPEED_CMS       = 15.0f;
 constexpr float MIN_SPEED_CMS       = 5.0f;
 constexpr float MAX_ACCEL_CMS2      = 20.0f;
 constexpr float MAX_STEER_DEG       = 50.0f;
-constexpr bool  INVERT_STEER        = false;    // Đổi thành true nếu servo lắp ngược
+constexpr bool  INVERT_STEER        = false;    
 
 // ============================================================
 // MODEL PATHS
@@ -26,13 +25,10 @@ constexpr const char* SIGN_ENGINE_PATH = "/home/car4/Downloads/sign/huy_sign.eng
 constexpr int   MIN_ROWS             = 5;
 constexpr float COVERAGE_THRESHOLD   = 0.05f;
 constexpr float CURVE_SCALE          = 150.0f;
-constexpr float ROAD_CONF_MARGIN     = 0.02f;
 
 // ============================================================
 // STEERING CALIBRATION (Từ dữ liệu hồi quy)
 // ============================================================
-// Phương trình: y = m*x + b (y: góc thực tế, x: góc servo)
-// Đảo ngược:    x = (y - b) / m
 constexpr float STEER_LEFT_M  = 0.96f;
 constexpr float STEER_LEFT_B  = -6.2f;
 constexpr float STEER_RIGHT_M = 0.71f;
@@ -59,5 +55,4 @@ constexpr float HEADING_RESET_DEG          = 56.0f;
 constexpr float TURN_CONDITION_Y_LO_RATIO  = 0.69f;
 constexpr float TURN_CONDITION_COVERAGE    = 0.78f;
 
-} // namespace config
-} // namespace ucr
+} } // namespace
