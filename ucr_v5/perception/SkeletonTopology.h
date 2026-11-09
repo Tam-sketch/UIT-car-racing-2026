@@ -43,11 +43,11 @@ struct SkeletonConfig {
 
 // Zhang-Suen thinning. Input binary (0/255), output binary (0/255).
 inline cv::Mat ZhangSuenThinning(const cv::Mat& binary) {
-    cv::Mat img = (binary > 0);
-    cv::Mat prev;
+    cv::Mat img = (binary > 0);                          // 0/255, CV_8UC1
+    cv::Mat prev = cv::Mat::zeros(img.size(), CV_8UC1);  // match size/type
     cv::Mat diff;
     do {
-        // --- Sub-iter 1: delete N(p1) where A==1, 2<=B<=6, p2p4p6==0, p4p6p8==0 ---
+        // --- Sub-iter 1 ---
         cv::Mat marker = cv::Mat::zeros(img.size(), CV_8UC1);
         for (int y = 1; y < img.rows - 1; ++y) {
             const uchar* r0 = img.ptr<uchar>(y - 1);
@@ -62,11 +62,12 @@ inline cv::Mat ZhangSuenThinning(const cv::Mat& binary) {
                 const int A = (!p2 && p3) + (!p3 && p4) + (!p4 && p5) + (!p5 && p6)
                             + (!p6 && p7) + (!p7 && p8) + (!p8 && p9) + (!p9 && p2);
                 const int B = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
-                if (A == 1 && B >= 2 && B <= 6 && !(p2 && p4 && p6) && !(p4 && p6 && p8))
+                if (A == 1 && B >= 2 && B <= 6 &&
+                    !(p2 && p4 && p6) && !(p4 && p6 && p8))
                     m[x] = 1;
             }
         }
-        img &= ~marker;
+        img.setTo(0, marker);   // ← replaces `img &= ~marker`
 
         // --- Sub-iter 2 ---
         marker.setTo(0);
@@ -83,17 +84,18 @@ inline cv::Mat ZhangSuenThinning(const cv::Mat& binary) {
                 const int A = (!p2 && p3) + (!p3 && p4) + (!p4 && p5) + (!p5 && p6)
                             + (!p6 && p7) + (!p7 && p8) + (!p8 && p9) + (!p9 && p2);
                 const int B = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
-                if (A == 1 && B >= 2 && B <= 6 && !(p2 && p4 && p8) && !(p2 && p6 && p8))
+                if (A == 1 && B >= 2 && B <= 6 &&
+                    !(p2 && p4 && p8) && !(p2 && p6 && p8))
                     m[x] = 1;
             }
         }
-        img &= ~marker;
+        img.setTo(0, marker);
 
-        cv::absdiff(img, prev, diff);
+        cv::absdiff(img, prev, diff);   // both valid now
         prev = img.clone();
     } while (cv::countNonZero(diff) > 0);
 
-    return img * 255;
+    return img;   // already 0/255
 }
 
 // Full pipeline: clean → thin → junction → arms → L/S/R.
