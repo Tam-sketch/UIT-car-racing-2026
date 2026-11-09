@@ -115,6 +115,8 @@ int main() {
     turnCfg.sign_hold_ticks           = ucr::config::SIGN_HOLD_FRAMES;
     turnCfg.sign_snapshot_hold_ticks  = ucr::config::SIGN_SNAPSHOT_HOLD_FRAMES;
     turnCfg.reset_debounce_ticks      = ucr::config::RESET_DEBOUNCE_FRAMES;
+    turnCfg.turn_opening_margin       = ucr::config::TURN_OPENING_MARGIN;
+    turnCfg.turn_near_min_coverage    = ucr::config::TURN_NEAR_MIN_COVERAGE;
     ucr::control::TurnStateMachine turnSm(
         turnCfg,
         ucr::config::SIGN_VOTER_ACTIVATE_FRAMES,

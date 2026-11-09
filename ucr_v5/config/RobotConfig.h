@@ -159,6 +159,7 @@ inline constexpr int TOPO_CONFIRM_FRAMES          = 3;
 // Control-tick units. 90 ticks ÷ 6 Hz ≈ 15 s (matches original 150 ÷ 10 Hz).
 inline constexpr int RESET_DEBOUNCE_FRAMES        = 90;
 
+
 // --- Turn SM ---
 inline constexpr float FORCE_ANGLE               = 22.0f;
 inline constexpr float TURN_CONDITION_Y_LO_RATIO = 0.69f;
@@ -170,6 +171,8 @@ inline constexpr float FORCE_EXIT_SPEED          = 12.0f;
 inline constexpr float FORCE_TURN_PHASE_DEG      = 15.0f;
 inline constexpr float FORCE_EXIT_PHASE_DEG      = 50.0f;
 inline constexpr float SLOW_SPEED_CMS            = 10.0f;
+inline constexpr float TURN_OPENING_MARGIN     = 0.08f;
+inline constexpr float TURN_NEAR_MIN_COVERAGE  = 0.55f;
 
 // --- Heading (BNO055) ---
 // BNO055 eulerDeg.x → heading transform. Defaults are identity.

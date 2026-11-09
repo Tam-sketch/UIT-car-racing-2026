@@ -46,6 +46,16 @@ struct TurnConfig {
     float slow_speed      = 10.0f;   // was 15 in sim
     float max_speed       = 20.0f;   // matches MAX_SPEED_CMS
     int   sign_hold_ticks = 30;
+    
+    // Relative widening threshold. cov(far band) must exceed cov(near band)
+    // by this fraction for the gate to fire. 0.08 = 8 percentage-point widening.
+    // Raise (0.10–0.15) if force-turn fires too early; lower (0.05) if it never fires.
+    float turn_opening_margin = 0.08f;
+
+    // Absolute floor on near-band coverage. Protects against mask dropout while
+    // the car is off the lane. Raise if false triggers during occlusion.
+    float turn_near_min_coverage = 0.55f;
+
     // --- Class indices (8-class engine) ---
     int idx_construction_ahead = 0;
     int idx_no_left            = 1;
@@ -184,12 +194,31 @@ private:
 
     bool CheckTurnCondition(const cv::Mat& mask) const {
         if (mask.empty()) return false;
-        const int yLo = (int)(mask.rows * cfg_.turn_condition_y_lo_ratio);
-        if (yLo >= mask.rows) return false;
-        const int area = (mask.rows - yLo) * mask.cols;
-        if (area <= 0) return false;
-        const int cnt = cv::countNonZero(mask.rowRange(yLo, mask.rows));
-        return (float)cnt / (float)area >= cfg_.turn_condition_coverage;
+        const int h = mask.rows, w = mask.cols;
+        if (h < 10) return false;
+
+        // Three bands, bottom to top (image coords: y=h is bottom/near, y=0 is top/far).
+        //   far  band: y ∈ [0.55h, 0.72h)  ← where the junction mouth is visible
+        //   near band: y ∈ [0.82h, h)      ← pure lane, always ≈lane width
+        //   bottom band (for the absolute safety net) = near band
+        const int yFarTop  = (int)(h * 0.55f);
+        const int yFarBot  = (int)(h * 0.72f);
+        const int yNearTop = (int)(h * 0.82f);
+        if (yFarTop >= yFarBot || yFarBot >= yNearTop || yNearTop >= h) return false;
+
+        const int areaFar  = (yFarBot - yFarTop) * w;
+        const int areaNear = (h - yNearTop) * w;
+        if (areaFar <= 0 || areaNear <= 0) return false;
+
+        const float covFar  = (float)cv::countNonZero(mask.rowRange(yFarTop, yFarBot)) / areaFar;
+        const float covNear = (float)cv::countNonZero(mask.rowRange(yNearTop, h))       / areaNear;
+
+        // Gate condition:
+        //   (a) the junction band has more road than the near band (relative widening)
+        //   (b) the near band is dominated by road (car is actually on the lane;
+        //       protects against firing during a mask dropout)
+        const float opening = covFar - covNear;
+        return (opening >= cfg_.turn_opening_margin) && (covNear >= 0.55f);
     }
 
     int DecideForceDir(int commit, const perception::TopoResult& topo) const {
