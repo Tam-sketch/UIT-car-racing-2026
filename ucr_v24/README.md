@@ -1,60 +1,154 @@
-# UCR 2026 — Jetson Nano Autonomous Car
+# Trả lời 2 câu hỏi
 
-Autonomous road-following on the physical round-3 car. Perception is a
-TensorRT road-segmentation model; control is a port of the proven
-`ucr_main_v20.py` PID. The control loop ticks at a fixed 10 Hz so the
-sim-tuned per-step constants keep their meaning on the real robot.
+## Câu 1: Có tạo nhiều centerline không? — **KHÔNG, chỉ 1 centerline**
+
+Nhìn vào `extractCenterline()`:
+
+```cpp
+for (int y = h - 1; y >= 0; y--) {
+    int s, e;
+    if (largestRun(row, w, s, e)) row_centers.push_back({(s + e) / 2, y});
+}
+```
+
+`largestRun()` **chỉ lấy đoạn liên tục dài nhất** trên mỗi hàng. Vậy:
+
+- Mỗi hàng → **1 điểm center** duy nhất
+- Cả mask → **1 centerline** duy nhất (bám theo "largest run" per row)
+
+**Kể cả khi tắt `keep_largest` (trong V6.1 patch khi turn active)**: `largestRun` vẫn chỉ chọn **1 run mỗi hàng**. Đây chính là điểm mà tài liệu "New Lane Association" chỉ ra:
+
+> Nếu lane cũ (thẳng, rộng) và nhánh rẽ trái (hẹp), `largestRun` sẽ chọn lane cũ → centerline vẫn bám lane cũ.
+
+**Hệ quả:** V6.1 tắt `keep_largest` chỉ giúp `detectOpenings` nhìn thấy các nhánh (vì nó scan edge profiles), nhưng `extractCenterline` **vẫn chỉ cho 1 path**. Đây là lý do cần thêm `turn_committed_` state: khi đã commit, PID dùng Bézier path (từ memory), không dùng centerline nữa.
+
+## Câu 2: Chỉ vào opening khi có biển báo? — **ĐÚNG cho ENTRY, SAI cho CONTINUATION**
+
+```cpp
+std::vector<Opening> detectOpenings(const cv::Mat& mask, const SignState& sign) {
+    if (!sign.active || sign.side == 0) return openings;  // ← CHẶN khi không có sign
+    ...
+}
+```
+
+| Giai đoạn | Cần sign? |
+|---|---|
+| **Detect opening** (tìm nhánh rẽ) | ✅ Có — `sign.active` phải true |
+| **Commit turn** (bắt đầu Bézier) | ✅ Có — cần cả sign + opening |
+| **Continuation** (Bézier chạy) | ❌ Không — `turn_committed_` persist |
+| **Ghost mode** (opening biến mất) | ❌ Không — synthesize từ `commit_turn_point_` |
+| **Release** (về PID) | ❌ Không — dùng mask/heading/max_ticks |
+
+**Tóm tắt:** Biển báo cần cho **kích hoạt** turn, nhưng **không cần** để **duy trì** turn đã commit.
 
 ---
 
-## Current status
+# README.md (cập nhật cho V6.1)
 
-**Running binary:** `main` (a.k.a. `ucrv5` — same source file, renamed at
-the CMake target). Lane-following only: `LaneFollowerV20` + `RoadSegmenter`.
+```markdown
+# UCR 2026 — Jetson Nano Autonomous Car (V6.1)
 
-The sign detector, sign voter, skeleton topology, and turn state machine
-exist in the tree but are **not wired into the current `main.cpp`**. They
-were integrated in an earlier build (Log 13) and reverted to isolate a
-turn-arming problem: on the round-3 map the area-spike gate never fired,
-because the road-segment model does not mask far enough ahead to expose
-the junction widening. Pending re-integration on a gate that works.
+Autonomous road-following + sign-triggered Bezier turns. TensorRT
+road-segmentation + YOLO sign detection + sign voter + opening detector +
+Bezier path planner + PID. Fixed 10 Hz control tick.
+
+**V6.1 status:** all components wired. Sign detection, voter, opening
+detector, and Bezier turn are ACTIVE in `main.cpp`. Traffic-light (red/green)
+and pedestrian stop are active.
+
+---
+
+## Current status — V6.1 (fully wired)
 
 | Component | File | Status |
 |---|---|---|
-| Hardware bring-up (camera, motor, servo, IMU, ToF, OLED) | `hardware/*` | Running |
-| TensorRT session (FP16 + FP32 I/O) | `perception/TrtSession.h` | Running |
-| Road segmentation (TwinLiteNet) | `perception/RoadSegmenter.h` | Running |
-| v20 PID + occlusion gate + asymmetry | `control/LaneFollowerV20.h` | Running |
-| Sign detection (YOLO 8-class head) | `perception/SignDetector.h` | Standalone-verified, not wired |
-| Sign voter (tick-indexed) | `control/SignVoter.h` | Not wired |
-| Skeleton topology (Zhang-Suen + TopoLatch) | `perception/SkeletonTopology.h` | Not wired |
-| Turn state machine (area-spike gate) | `control/TurnStateMachine.h` | Tested, never fired — not wired |
-| v21 opening detector + Bezier path (reference) | `control/LaneFollowerV21.h` | **NOT COMPILED** — algorithm reference only |
+| Hardware bring-up | `hardware/*` | Running |
+| TensorRT session | `perception/TrtSession.h` | Running |
+| Road segmentation | `perception/RoadSegmenter.h` | Running |
+| v20 PID + occlusion + asymmetry | `control/LaneFollowerV21.h` (V20 core) | Running |
+| Sign detection (YOLO 8-class) | `perception/SignDetector.h` | Running |
+| Sign voter | `control/SignVoter.h` | Running |
+| Opening detection (V21) | `control/LaneFollowerV21.h` | Running |
+| Bezier path + TurnPlan | `control/LaneFollowerV21.h` | Running |
+| Traffic light (HSV) + pedestrian stop | `main.cpp` | Running |
+| Turn commit + completion | `control/LaneFollowerV21.h` | Running (V6.1) |
+| Old `TurnStateMachine.h` (area-spike) | `control/TurnStateMachine.h` | Deprecated, unused |
+| Old `SkeletonTopology.h` | `perception/SkeletonTopology.h` | Deprecated, unused |
 
 ---
 
-## Architecture (current running build)
+## Architecture (V6.1)
 
 ```
 Camera (BGR 640×384)
 │
+├─→ SignDetector (YOLO) ──→ SignVoter ──→ SignState
+│                            (temporal filter)
+│
 ▼
-RoadSegmenter          ← TensorRT engine + BGR→RGB + argmax
-│  (CV_8UC1 mask at model output resolution, currently 320×184)
+RoadSegmenter (TwinLiteNet 320×184)
+│
 ▼
-LaneFollowerV20        ← keep_largest → centerline → near/far/curve
-│                     → occlusion gate → asymmetry → PID → speed
-│  (v20::LaneFollower::Output)
+LaneFollowerV21 (V6.1)
+  ├─ extractCenterline  ← ONLY 1 centerline per frame
+  │                        (largest-run per row; keep_largest
+  │                         disabled during turn for openings)
+  ├─ detectOpenings     ← ONLY when sign.active
+  │                        (edge-profile deviation)
+  ├─ TurnPlan commit    ← sign + opening + tangent check
+  ├─ Bezier path        ← cached; survives sign timeout
+  ├─ TurnPlan release   ← mask-at-turn-point / heading / max_ticks
+  └─ PID → angle, speed
+│
 ▼
-main loop              ← fixed 10 Hz tick, soft-start ramp
-│                     → real-angle → servo calibration → servo cmd
-▼
-Motor / Servo
+main.cpp ──→ Motor + Servo
+  └─ stop overrides: person > red light > normal
 ```
 
-The control loop ticks at a **fixed period**, independent of inference
-rate. Every rate limit and EMA inside `LaneFollowerV20` is *per step*, so
-the tick rate defines their real-world meaning. See "Fixed-rate tick".
+**Key architectural notes:**
+
+1. **Single centerline:** `extractCenterline()` runs `largestRun()` per
+   row → exactly ONE path per frame. During a turn, this path still
+   tracks the OLD road (because old road is wider than the new branch).
+   The Bezier path is the actual turn target — PID uses `final_path`
+   which is `current_plan_.path` while committed, not the raw centerline.
+
+2. **Sign gates opening detection:** `detectOpenings()` returns empty
+   when `sign.active == false`. No sign → no opening → no turn. This is
+   intentional to avoid false positives from any road widening.
+
+3. **Sign is NOT required to finish a turn:** once `turn_committed_` is
+   set (sign + opening + tangent check), the turn completes even if the
+   sign voter times out, because completion is driven by:
+   - mask coverage at `commit_turn_point_`, OR
+   - heading delta ≥ 60° (optional IMU), OR
+   - `turn_max_ticks` fallback (3 s hard cap).
+
+---
+
+## V6.1 patches (relative to earlier V6)
+
+Five targeted fixes for the "Bezier dies mid-turn" bug:
+
+| # | Patch | Effect |
+|---|---|---|
+| 1 | Skip `keep_largest` when `turn_committed_` | Opening detection sees both old road + new branch |
+| 2 | Tangent sanity check before commit | Rejects commit when centerline still bends the wrong way |
+| 3 | Release via mask-at-`commit_turn_point_` | Replaces unreliable `cl.near_error` check |
+| 4 | Optional heading release (BNO055) | If IMU present, releases at 60° turn |
+| 5 | `turn_max_ticks` fallback | Hard cap at 30 ticks (~3 s) to prevent permanent stuck |
+
+Plus two earlier fixes carried over:
+
+- `turn_memory_.last_y_mid = best.y_mid` (was `std::min` — bug locked to
+  furthest opening instead of nearest).
+- Skip `OcclusionGate` while `turn_committed_` (avoids false emergency
+  during turn when mask suddenly loses road).
+
+Traffic-light classifier upgraded from per-pixel loop to `cv::inRange`
++ `cv::countNonZero` (5–10× faster). Green light clears `lastRedSeenTick`
+so car resumes immediately when light turns green — UNLESS a pedestrian
+is also in frame, in which case `stopForPerson` wins.
 
 ---
 
@@ -62,24 +156,18 @@ the tick rate defines their real-world meaning. See "Fixed-rate tick".
 
 ```
 config/
-  RobotConfig.h           ← all tunable constants (see "Configuration guide")
+  RobotConfig.h           ← all tunables (Section A + Section B)
 perception/
-  TrtSession.h            ← generic TensorRT engine wrapper (FP16/FP32 I/O)
-  RoadSegmenter.h         ← TwinLiteNet binary segmentation (2-ch argmax)
-  SignDetector.h          ← YOLO 8-class detection head (not wired)
-  SkeletonTopology.h      ← Zhang-Suen thinning + L/S/R arms (not wired)
+  TrtSession.h            ← TensorRT wrapper (FP16/FP32)
+  RoadSegmenter.h         ← TwinLiteNet (2-ch argmax)
+  SignDetector.h          ← YOLO 8-class head
+  SkeletonTopology.h      ← deprecated (unused)
 control/
-  LaneFollowerV20.h       ← the v20 PID stack (header-only, cohesive, running)
-  SignVoter.h             ← tick-indexed sign vote (not wired)
-  TurnStateMachine.h      ← force-turn SM + area-spike gate (not wired)
-  LaneFollowerV21.h       ← v21 opening + Bezier reference (NOT COMPILED)
-main.cpp                  ← hardware init + control loop + UI (v20-only)
+  LaneFollowerV21.h       ← V20 PID + V21 opening + V6.1 turn plan
+  SignVoter.h             ← tick-indexed sign vote
+  TurnStateMachine.h      ← deprecated (unused)
+main.cpp                  ← hardware + control loop + UI
 ```
-
-**Rule of thumb:** if a piece of code touches only the TensorRT API, it
-belongs in `TrtSession.h`. If it also touches the model's tensor layout
-(BGR→RGB, argmax, NMS, class decode), it belongs in a model wrapper
-(`RoadSegmenter.h`, `SignDetector.h`).
 
 ---
 
@@ -92,278 +180,212 @@ make -j$(nproc)
 sudo ./main
 ```
 
-The CMake target is currently `main`. In Log 13 the same source was built
-as `ucrv5`; either name works — they refer to the same file.
-
-No new libraries are linked beyond what `thisinh` already required:
-`nvinfer`, `cudart`, OpenCV, pthreads.
-
 Expected boot:
-
 ```
-=== UCR2026: Auto Run ===
-Engine: /home/car4/Downloads/road/kga2.engine
-Control period: 100 ms
+=== UCR2026 V6.1 (turns=yes) ===
+Road: /home/car4/Downloads/road/kga2.engine
+Sign: /home/car4/Downloads/sign/huy_sign.engine
+Control: 100 ms
 [RoadSegmenter] in 320x184 out 320x184
+[SignDetector] in 416x416 out (12,3549) classes=8
 ```
-
-Note: the engine is **320×184**, not 320×180. The model was exported at
-320×184, so `near_error` / `far_error` are computed on a slightly
-vertically-distorted mask relative to a clean 5:3 crop. This has been
-accepted (Log 13 P6); fix at engine-export time if it ever biases
-straight-line behaviour.
-
-If you see:
-
-- `[TrtSession] Init error: ...` → engine file missing or built against a
-  different TensorRT than the one on the Jetson.
-- `[RoadSegmenter] Expected 2 output channels` → the engine is not a
-  TwinLiteNet binary-segmentation export.
-- `[RoadSegmenter] Dynamic dim ... not supported` → static-shape export
-  required; `TrtSession` does not handle dynamic bindings.
-
-Press `q` or `Esc` to stop.
 
 ---
 
 ## Fixed-rate tick
 
-`main.cpp` calls `LaneFollower::step()` **only** when
-`steady_clock::now() >= next_control`. Inference runs as fast as the
-hardware allows in between.
+`main.cpp` calls `LaneFollower::step()` only when
+`steady_clock::now() >= next_control`. Inference runs in between.
 
-- `rate_limit = 10` means **10° per step**, not 10° per frame. At 10 Hz
-  that is 100°/s — the value v20 was tuned at.
-- Same for `derivative_alpha`, `d_far_ema_alpha`, `cov_ema_alpha`,
-  `asym_ema`, and the speed EMA.
-
-If you change `CONTROL_PERIOD_MS`, every per-step constant in
-`LaneFollowerV20.h` changes meaning. Recompute alphas with
-`alpha = 1 - exp(-dt / tau)`, and rescale the rate limits proportionally.
+Every rate limit and EMA inside `LaneFollowerV21` is **per-step**. If you
+change `CONTROL_PERIOD_MS`, recompute alphas with `1 - exp(-dt/tau)` and
+rescale rate limits proportionally.
 
 ---
 
-## Servo calibration
+## Sign classes (8-class engine)
 
-The v20 PID emits a steering angle in **PID convention** (positive =
-right turn), in degrees, after `post_pid_gain`. `main.cpp`:
-
-1. Negates to **real-angle convention** (positive = left turn).
-2. Clamps to `±MAX_REAL_ANGLE_DEG` (30°).
-3. Maps through `RealAngleToServo()` → **raw servo command** (positive =
-   left).
-4. Clamps to `±MAX_SERVO_CMD` (55) — a second safety independent of the
-   real-angle bound.
-5. Rounds and passes to `Servo::SetAngle()`.
-
-The `RealAngleToServo` / `ServoToRealAngle` pair encodes the empirical
-servo asymmetry from Log 12:
-
-```
-servo_cmd > 0 (left):   real =  0.96 * servo_cmd − 6.2
-servo_cmd < 0 (right):  real =  0.71 * servo_cmd + 2.5
-```
-
-Left and right are ~35% different in gain, and the mechanical deadband is
-asymmetric (~6.5° servo on the left, ~3.5° on the right). Treat the
-`±MAX_REAL_ANGLE_DEG` bound as **the** meaningful steering limit; the
-`±MAX_SERVO_CMD` is a belt-and-braces clamp.
-
-**Known latent issues** (from Log 12 E52/E53; not fixed, documented here):
-
-- **E52 — `post_pid_gain` (2.2) exceeds the real-angle saturation point.**
-  PID output `13.6` already saturates `MAX_REAL_ANGLE_DEG = 30`; the upper
-  ~38% of the PID's numeric range maps to a flat 30°. Either lower
-  `POST_PID_GAIN` to ~1.36 or raise `MAX_REAL_ANGLE_DEG` to ~40 — decide
-  empirically on-track. Current build leaves 2.2 in place.
-- **E53 — servo zero is not the mechanical centre.** The two fitted lines
-  cross real-zero at different servo commands. The code enforces
-  `real=0 ⟺ servo=0` by convention, producing a small piecewise
-  discontinuity at centre. May show as mild left/right drift near
-  straight-line; verify at low speed.
-
----
-
-## Sign classes (reserved for integration)
-
-The 8-class engine emits, in order:
-
-| id | name | meaning |
+| id | name | action |
 |---|---|---|
-| 0 | construction_ahead | road-work warning |
-| 1 | no_left | turn right required (or straight if 4-way) |
-| 2 | no_right | turn left required (or straight if 4-way) |
-| 3 | parking | enter parking state |
-| 4 | roundabout | roundabout handling |
-| 5 | traffic_light | stop on red (future) |
-| 6 | turn_left | turn left required |
-| 7 | turn_right | turn right required |
+| 0 | construction_ahead | turn left (map-specific) |
+| 1 | no_left | turn right (or straight if 4-way) |
+| 2 | no_right | turn left (or straight if 4-way) |
+| 3 | parking | not yet wired |
+| 4 | roundabout | not yet wired |
+| 5 | traffic_light | red = stop, green = resume |
+| 6 | turn_left | turn left |
+| 7 | turn_right | turn right |
+| 8 | walking_person | stop immediately |
 
-Precedence when several compete: **explicit turn > no-turn > default
-straight**. `SignDetector.h` NMS is class-agnostic — if `no_left` and
-`turn_left` co-occur on the same sign post, only the top scorer survives.
-This is acceptable for now; upgrade to class-aware NMS if the class list
-ever puts conflicting signs on one post.
-
-`SIGN_DETECT_EVERY = 2` is the current setting. 4 was tested with no
-observed difference at ~6 Hz loop rate; 2 is kept.
+**Pedestrian overrides everything** (including green light).
 
 ---
 
-## Turn phases (reserved for integration)
+## Turn completion — 3 signals
 
-`TurnStateMachine` uses these phases, driven by measured BNO055 heading
-delta from force-start (no hardcoded timers):
+While `turn_committed_ == true`, turn persists regardless of sign state.
+Release happens when **any** of:
 
-| phase | condition | target speed |
-|---|---|---|
-| ENTRY | `|Δheading| < FORCE_TURN_PHASE_DEG (15°)` | `FORCE_APPROACH_SPEED (8)` |
-| TURNING | `15° ≤ |Δheading| < 50°` | `FORCE_TURNING_SPEED (5)` |
-| EXIT | `|Δheading| ≥ 50°` | `FORCE_EXIT_SPEED (12)` |
-| reset | `|Δheading| ≥ 56°` | voter + force reset |
+| Signal | Trigger |
+|---|---|
+| A | Mask coverage ≥ 65% in a 24×24 window at `commit_turn_point_` |
+| B | `|Δheading| ≥ 60°` from `commit_heading_` (only if IMU passed) |
+| C | `turn_tick_ ≥ 30` (~3 s) — hard safety cap |
 
-The gate that arms this is the **area-spike** detector — mask area must
-exceed a slow EMA baseline by `TURN_AREA_RATIO` for `TURN_GATE_PERSIST`
-consecutive ticks. On the round-3 map this **never fired**; re-integration
-is pending a gate that works on a mask that does not see far ahead.
-
----
-
-## Heading source (reserved for integration)
-
-`GetStatus`-equivalent on the car is `BNO055::eulerDeg.x` (fused, drifts,
-wraps 0/360). `BNO055::relativeYawDeg()` (gyro-integrated, bias-corrected)
-is the alternative but is **currently always 0** — `integrateYawRate(dt)`
-is never called from `SensorThread` (E38 from the Round-3 handoff). Any
-turn-completion logic that depends on gyro-integrated yaw needs E38 fixed
-first.
-
-`HEADING_SIGN` / `HEADING_OFFSET_DEG` in `RobotConfig.h` are the transform
-into the `TurnStateMachine`'s expected convention (positive = right).
-
----
-
-## Verification checklist
-
-Before any timed run:
-
-- [ ] `sudo ./main` boots, prints `[RoadSegmenter] in 320x184 out 320x184`
-- [ ] Camera frame shows in UI; green mask overlays the road correctly
-- [ ] Red centerline follows the road centre visually
-- [ ] `kf` in UI ≈ 1.00 on open road; drops visibly at junctions/obstacles
-- [ ] `INV` flag off when mask is healthy; on when the mask is lost
-- [ ] Motor at 0 → car does not move; `MIN_SPEED_CMS` → smooth creep
-- [ ] Servo at `RealAngleToServo(+10)` → car turns right (verify empirically)
-- [ ] Servo at `RealAngleToServo(−10)` → car turns left
-- [ ] Emergency stop test: Ctrl-C → motor stops, servo centres
-- [ ] First-tick motor speed is `min(speed, MAX_ACCEL_CMS2 × 0.1)` not a
-      small fractional value like `0.615` — see "P5" below.
+Requires `turn_tick_ ≥ 8` (0.8 s minimum) before A or B can fire.
 
 ---
 
 ## Configuration guide
 
-`config/RobotConfig.h` is split into two sections:
-
-- **Section A — active** — read by the current `main.cpp`.
-- **Section B — reserved** — read by nothing currently; will be wired into
-  `SignDetector` / `SignVoter` / `TurnStateMachine` on re-integration.
-
-Tune **only** Section A values for the current binary. Section B values
-can be edited freely; they have no effect until integration.
-
-### Section A — the values you'll actually touch
+### Section A — active
 
 | Constant | Meaning | Safe range |
 |---|---|---|
-| `MAX_SPEED_CMS` | Top forward speed | 5 → 25 |
-| `MIN_SPEED_CMS` | Floor speed in curves / occl | 2 → 12 |
-| `MAX_REAL_ANGLE_DEG` | Real-angle steering bound | 20 → 40 |
+| `MAX_SPEED_CMS` | Top forward speed | 5 → 20 |
+| `MIN_SPEED_CMS` | Floor speed (curves, lost mask) | 2 → 12 |
+| `MAX_REAL_ANGLE_DEG` | Real-angle bound | 20 → 40 |
 | `MAX_SERVO_CMD` | Raw servo clamp | 40 → 60 |
-| `CONTROL_PERIOD_MS` | PID tick period | leave at 100 unless re-tuning |
-| `MAX_ACCEL_CMS2` | Speed ramp on start | 10 → 40 |
-| `POST_PID_GAIN` | PID-to-real-angle scale | calibrate empirically |
-| `CURVE_SCALE` | Curve slowdown aggressiveness | 80 (more) → 200 (less) |
-| `MIN_ROWS`, `COVERAGE_THRESHOLD` | Mask validity gate | tighten if garbage masks slip |
+| `CONTROL_PERIOD_MS` | PID tick period | leave at 100 |
+| `MAX_ACCEL_CMS2` | Speed ramp | 10 → 40 |
+| `POST_PID_GAIN` | PID → real-angle scale | 1.4 → 2.2 (see E52) |
+| `CURVE_SCALE` | Curve slowdown | 80 (more) → 200 (less) |
+| `MIN_ROWS`, `COVERAGE_THRESHOLD` | Mask validity | tighten if garbage slips |
 
-### Section B — reserved
+### Turn completion tuning
 
-All `SIGN_*`, `TOPO_*`, `TURN_*`, `FORCE_*`, `SLOW_SPEED_CMS`,
-`HEADING_*`, and `sign_class::*` constants. See "Turn phases" and "Sign
-classes" above for meaning.
+| Constant | Default | Meaning |
+|---|---|---|
+| `TURN_MIN_TICKS` | 8 | Min ticks before release allowed |
+| `TURN_MAX_TICKS` | 30 | Force release (safety) |
+| `TURN_RELEASE_ROAD_FRAC` | 0.65 | Coverage threshold at turn point |
+| `TURN_RELEASE_WINDOW_PX` | 12 | Half-window for coverage check |
+| `TURN_COMPLETE_DEG` | 60 | Heading delta for release (if IMU) |
+| `TURN_COMMIT_PROXIMITY` | 0.50 | Commit only when opening y > 0.5·H |
+| `TURN_SYNTH_WIDTH_PX` | 60 | Fallback Bezier width when ghost |
 
-### Removed (dead, do not re-add)
+### Opening detection
 
-These were failed gate iterations from Log 13 and are deleted from
-`RobotConfig.h` and `TurnStateMachine::TurnConfig`:
+| Constant | Default | Meaning |
+|---|---|---|
+| `OPEN_THRESH` | 15 | Pixel deviation threshold |
+| `OPEN_MIN_HEIGHT` | 10 | Min vertical extent |
+| `OPEN_SMOOTH_WIN` | 5 | Moving average for edges |
+| `OPEN_BASE_WIN` | 50 | Rolling median for baseline |
 
-- `TURN_CONDITION_Y_LO_RATIO`, `TURN_CONDITION_COVERAGE` — bottom-band coverage gate
-- `TURN_OPENING_MARGIN`, `TURN_NEAR_MIN_COVERAGE` — far-band vs near-band gate
-- `OPEN_THRESH`, `OPEN_MIN_HEIGHT`, `OPEN_SMOOTH_WIN`, `OPEN_BASE_WIN`, `TURN_OPENING_PROXIMITY` — V21 opening constants (existed only in the never-compiled draft; port them into `TurnConfig` if/when you swap the gate)
+### Bezier path
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `BEZIER_CORNER_RADIUS` | 20 | Corner curvature |
+| `BEZIER_MIN_TURN_DIST` | 4 | Min turn distance |
+| `BEZIER_EXTEND_LEN` | 80 | Extension into new lane |
+
+---
+
+## Known issues
+
+1. **E52 — `post_pid_gain` saturation:** with `POST_PID_GAIN=2.2` and
+   `MAX_REAL_ANGLE_DEG=30`, PID output `>13.6` saturates. Upper 38% of
+   PID range is flat. Consider lowering to 1.4 or raising the angle bound.
+
+2. **Single centerline limitation:** `extractCenterline` uses
+   `largestRun` per row → only 1 path. During turn, if new branch is
+   narrower than old road, raw centerline still tracks old road. This
+   is why V6.1 uses `turn_committed_` state and Bezier path instead of
+   re-extracting centerline during turn.
+
+3. **Ghost turn uses fixed width:** when opening disappears mid-turn,
+   synthesized opening uses `turn_memory_.turn_width` (from last seen
+   opening) or `TURN_SYNTH_WIDTH_PX` (60) as fallback. If actual lane
+   width is very different, Bezier endpoint may be off by ±20 px.
 
 ---
 
 ## What NOT to do
 
-- **Do not** tick the PID at inference rate. Use the fixed-period gate.
-- **Do not** reset `LaneFollower` on a lost-mask frame. Only a TensorRT
-  *failure* (`inferOK == false`) triggers a hard reset; a lost mask just
-  yields `valid == false` and holds `last_angle`.
-- **Do not** put model-specific code in `TrtSession.h`.
-- **Do not** put hardware logic in `RoadSegmenter` / `LaneFollower` — those
-  are pure.
-- **Do not** split `LaneFollowerV20.h`. It is cohesive; the near/far/
-  curve/occl/asym signals feed the PID and only exist in that context.
-- **Do not** `#include` `control/LaneFollowerV21.h` in any build target. It
-  is reference-only and will not compile (see its header comment).
-- **Do not** change `CONTROL_PERIOD_MS` without retuning every per-step
-  rate limit and EMA in `LaneFollowerV20.h`.
+- Do not tick PID at inference rate — use `next_control` gate.
+- Do not reset `LaneFollower` on a lost-mask frame. Only TensorRT
+  failure (`inferOK == false`) triggers hard reset.
+- Do not `#include` `TurnStateMachine.h` or `SkeletonTopology.h` — they
+  are deprecated and unused.
+- Do not re-enable `keep_largest` during turn — V6.1 depends on it being
+  disabled so opening detection sees both branches.
+- Do not change `CONTROL_PERIOD_MS` without retuning all per-step
+  rate limits and EMA alphas.
 
 ---
 
-## Open issues / next steps
+## Verification checklist
 
-1. **P5 — first-tick speed.** Boot log shows `[Driver -> MCU]: N1 v0.615385`
-  on the first actuation. With `MAX_ACCEL_CMS2 = 20`, `CONTROL_PERIOD_MS =
-  100`, the expected first applied speed from 0 is `2.0` cm/s. `0.615385
-  = 200 / 325`, which is `Motor::SetSpeedCms` cm/s → wheel-rad/s with
-  3.25 cm radius. Inspect `Motor::SetSpeedCms` and the first-tick call site
-  in `main.cpp` to find where the division is happening (either `speed` is
-  being set to `0.615` pre-motor, or `Motor` converts via a different
-  factor).
-2. **Turn gate.** The area-spike gate does not fire on the round-3 map.
-  Candidate next gates: (a) `LaneFollowerV21`'s rolling-median opening
-  detector, ported into `TurnStateMachine::CheckTurnCondition`; (b) a
-  sign-bbox-based gate using `SignDetector`'s bbox bottom edge as a
-  proximity proxy; (c) fusion of the two. Decided in a future session.
-3. **E38 — `relativeYawDeg()` always 0.** `integrateYawRate(dt)` is never
-  called from `SensorThread`. Required for turn completion if you choose
-  the gyro-integrated heading source. Otherwise use `eulerDeg.x` and
-  accept drift.
-4. **Sign/turn integration.** Re-introduce `SignDetector` +
-  `SignVoter` + `TurnStateMachine` into a new `main.cpp` **only after**
-  the gate is redesigned. The current reverted state is stable — do not
-  re-add the area-spike gate as-is.
-5. **E52/E53 servo calibration.** Decide `POST_PID_GAIN` vs
-  `MAX_REAL_ANGLE_DEG` alignment (E52), and validate E53 near
-  straight-line at low speed.
+Boot:
+- [ ] `sudo ./main` prints `[RoadSegmenter] in 320x184 out 320x184`
+- [ ] `[SignDetector] in 416x416 out (12,3549) classes=8`
+- [ ] `turns=yes` in boot header
+
+Straight-line:
+- [ ] Green mask overlays road correctly
+- [ ] Red centerline follows road center
+- [ ] `kf ≈ 1.00` on open road
+- [ ] `INV` off when mask healthy, on when lost
+
+Turn:
+- [ ] Đưa biển `turn_left` trước cam → state chuyển `TURN APPROACHING`
+- [ ] Tiến gần opening → state chuyển `TURN LEFT` (path magenta)
+- [ ] Che opening giữa cua → state chuyển `GHOST TURN LEFT` (path yellow, vẫn sống)
+- [ ] Xe hoàn thành cua → state về `CENTERLINE` (không sớm, không muộn)
+- [ ] Nếu kẹt giữa cua → sau ~3s (30 tick) tự release
+
+Traffic light:
+- [ ] Đưa ảnh đèn đỏ trước cam → `spd` về 0, state hiển thị `STOP:red`
+- [ ] Đưa ảnh đèn xanh → `spd` trở lại (trừ khi có người)
+
+Pedestrian:
+- [ ] Đưa ảnh người đi bộ → `spd` về 0, state `STOP:person`
+- [ ] Người + đèn xanh → vẫn dừng (person wins)
+- [ ] Người biến mất sau 2s → xe tự đi tiếp
+
+Emergency:
+- [ ] Ctrl-C → motor stops, servo centers
 
 ---
 
-## Logs and debugging
-
-The only visibility currently is the on-screen overlay (`SHOW_UI = true`):
+## Debug UI
 
 ```
-FPS <fps> | spd <applied>/<target> | PID <pre-gain> | out <post-clamp> | kf <kept_frac> [INV]
+FPS 10.2 | spd 12.0/12.0 | PID -3.2 | out -15 | kf 0.98
+sign turn_left | TURN LEFT | near -2.1 far 5.4 cov 0.82
 ```
 
-- `spd <applied>/<target>` — soft-start ramped value vs. follower's target
-- `PID <pre-gain>` — raw PID output before `post_pid_gain`
-- `out <post-clamp>` — final rounded servo command
-- `kf <kept_frac>` — largest-component fraction; drops at junctions/obstacles
-- `INV` — mask is invalid but coverage still > 2 %
+**State strings:**
+- `CENTERLINE` — PID bám đường bình thường
+- `TURN APPROACHING` — sign active, opening thấy nhưng chưa đủ gần để commit
+- `TURN PENDING (tangent)` — opening gần nhưng centerline vẫn thẳng (chờ xe tiến)
+- `TURN LEFT/RIGHT` — Bezier active, path magenta
+- `GHOST TURN LEFT/RIGHT` — opening biến mất, path yellow
+- `INVALID MASK` — mask rỗng, xe dừng khẩn cấp
 
-When you add a CSV logger, the columns to capture:
+**Stop strings in log:**
+- `-` — không dừng
+- `STOP:red` — đèn đỏ
+- `STOP:person` — người đi bộ
+
+---
+
+## Logs
+
+On-screen overlay only (`SHOW_UI = true`). To add CSV logger, columns:
 `t_usec, valid, coverage, kept_frac, near_e, far_e, eff, curve_smooth,
-asym, occl, angle_pre_gain, angle, servo_cmd, applied_speed, tof[4], imu_yaw`.
+asym, occl, angle_pre_gain, angle, servo_cmd, applied_speed, state_str,
+turn_committed, turn_tick, sign_id, person_age, red_age`.
+```
+
+---
+
+## Tóm tắt 2 câu trả lời
+
+1. **Chỉ 1 centerline:** `extractCenterline` dùng `largestRun` per row → **1 path duy nhất**. Trong turn, path này vẫn bám đường cũ (rộng hơn) → đó là lý do cần `turn_committed_` state + Bezier path cache để không phụ thuộc centerline nữa.
+
+2. **Chỉ vào opening khi có biển:** `detectOpenings` return empty nếu `sign.active == false`. Nhưng **sau khi commit**, turn vẫn tiếp tục dù biển có mất — vì completion dựa vào mask/heading/max_ticks, không phụ thuộc sign.
+
+Nếu sau này muốn multi-branch extraction (nhiều centerline thật sự), cần viết `extractMultiBranchCenterlines` — đây là scope ~300-500 dòng code, không nằm trong V6.1.
