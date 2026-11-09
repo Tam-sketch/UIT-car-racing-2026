@@ -1,12 +1,22 @@
-# `README.md`
+# README.md (Cập nhật cho kiến trúc Path-based Turn Planner)
+
+Dưới đây là nội dung `README.md` hoàn chỉnh, đã cập nhật theo kiến trúc mới (Path-based, TurnPlanner, bỏ TurnStateMachine).
 
 ```markdown
 # UCR 2026 — Jetson Nano Autonomous Car
 
 Autonomous road-following on the physical round-3 car. Perception is a
 TensorRT road-segmentation model; control is a port of the proven
-`ucr_main_v20.py` PID. Everything runs on a fixed 10 Hz control tick so
-the sim-tuned constants keep their meaning on the real robot.
+`ucr_main_v20.py` PID. 
+
+**Cập nhật Round 3:** 
+- Chuyển sang **Path-based Turn Planner** (port 1:1 từ `openinglogic.py`).
+- Thay thế hoàn toàn `TurnStateMachine` cũ (dùng IMU heading) bằng cách 
+  modify `row_centers` để PID tự bẻ lái.
+- Thêm `SignVoter` để chống nhiễu sign detect đơn lẻ.
+
+Everything runs on a fixed 10 Hz control tick so the sim-tuned constants 
+keep their meaning on the real robot.
 
 ---
 
@@ -15,24 +25,21 @@ the sim-tuned constants keep their meaning on the real robot.
 ```
 Camera (BGR 640×384)
 │
-▼
-RoadSegmenter          ← TensorRT engine + BGR→RGB + argmax
-│  (CV_8UC1 mask at model output resolution)
-▼
-LaneFollowerV20        ← keep_largest → centerline → near/far/curve
-│                     → occlusion gate → asymmetry → PID → speed
-│  (v20::LaneFollower::Output)
-▼
-main loop              ← fixed 10 Hz tick, soft-start ramp, servo/motor
-│
-▼
-Motor / Servo
+├─→ SignDetector (YOLOv8) ──→ SignVoter ──→ setSign()
+│                                              │
+▼                                              ▼
+RoadSegmenter (TwinLiteNet)            LaneFollowerV20
+│  (CV_8UC1 mask 320×184)               │  ├─ extractCenterline
+▼                                      │  ├─ TurnPlanner.update()
+TurnPlanner (openinglogic.py port) ────┘  │   (modify path nếu có biển)
+   (morph_close, edge_dev, bezier)         ├─ OcclusionGate
+                                           ├─ Asymmetry
+                                           ├─ PID (v20)
+                                           └─ Speed planning
+                                              │
+                                              ▼
+main loop (10 Hz) ──→ Motor / Servo
 ```
-
-The control loop ticks at a **fixed period**, regardless of how fast
-inference runs. This is intentional — every rate limit and EMA inside
-`LaneFollowerV20` is *per step*, so the tick rate defines their real
-behavior.
 
 ---
 
@@ -40,12 +47,16 @@ behavior.
 
 ```
 config/
-  RobotConfig.h           ← every tunable constant (one place)
+  RobotConfig.h           ← every tunable constant (hardware + system)
 perception/
-  TrtSession.h            ← generic TensorRT engine wrapper (no model logic)
-  RoadSegmenter.h         ← TwinLiteNet road segmentation (uses TrtSession)
+  TrtSession.h            ← generic TensorRT engine wrapper
+  RoadSegmenter.h         ← TwinLiteNet road segmentation
+  SignDetector.h          ← YOLOv8 sign detection (NMS + unletterbox)
 control/
-  LaneFollowerV20.h       ← the v20 PID stack (header-only, cohesive)
+  TurnPlanner.h           ← [NEW] Port 1:1 từ openinglogic.py
+  LaneFollowerV20.h       ← v20 PID + tích hợp TurnPlanner
+  SignVoter.h             ← Chống nhiễu sign (multi-frame voting)
+  TurnStateMachine.h      ← [DEPRECATED] Không còn dùng, có thể xóa
 main.cpp                  ← hardware init + control loop + UI
 ```
 
@@ -55,14 +66,17 @@ main.cpp                  ← hardware init + control loop + UI
 |---|---|
 | Engine load / buffer / stream | `TrtSession.h` |
 | BGR→RGB, argmax, confidence margin | `RoadSegmenter.h` |
+| Sign bbox, NMS, class decode | `SignDetector.h` |
+| Multi-frame sign voting | `SignVoter.h` |
+| **Opening detection, Bézier path, ghost mode** | **`TurnPlanner.h`** |
 | Near/far split, occlusion, PID, speed | `LaneFollowerV20.h` |
-| Constants you actually tune | `RobotConfig.h` |
+| Hardware constants, servo calibration | `RobotConfig.h` |
 | Wiring, timing, hardware order | `main.cpp` |
 
-**Rule of thumb:** if a piece of code touches only the TensorRT API, it
-belongs in `TrtSession.h`. If it also touches the model's tensor layout
-(BGR→RGB, argmax, NMS, class decode), it belongs in a model wrapper
-(`RoadSegmenter.h`, future `SignDetector.h`).
+**Rule of thumb:** 
+- Nếu code chỉ chạm TensorRT API → `TrtSession.h`.
+- Nếu chạm tensor layout (BGR→RGB, argmax, NMS) → model wrapper (`RoadSegmenter.h`, `SignDetector.h`).
+- Nếu xử lý hình học đường đi (centerline, path) → `TurnPlanner.h` hoặc `LaneFollowerV20.h`.
 
 ---
 
@@ -91,21 +105,18 @@ sudo ./main
 Expected boot log:
 
 ```
-=== UCR2026: Auto Run ===
-Engine: /home/car4/Downloads/road/kga2.engine
-Control period: 100 ms
-[RoadSegmenter] in 320x180 out 320x180
+=== UCR2026 Auto Run (Path-based, signs=yes) ===
+[RoadSegmenter] in 320x184 out 320x184
 ```
 
 If you see:
 
 - `[TrtSession] Init error: ...` → engine file missing or incompatible
-  with the installed TensorRT version. Re-export the engine against the
-  Jetson's TensorRT.
+  with the installed TensorRT version.
 - `[RoadSegmenter] Expected 2 output channels` → the engine is not a
-  TwinLiteNet binary-segmentation model. Check the export.
-- `[RoadSegmenter] Dynamic dim ... not supported` → the engine has
-  dynamic shape bindings. Fix the export to use static shapes.
+  TwinLiteNet binary-segmentation model.
+- `[SignDetector] engine has no I/O` → sign engine missing.
+- `signs=NO` → sign detector không load được, turn sẽ không kích hoạt.
 
 Press `q` or `Esc` to stop.
 
@@ -133,56 +144,58 @@ the alphas with `alpha = 1 - exp(-dt / tau)`.
 
 ---
 
-## Adding a new perception model (sign detector, crosswalk, etc.)
+## Turn Planner Logic (Mới)
+
+`TurnPlanner` hoạt động theo cơ chế **Path-based** (thay vì force-turn bằng IMU cũ):
+
+1. **Detect Opening:**
+   - Morph close (kernel 35x5) để làm sạch mask.
+   - Tính `edge_profile` (trái/phải) của vùng đường.
+   - Smooth bằng moving average (win 5), baseline bằng rolling median (win 50).
+   - `deviation > 15` px liên tục ≥ 10 hàng → phát hiện opening (ngã rẽ).
+
+2. **Trigger:**
+   - Nếu `op.y_mid > 0.75 * mask.rows` (gần xe) → thực hiện rẽ.
+   - Với biển `no_left`/`no_right`, kiểm tra `isStraightBlocked`. Nếu đường thẳng vẫn đi được → bỏ qua biển, đi thẳng.
+
+3. **Modify Path:**
+   - Tìm `x_turn` (điểm giữa opening và baseline).
+   - Vẽ đường cong **Bézier bậc 2** từ centerline hiện tại vào opening.
+   - Extend thẳng vào làn mới (tối đa 80px).
+
+4. **Ghost Mode:**
+   - Nếu mất dấu opening nhưng vẫn đang trong turn, dùng `last_y_mid` và `turn_width` để tạo "opening ảo" và tiếp tục rẽ.
+
+**Lưu ý:** `TurnPlanner` modify `row_centers`. PID v20 sau đó sẽ tính `near_error`, `far_error` từ path mới này và tự động bẻ lái.
+
+---
+
+## Adding a new perception model
 
 Copy `RoadSegmenter.h` as a template. Structure:
 
 ```cpp
-class SignDetector {
-    TrtSession session_;          // reuse — do NOT reimplement
+class NewModel {
+    TrtSession session_;
     std::vector<float> inBuf_, outBuf_;
-    // ... model-specific dims
 public:
     bool Init(const std::string& enginePath);
-    bool Predict(const cv::Mat& bgrFrame, SignResult& out);
+    bool Predict(const cv::Mat& bgrFrame, Result& out);
 };
 ```
 
-The sign model will need more post-processing (NMS, class decode,
-bbox regression). Keep all of it inside `SignDetector::Predict` — do
-not leak it into `TrtSession` and do not leak it into `main.cpp`.
+Keep all model-specific post-processing inside `Predict`.
 
 Then in `main.cpp`:
 
 ```cpp
-ucr::perception::SignDetector sign;
-sign.Init(ucr::config::SIGN_ENGINE_PATH);
+ucr::perception::NewModel model;
+model.Init("path/to/engine");
 
-// inside the loop, after road.Predict():
-ucr::perception::SignResult signs;
-sign.Predict(frame, signs);
-// → feed signs to a future MissionStateMachine
+// inside the loop:
+ucr::perception::Result result;
+model.Predict(frame, result);
 ```
-
----
-
-## Adding a new controller / mission state
-
-When the sign detector is ready you will add a state machine between
-`LaneFollowerV20` and the motor/servo. Suggested layout:
-
-```
-mission/
-  MissionStateMachine.h    ← reads road + sign output, decides mode
-  TurnController.h         ← takes over servo during TURN_COMMITTED
-  ParkController.h         ← future
-```
-
-`main.cpp` becomes a dispatcher: it asks the state machine "who owns
-the actuator this tick?", and forwards the command from the right
-owner. Do **not** let a turn controller mutate `LaneFollowerV20`
-internals — feed its output back into the state machine, and let the
-state machine decide.
 
 ---
 
@@ -197,29 +210,28 @@ algorithm details, not system knobs.
 
 | Constant | Meaning | Safe range |
 |---|---|---|
-| `MAX_SPEED_CMS` | Top forward speed | 5 → 25 |
+| `MAX_SPEED_CMS` | Top forward speed | 5 → 20 |
 | `MIN_SPEED_CMS` | Floor speed during curves / occl | 2 → 8 |
-| `MAX_STEER_DEG` | Servo clamp | **verify ≤20 before going to 50** |
-| `INVERT_STEER` | Servo sign flip | must be empirically checked |
+| `MAX_REAL_ANGLE_DEG` | Servo physical clamp | **verify ≤ 30** |
 | `CONTROL_PERIOD_MS` | PID tick period | leave at 100 unless re-tuning |
 | `MAX_ACCEL_CMS2` | Speed ramp on start | 10 → 40 |
 | `POST_PID_GAIN` | PID-to-servo scale | **calibrate empirically** |
 | `CURVE_SCALE` | How aggressive curve slowdown is | 80 (more) → 200 (less) |
 | `MIN_ROWS`, `COVERAGE_THRESHOLD` | Mask validity gate | tighten if garbage masks slip through |
 
-### Calibrate `POST_PID_GAIN`
+### Turn Planner Tuning (Trong `TurnPlannerConfig`)
 
-The current value (2.2) is a guess inherited from `test_run.cpp`. To
-replace it with a measured value:
+Các thông số mặc định đã được port 1:1 từ Python (dành cho mask 640x360). Vì C++ chạy mask 320x184, **nên kiểm tra lại nếu thấy turn hoạt động không đúng**:
 
-1. Park the car on a clear, flat surface.
-2. Command the servo manually (5°, 10°, 15°, 20°, 30°, 40°, 50°) and
-   let it hold for ~1 s each while rolling slowly forward at constant
-   speed.
-3. Record the yaw-rate from `BNO055::eulerDeg.x` for each angle.
-4. Compute what servo angle produces the same turn radius that the
-   sim's PID output of "1.0" was tuned to. That ratio is
-   `POST_PID_GAIN`.
+| Constant | Default | Meaning |
+|---|---|---|
+| `open_thresh` | 15 | Ngưỡng deviation để nhận là opening. Giảm → nhạy hơn. |
+| `min_height` | 10 | Số hàng pixel tối thiểu của opening. Giảm → dễ trigger. |
+| `turn_trigger_y_ratio` | 0.75 | Trigger khi opening gần xe (y > 0.75*H). |
+| `corner_radius` | 20 | Độ cong của Bézier. Tăng → cua mượt hơn. |
+| `turn_speed_cap` | 12.0 | Tốc độ tối đa khi đang modify path (cm/s). |
+
+*Lưu ý:* `turn_speed_cap` nằm trong `v20::Config` (không phải `TurnPlannerConfig`).
 
 ---
 
@@ -227,13 +239,15 @@ replace it with a measured value:
 
 Before any timed run:
 
-- [ ] `sudo ./main` boots, prints `[RoadSegmenter] in WxH out WxH`
+- [ ] `sudo ./main` boots, prints `[RoadSegmenter] in 320x184 out 320x184`
 - [ ] Camera frame shows in UI, mask overlays road correctly
 - [ ] Centerline (red) follows the road center visually
 - [ ] `kf` in UI ≈ 1.00 on open road, drops at junctions / obstacles
 - [ ] `INV` flag off when mask is healthy, on when lost
 - [ ] Motor at 0 → car does not move; at `MIN_SPEED_CMS` → smooth creep
 - [ ] Servo at `+N°` → car turns in the direction you expect
+- [ ] **Đưa biển `turn_left` trước cam → line chuyển sang MAGENTA, `turn=Y`**
+- [ ] **Bỏ biển → line trở lại đỏ, `turn=N`**
 - [ ] Emergency stop test: kill `main` (Ctrl-C) → motor stops, servo centers
 
 ---
@@ -243,12 +257,12 @@ Before any timed run:
 - **Do not** tick the PID at inference rate. Use the fixed-period gate.
 - **Do not** reset `LaneFollower` on a single dropped road-mask frame
   (current code resets on `inferOK=false` — a TensorRT *failure*, not a
-  lost mask; a lost mask yields `valid=false` but does not reset).
+  lost mask).
 - **Do not** put model-specific code in `TrtSession.h`.
 - **Do not** put hardware logic (camera, motor, servo) in
   `RoadSegmenter` or `LaneFollower` — those should be pure.
-- **Do not** split `LaneFollowerV20.h`. It is cohesive; the near/far/
-  curve/occl/asym signals feed the PID and only exist in that context.
+- **Do not** split `LaneFollowerV20.h`. It is cohesive.
+- **Do not** dùng lại `TurnStateMachine.h`. Logic force-turn bằng IMU đã bị loại bỏ hoàn toàn.
 
 ---
 
@@ -256,43 +270,43 @@ Before any timed run:
 
 Ordered by dependency:
 
-1. **Sign detector** — `perception/SignDetector.h` on top of `TrtSession`
-2. **Mission state machine** — `mission/MissionStateMachine.h`
-3. **Turn controller** — `mission/TurnController.h`, uses IMU heading for
-   completion (requires fixing E38: `integrateYawRate` is never called
-   in `SensorThread`)
-4. **Bridge handling** — new state, possibly no new model
-5. **Pedestrian stop** — needs the crosswalk detector; needs a
+1. **Bridge handling** — new state, possibly no new model
+2. **Pedestrian stop** — needs the crosswalk detector; needs a
    safe-resume policy
-6. **Parallel parking** — `mission/ParkController.h`, needs ToF
+3. **Parallel parking** — `mission/ParkController.h`, needs ToF
    clearance logic and reverse motion
 
-Each of (1)–(6) is additive: new files under `perception/` and
-`mission/`, one new line in `main.cpp` to wire it in, and (once more
-than 2 owners exist) a small dispatcher in `main.cpp`.
+Each of (1)–(3) is additive.
 
 ---
 
 ## Logs and debugging
 
-Currently the only visibility is the on-screen overlay (`SHOW_UI =
-true`). The overlay shows:
+Currently the only visibility is the on-screen overlay (`SHOW_UI = true`). 
+The overlay shows:
 
 ```
-FPS <fps> | spd <applied>/<target> | PID <pre-gain> | out <post-clamp> | kf <kept_frac> [INV]
+FPS <fps> | spd <applied>/<target> | PID <pre-gain> | sign=<sign_name> | turn=<Y/A/N> side=<left/right> ymid=<y> | hdg <heading>
 ```
 
 - `spd <applied>/<target>` — soft-start ramped value vs. what the
-  follower wanted
-- `PID <pre-gain>` — raw PID output before `POST_PID_GAIN`
-- `out <post-clamp>` — final servo command after gain, clamp, invert
-- `kf <kept_frac>` — largest-component fraction; drops at junctions
-- `INV` — mask is invalid but coverage is still > 2 %
-
-If you add a CSV logger later, the columns to capture are:
-`t_usec, valid, coverage, kept_frac, near_e, far_e, eff, curve_smooth,
-asym, occl, angle_pre_gain, angle, speed, tof[4], imu_yaw`.
+  follower wanted.
+- `PID <pre-gain>` — raw PID output before `POST_PID_GAIN`.
+- `sign=<name>` — sign đang được voter commit (hoặc `-` nếu không có).
+- `turn=Y` — TurnPlanner đang modify path (line màu MAGENTA).
+- `turn=A` — Đang tiếp cận opening (Approaching), chưa modify path.
+- `turn=N` — Không có turn.
+- `side=<left/right>` — Hướng rẽ đang được lên kế hoạch.
+- `ymid=<y>` — Vị trí y của opening gần nhất.
+- `hdg <heading>` — Heading từ BNO055 (chỉ để tham khảo, không dùng cho control).
 ```
-```
 
-That's the whole file. Save as `README.md` at the repo root (or in the round-3 source folder if you keep round-1/2 code in the same tree).
+---
+
+### Tóm tắt các thay đổi chính so với README cũ:
+1. **Architecture**: Cập nhật sơ đồ khối (thêm SignDetector, SignVoter, TurnPlanner).
+2. **File map**: Thêm `TurnPlanner.h`, `SignVoter.h`; đánh dấu deprecated `TurnStateMachine.h`.
+3. **Turn Planner Logic**: Thêm section giải thích cơ chế Path-based mới.
+4. **Tuning**: Thêm bảng thông số `TurnPlannerConfig` và `turn_speed_cap`.
+5. **Verification**: Thêm checklist kiểm tra line MAGENTA khi có biển.
+6. **UI Overlay**: Cập nhật format log mới (`turn=Y/A/N`, `side=...`, `ymid=...`).
