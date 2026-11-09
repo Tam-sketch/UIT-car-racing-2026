@@ -120,13 +120,16 @@ static constexpr float TURN_TARGET_YAW            = 72.0f;
 static constexpr float TURN_SHARP_ANGLE           = 22.0f;
 static constexpr float TURN_BRAKING_SPEED         = 8.0f;
 static constexpr float TURN_TURNING_SPEED         = 8.0f;
-static constexpr float TURN_BRAKE_MULT            = 1.60f;
-static constexpr float TURN_TURN_MULT             = 2.00f;
-static constexpr float TURN_BASELINE_FLOOR        = 2280.0f;  // tuned on YOLO-320x192 output
+static constexpr float TURN_BRAKE_MULT            = 1.20f;   // was 1.60 — start braking at 20% widening
+static constexpr float TURN_TURN_MULT             = 1.40f;   // was 2.00 — trigger at 40% widening
+    // Fallback floor for frozen_baseline, used only if the live EMA is
+    // lower than this. Tuned conservatively — the real baseline is the EMA
+    // (which freezes when a sign commits). Re-measure on TwinLiteNet.
+static constexpr float TURN_BASELINE_FLOOR        = 1500.0f; // was 2280 — pre-warmup fallback
 static constexpr float TURN_BASELINE_ALPHA        = 0.97f;
 static constexpr float TURN_TAPER_START           = 0.85f;
 static constexpr float TURN_BAIL_FRAC_OF_BASELINE = 1.05f;
-static constexpr float TURN_PEAK_DROP_PX          = 200.0f;
+static constexpr float TURN_PEAK_DROP_PX          = 250.0f;    // was 200  — slight bump above noise
 
 // ---- Heading source (BNO055) ----
 // eulerDeg.x is the BNO055's fused yaw. Test file (`./main` with no args) prints it raw.

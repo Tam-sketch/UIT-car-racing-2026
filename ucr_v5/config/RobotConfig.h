@@ -1,0 +1,177 @@
+// ============================================================
+// config/RobotConfig.h
+//
+// Central config for the UCR-2026 car application.
+// All tunable constants live here. Controller internals
+// (LaneFollowerV20::Config) are still configured at the call
+// site so this file stays focused on hardware/system values.
+// ============================================================
+#pragma once
+
+namespace ucr {
+namespace config {
+
+// --------------------------------------------------------
+// Model paths
+// --------------------------------------------------------
+inline constexpr char ROAD_ENGINE_PATH[] =
+    "/home/car4/Downloads/road/kga2.engine";
+inline constexpr char SIGN_ENGINE_PATH[] = 
+    "/home/car4/Downloads/sign/huy_sign.engine";
+// When sign model is ready:
+// inline constexpr char SIGN_ENGINE_PATH[] = "...";
+
+// --------------------------------------------------------
+// Hardware limits
+// --------------------------------------------------------
+// Raised from 15 cm/s. User confirmed 10 cm/s turns without sliding,
+// so 15 → 20 is safe headroom. Do not exceed 25 until the track
+// shows a need.
+inline constexpr float MAX_SPEED_CMS = 20.0f;
+inline constexpr float MIN_SPEED_CMS = 10.0f;
+
+// --------------------------------------------------------
+// Servo calibration (measured empirically)
+//
+// Real angle = SLOPE * servo_cmd + OFFSET, per branch:
+//   servo_cmd > 0  (left):   real =  0.96 * cmd - 6.2
+//   servo_cmd < 0  (right):  real =  0.71 * cmd + 2.5
+//
+// Conventions used by this project:
+//   - PID output (out.angle): positive = RIGHT turn
+//   - Servo command (SetAngle): positive = LEFT turn
+//   - Real angle (physical): positive = LEFT turn (matches servo)
+//
+// The helper functions below convert between "desired real angle"
+// and "servo command", inverting the measured curves.
+// --------------------------------------------------------
+inline constexpr float SERVO_LEFT_SLOPE    = 0.96f;
+inline constexpr float SERVO_LEFT_OFFSET   = -6.2f;
+inline constexpr float SERVO_RIGHT_SLOPE   = 0.71f;
+inline constexpr float SERVO_RIGHT_OFFSET  = 2.5f;
+
+// Symmetric real-angle bound. Servo commands are computed to hit
+// exactly this on both sides, so the car turns equally left/right.
+// At 30° real: left servo ≈ 37.7, right servo ≈ −45.8. Both are
+// safely inside the ±60° servo range. Raise to 33 if you need
+// to match the previous max right-turn capability.
+inline constexpr float MAX_REAL_ANGLE_DEG = 30.0f;
+
+// Hard safety clamp on the raw servo command. Independent of the
+// real-angle bound — catches calibration errors and saturated maps.
+inline constexpr int MAX_SERVO_CMD = 55;
+
+// Convert: desired real angle (deg, + = left) → servo command.
+inline float RealAngleToServo(float real_deg) {
+    if (real_deg > 0.0f)
+        return (real_deg - SERVO_LEFT_OFFSET) / SERVO_LEFT_SLOPE;
+    if (real_deg < 0.0f)
+        return (real_deg - SERVO_RIGHT_OFFSET) / SERVO_RIGHT_SLOPE;
+    return 0.0f;
+}
+
+// Inverse: servo command → predicted real angle (deg, + = left).
+// Use for UI diagnostics and post-run analysis.
+inline float ServoToRealAngle(float servo_cmd) {
+    if (servo_cmd > 0.0f)
+        return SERVO_LEFT_SLOPE * servo_cmd + SERVO_LEFT_OFFSET;
+    if (servo_cmd < 0.0f)
+        return SERVO_RIGHT_SLOPE * servo_cmd + SERVO_RIGHT_OFFSET;
+    return 0.0f;
+}
+
+// --------------------------------------------------------
+// Control loop
+// --------------------------------------------------------
+// PID step period. All LaneFollowerV20 rate limits and EMA
+// alphas are per-step, so this value determines their
+// real-world meaning. 100 ms = 10 Hz.
+inline constexpr int   CONTROL_PERIOD_MS = 100;
+
+// Speed ramp applied on motor commands (soft-start).
+// Decel is not ramped — the driver handles it.
+inline constexpr float MAX_ACCEL_CMS2 = 20.0f;
+
+// --------------------------------------------------------
+// Road model
+// --------------------------------------------------------
+inline constexpr int   ROAD_DA_CHANNEL  = 1;
+inline constexpr float ROAD_CONF_MARGIN = 0.02f;
+
+// --------------------------------------------------------
+// Sign model
+// --------------------------------------------------------
+inline constexpr float SIGN_CONF_THRESH = 0.5f;
+inline constexpr float SIGN_IOU_THRESH  = 0.45f;
+inline constexpr int   SIGN_INPUT_SIZE  = 416;
+// Detect at half the control rate (see user note). At CONTROL_PERIOD_MS=100
+// this gives ~5 Hz sign inference, which keeps frame drops low.
+inline constexpr int   SIGN_DETECT_EVERY = 2;
+
+// --- Sign class indices (new 8-class engine) ---
+namespace sign_class {
+    inline constexpr int CONSTRUCTION_AHEAD = 0;
+    inline constexpr int NO_LEFT            = 1;
+    inline constexpr int NO_RIGHT           = 2;
+    inline constexpr int PARKING            = 3;
+    inline constexpr int ROUNDABOUT         = 4;
+    inline constexpr int TRAFFIC_LIGHT      = 5;
+    inline constexpr int TURN_LEFT          = 6;
+    inline constexpr int TURN_RIGHT         = 7;
+}
+inline constexpr const char* SignClassName(int id) {
+    switch (id) {
+        case 0: return "construct";
+        case 1: return "no_left";
+        case 2: return "no_right";
+        case 3: return "parking";
+        case 4: return "roundabout";
+        case 5: return "traffic_light";
+        case 6: return "turn_left";
+        case 7: return "turn_right";
+        default: return "-";
+    }
+}
+
+// --- Sign voter (tick units) ---
+inline constexpr int SIGN_VOTER_ACTIVATE_FRAMES   = 5;
+inline constexpr int SIGN_VOTER_TIMEOUT_FRAMES    = 100;
+inline constexpr int SIGN_HOLD_FRAMES             = 30;
+inline constexpr int SIGN_SNAPSHOT_HOLD_FRAMES    = 5;
+inline constexpr int TOPO_CONFIRM_FRAMES          = 3;
+inline constexpr int RESET_DEBOUNCE_FRAMES        = 150;
+
+// --- Turn SM ---
+inline constexpr float FORCE_ANGLE               = 22.0f;
+inline constexpr float TURN_CONDITION_Y_LO_RATIO = 0.69f;
+inline constexpr float TURN_CONDITION_COVERAGE   = 0.78f;
+inline constexpr float HEADING_RESET_DEG         = 56.0f;
+inline constexpr float FORCE_APPROACH_SPEED      = 8.0f;
+inline constexpr float FORCE_TURNING_SPEED       = 5.0f;
+inline constexpr float FORCE_EXIT_SPEED          = 12.0f;
+inline constexpr float FORCE_TURN_PHASE_DEG      = 15.0f;
+inline constexpr float FORCE_EXIT_PHASE_DEG      = 50.0f;
+inline constexpr float SLOW_SPEED_CMS            = 10.0f;
+
+// --- Heading (BNO055) ---
+// BNO055 eulerDeg.x → heading transform. Defaults are identity.
+// If the car reads left-positive, set SIGN=-1, OFFSET=360 to match
+// pray.py's convention (+ = right).
+inline constexpr float HEADING_SIGN       = 1.0f;
+inline constexpr float HEADING_OFFSET_DEG = 0.0f;
+
+// --------------------------------------------------------
+// Lane follower tuning (from test_run.cpp)
+// --------------------------------------------------------
+inline constexpr float  CURVE_SCALE        = 150.0f;
+inline constexpr double POST_PID_GAIN      = 2.2;
+inline constexpr int    MIN_ROWS           = 5;
+inline constexpr double COVERAGE_THRESHOLD = 0.05;
+
+// --------------------------------------------------------
+// UI
+// --------------------------------------------------------
+inline constexpr bool SHOW_UI = true;
+
+}  // namespace config
+}  // namespace ucr

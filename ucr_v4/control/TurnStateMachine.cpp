@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 #include "perception/SignClass.h"   // for SIGN_TURN_LEFT / SIGN_TURN_RIGHT
 
@@ -65,7 +66,10 @@ TurnStateMachine::Output TurnStateMachine::Update(int   sign_committed,
                 ResetApproach();
                 state_ = APPROACH;
 
-                // TODO (E45 CsvLogger): log NORMAL -> APPROACH
+                std::fprintf(stderr,
+                    "[TSM] NORMAL->APPROACH sign=%d dir=%+d px_mid=%d base=%.0f brTh=%.0f tnTh=%.0f\n",
+                    sign_committed, d, px_mid,
+                    frozen_baseline_, brake_thresh_, turn_thresh_);
             } else {
                 // no_left / no_right / new classes: block + reset,
                 // otherwise the same committed sign would re-trigger
@@ -98,7 +102,9 @@ TurnStateMachine::Output TurnStateMachine::Update(int   sign_committed,
         {
             state_         = TURNING;
             entry_heading_ = heading;
-            // TODO (E45): log APPROACH -> TURNING
+            std::fprintf(stderr,
+                "[TSM] APPROACH->TURNING peak=%.0f px_mid=%d drop=%.0f entry_hdg=%.2f\n",
+                px_mid_peak_, px_mid, last_drop_from_peak_, heading);
             return out;
         }
 
@@ -117,7 +123,14 @@ TurnStateMachine::Output TurnStateMachine::Update(int   sign_committed,
             px_mid_ema_     = -1.0f;
             ResetApproach();
 
-            // TODO (E45): log APPROACH -> NORMAL (bail)
+            std::fprintf(stderr,
+                "[TSM] APPROACH->NORMAL (BAIL) peak=%.0f tnTh=%.0f px_mid=%d bailTh=%.0f — "
+                "peak was %.0f below trigger\n",
+                px_mid_peak_, turn_thresh_, px_mid,
+                frozen_baseline_ * ucr::config::TURN_BAIL_FRAC_OF_BASELINE,
+                turn_thresh_ - px_mid_peak_);
+
+
             return out;
         }
 
@@ -154,7 +167,9 @@ TurnStateMachine::Output TurnStateMachine::Update(int   sign_committed,
             px_mid_ema_     = -1.0f;
             ResetApproach();
 
-            // TODO (E45): log TURNING -> NORMAL
+            std::fprintf(stderr,
+                "[TSM] TURNING->NORMAL delta=%.1f progress=%.2f exit_hdg=%.2f\n",
+                delta, progress, heading);
             return out;
         }
 

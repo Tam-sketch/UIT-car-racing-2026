@@ -417,9 +417,9 @@ public:
                 outLim = c_.emergency_output_limit; rateLim = c_.emergency_rate_limit; emgAuth_ = true;
             } else { outLim = c_.output_limit; rateLim = c_.rate_limit; emgAuth_ = false; }
         }
-        double sg = detail::sgn(error);
-        double e = (std::abs(error) < c_.deadband) ? sg * (std::abs(error) - c_.deadband)
-                                                    : error - sg * c_.deadband;
+        double sg      = detail::sgn(error);
+        double abs_err = std::abs(error);
+        double e       = (abs_err <= c_.deadband) ? 0.0 : (error - sg * c_.deadband);
         double p = kpEff * e;
         integral_ = std::clamp(integral_ + e, -c_.integral_limit, c_.integral_limit);
         double i = c_.ki * integral_;
