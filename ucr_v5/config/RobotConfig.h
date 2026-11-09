@@ -104,9 +104,6 @@ inline constexpr float ROAD_CONF_MARGIN = 0.02f;
 inline constexpr float SIGN_CONF_THRESH = 0.5f;
 inline constexpr float SIGN_IOU_THRESH  = 0.45f;
 inline constexpr int   SIGN_INPUT_SIZE  = 416;
-// Detect at half the control rate (see user note). At CONTROL_PERIOD_MS=100
-// this gives ~5 Hz sign inference, which keeps frame drops low.
-inline constexpr int   SIGN_DETECT_EVERY = 2;
 
 // --- Sign class indices (new 8-class engine) ---
 namespace sign_class {
@@ -133,13 +130,34 @@ inline constexpr const char* SignClassName(int id) {
     }
 }
 
-// --- Sign voter (tick units) ---
-inline constexpr int SIGN_VOTER_ACTIVATE_FRAMES   = 5;
-inline constexpr int SIGN_VOTER_TIMEOUT_FRAMES    = 100;
-inline constexpr int SIGN_HOLD_FRAMES             = 30;
-inline constexpr int SIGN_SNAPSHOT_HOLD_FRAMES    = 5;
+// --- Sign detect frequency ---
+// Every Nth control tick. At 5–7 FPS loop this is ~1.25–1.75 Hz, which is
+// more than enough for a slow car: signs are visible from 3–5 m, so a
+// 15 cm/s approach spends 20–30 s in sign range → 25–50 detections.
+inline constexpr int SIGN_DETECT_EVERY = 4;
+
+// --- Sign voter timers ---
+// NOTE: units are mixed — see per-constant comments. All values below are
+// re-tuned for ~6 Hz control tick and ~1.5 Hz detect rate (i.e. real car).
+// If FPS changes significantly, recompute: ticks = seconds × actual_Hz.
+
+// Detect-update units. 2 consecutive detects ≈ 1.3 s at 1.5 Hz.
+inline constexpr int SIGN_VOTER_ACTIVATE_FRAMES   = 2;
+
+// Control-tick units. 60 ticks ÷ 6 Hz ≈ 10 s (matches original intent).
+inline constexpr int SIGN_VOTER_TIMEOUT_FRAMES    = 60;
+
+// Control-tick units. 18 ticks ÷ 6 Hz ≈ 3 s.
+inline constexpr int SIGN_HOLD_FRAMES             = 18;
+
+// Control-tick units. 3 ticks ÷ 6 Hz ≈ 0.5 s.
+inline constexpr int SIGN_SNAPSHOT_HOLD_FRAMES    = 3;
+
+// Detect-update units. 3 detects ≈ 2 s at 1.5 Hz — more stable than sim.
 inline constexpr int TOPO_CONFIRM_FRAMES          = 3;
-inline constexpr int RESET_DEBOUNCE_FRAMES        = 150;
+
+// Control-tick units. 90 ticks ÷ 6 Hz ≈ 15 s (matches original 150 ÷ 10 Hz).
+inline constexpr int RESET_DEBOUNCE_FRAMES        = 90;
 
 // --- Turn SM ---
 inline constexpr float FORCE_ANGLE               = 22.0f;
