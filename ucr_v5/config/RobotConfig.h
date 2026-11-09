@@ -134,7 +134,7 @@ inline constexpr const char* SignClassName(int id) {
 // Every Nth control tick. At 5–7 FPS loop this is ~1.25–1.75 Hz, which is
 // more than enough for a slow car: signs are visible from 3–5 m, so a
 // 15 cm/s approach spends 20–30 s in sign range → 25–50 detections.
-inline constexpr int SIGN_DETECT_EVERY = 4;
+inline constexpr int SIGN_DETECT_EVERY = 2;
 
 // --- Sign voter timers ---
 // NOTE: units are mixed — see per-constant comments. All values below are
@@ -173,6 +173,8 @@ inline constexpr float FORCE_EXIT_PHASE_DEG      = 50.0f;
 inline constexpr float SLOW_SPEED_CMS            = 10.0f;
 inline constexpr float TURN_OPENING_MARGIN     = 0.08f;
 inline constexpr float TURN_NEAR_MIN_COVERAGE  = 0.55f;
+inline constexpr float TURN_AREA_RATIO   = 1.30f;
+inline constexpr int   TURN_GATE_PERSIST = 2;
 
 // --- Heading (BNO055) ---
 // BNO055 eulerDeg.x → heading transform. Defaults are identity.

@@ -46,7 +46,7 @@ struct TurnConfig {
     float slow_speed      = 10.0f;   // was 15 in sim
     float max_speed       = 20.0f;   // matches MAX_SPEED_CMS
     int   sign_hold_ticks = 30;
-    
+
     // Relative widening threshold. cov(far band) must exceed cov(near band)
     // by this fraction for the gate to fire. 0.08 = 8 percentage-point widening.
     // Raise (0.10–0.15) if force-turn fires too early; lower (0.05) if it never fires.
@@ -55,6 +55,15 @@ struct TurnConfig {
     // Absolute floor on near-band coverage. Protects against mask dropout while
     // the car is off the lane. Raise if false triggers during occlusion.
     float turn_near_min_coverage = 0.55f;
+
+    // Junction detection via mask-area spike.
+    // Mask area must be this multiple of the recent straight-road baseline to arm.
+    // 1.25 = 25% growth; 1.30 = 30% growth; 1.40 = 40% growth (more conservative).
+    float turn_area_ratio    = 1.30f;
+
+    // Spike must persist this many consecutive control ticks before firing.
+    // At ~6 Hz this is 2 ticks ≈ 330 ms.
+    int   turn_gate_persist  = 2;
 
     // --- Class indices (8-class engine) ---
     int idx_construction_ahead = 0;
@@ -188,37 +197,45 @@ public:
     }
 
 private:
+    mutable float areaEma_ = -1.0f;
+    mutable int   gate_streak_ = 0;
+
     static float AngleDiffDeg(float a, float b) {
         return std::fmod(a - b + 540.0f, 360.0f) - 180.0f;
     }
 
     bool CheckTurnCondition(const cv::Mat& mask) const {
-        if (mask.empty()) return false;
+        if (mask.empty()) { gate_streak_ = 0; return false; }
         const int h = mask.rows, w = mask.cols;
-        if (h < 10) return false;
+        if (h < 20 || w < 20) { gate_streak_ = 0; return false; }
 
-        // Three bands, bottom to top (image coords: y=h is bottom/near, y=0 is top/far).
-        //   far  band: y ∈ [0.55h, 0.72h)  ← where the junction mouth is visible
-        //   near band: y ∈ [0.82h, h)      ← pure lane, always ≈lane width
-        //   bottom band (for the absolute safety net) = near band
-        const int yFarTop  = (int)(h * 0.55f);
-        const int yFarBot  = (int)(h * 0.72f);
-        const int yNearTop = (int)(h * 0.82f);
-        if (yFarTop >= yFarBot || yFarBot >= yNearTop || yNearTop >= h) return false;
+        const int maskArea = cv::countNonZero(mask);
+        if (maskArea < (int)(w * h * 0.02f)) { gate_streak_ = 0; return false; }
 
-        const int areaFar  = (yFarBot - yFarTop) * w;
-        const int areaNear = (h - yNearTop) * w;
-        if (areaFar <= 0 || areaNear <= 0) return false;
+        // --- Baseline: EMA of "normal" road area, updated only on non-spikes ---
+        if (areaEma_ < 0.0f) {
+            areaEma_ = (float)maskArea;
+            gate_streak_ = 0;
+            return false;
+        }
 
-        const float covFar  = (float)cv::countNonZero(mask.rowRange(yFarTop, yFarBot)) / areaFar;
-        const float covNear = (float)cv::countNonZero(mask.rowRange(yNearTop, h))       / areaNear;
+        // Junction signature: mask area 25-40% larger than the straight-road baseline.
+        // On a straight at constant pose, area is stable; at a junction the side road
+        // adds visible pixels and the total jumps.
+        const float spikeRatio = (float)maskArea / areaEma_;
+        const bool areaSpike = (spikeRatio >= cfg_.turn_area_ratio) &&
+                                (areaEma_ >= (float)(w * h) * 0.04f);   // baseline must be meaningful
 
-        // Gate condition:
-        //   (a) the junction band has more road than the near band (relative widening)
-        //   (b) the near band is dominated by road (car is actually on the lane;
-        //       protects against firing during a mask dropout)
-        const float opening = covFar - covNear;
-        return (opening >= cfg_.turn_opening_margin) && (covNear >= 0.55f);
+        // Only update the baseline when NOT spiking, so it stays locked to "straight" level.
+        if (!areaSpike) {
+            areaEma_ = 0.95f * areaEma_ + 0.05f * (float)maskArea;
+        }
+
+        // Persistence: spike must hold for K consecutive control ticks.
+        if (areaSpike) ++gate_streak_;
+        else           gate_streak_ = 0;
+
+        return gate_streak_ >= cfg_.turn_gate_persist;
     }
 
     int DecideForceDir(int commit, const perception::TopoResult& topo) const {
@@ -236,6 +253,8 @@ private:
         forceDir_ = 0;
         forceHeading0Valid_ = false;
         forcePhase_ = "-";
+        gate_streak_ = 0;         // add
+        // do NOT reset areaEma_ — baseline should survive across turns
     }
 
     class TopoResetDetector {
