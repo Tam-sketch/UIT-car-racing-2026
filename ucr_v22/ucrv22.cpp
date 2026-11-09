@@ -1,7 +1,7 @@
 #include "config/RobotConfig.h"
 #include "perception/RoadSegmenter.h"
 #include "perception/SignDetector.h"
-#include "control/LaneFollowerV22.h" // Sử dụng V22
+#include "control/LaneFollowerV22.h"
 
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -21,9 +21,6 @@
 volatile std::sig_atomic_t g_running = 1;
 void SignalHandler(int) { g_running = 0; }
 
-// ============================================================
-// MULTITHREADING CHO SIGN DETECTOR
-// ============================================================
 struct SignWorker {
     ucr::perception::SignDetector& detector;
     std::mutex mtx;
@@ -36,23 +33,19 @@ struct SignWorker {
 
     SignWorker(ucr::perception::SignDetector& d) : detector(d) {}
     void Start() { thread = std::thread(&SignWorker::Run, this); }
-    
     void Stop() {
         { std::lock_guard<std::mutex> lock(mtx); stop_thread = true; }
         cv.notify_all();
         if (thread.joinable()) thread.join();
     }
-
     void PushFrame(const cv::Mat& frame) {
         { std::lock_guard<std::mutex> lock(mtx); latest_frame = frame; new_frame_ready = true; }
         cv.notify_one();
     }
-
     std::vector<ucr::perception::Detection> GetLatest() {
         std::lock_guard<std::mutex> lock(mtx);
         return current_detections;
     }
-
 private:
     void Run() {
         while (true) {
@@ -82,17 +75,18 @@ std::string GetSignName(int id) {
     }
 }
 
-// Phương trình hồi quy góc lái
+// ĐÃ SỬA: Quay lại dùng Gain 2.2 (V20) thay vì công thức hồi quy gây gãy Servo
 int16_t ApplySteeringCalibration(float pid_angle) {
-    float cmd = 0.0f;
-    if (pid_angle < 0.0f) cmd = (pid_angle + 6.2f) / 0.96f;
-    else if (pid_angle > 0.0f) cmd = (pid_angle - 2.5f) / 0.71f;
+    if (std::isnan(pid_angle) || std::isinf(pid_angle)) pid_angle = 0.0f;
+    
+    float cmd = pid_angle * 2.2f; // Gain 2.2
+    
     if (ucr::config::INVERT_STEER) cmd = -cmd;
     return static_cast<int16_t>(std::clamp(cmd, -ucr::config::MAX_STEER_DEG, ucr::config::MAX_STEER_DEG));
 }
 
 int main() {
-    std::cout << "=== UCR2026 V22 (V20 Core + V21 Logic) ===\n";
+    std::cout << "=== UCR2026 V22 (No Watchdog) ===\n";
     std::signal(SIGINT, SignalHandler);
 
     Camera camera;
@@ -114,34 +108,21 @@ int main() {
     sign_worker.Start();
 
     v22::Config lane_cfg;
-    lane_cfg.post_pid_gain = 1.0f; // Bắt buộc tắt gain để dùng hàm hồi quy
+    lane_cfg.post_pid_gain = 1.0f; // Để 1.0 vì ta đã nhân 2.2 ở hàm ApplySteeringCalibration
     lane_cfg.max_speed = ucr::config::MAX_SPEED_CMS;
     lane_cfg.min_speed = ucr::config::MIN_SPEED_CMS;
-    lane_cfg.corner_radius = 35;   // Tăng độ rộng cua
+    lane_cfg.corner_radius = 35;   
     v22::LaneFollower lane_follower(lane_cfg);
 
     int frame_idx = 0;
     float current_speed = 0.0f;
     auto next_tick = std::chrono::steady_clock::now();
-    auto last_loop_time = std::chrono::steady_clock::now();
     auto last_imu_time = std::chrono::steady_clock::now();
 
     std::cout << "[Main] Bắt đầu vòng lặp 10 Hz...\n";
 
     while (g_running) {
         auto now = std::chrono::steady_clock::now();
-        
-        double loop_dt = std::chrono::duration<double>(now - last_loop_time).count();
-        last_loop_time = now;
-        if (loop_dt > 0.3) {
-            std::cerr << "\n[WATCHDOG] Tre! loop_dt = " << loop_dt << "s. EMERGENCY STOP!\n";
-            motor.SetSpeedCms(0);
-            servo.SetAngle(0);
-            current_speed = 0;
-            next_tick = std::chrono::steady_clock::now();
-            continue; 
-        }
-
         if (now < next_tick) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
         next_tick += std::chrono::milliseconds(ucr::config::CONTROL_PERIOD_MS);
         frame_idx++;
@@ -174,41 +155,37 @@ int main() {
                 sign_state.active = true;
                 sign_state.class_id = d.class_id;
                 
-                if (d.class_id == 6 || d.class_id == 0 || d.class_id == 2) sign_state.side = -1; // Left
-                else if (d.class_id == 7 || d.class_id == 1) sign_state.side = 1;                 // Right
-                else sign_state.side = 2; // Both
+                if (d.class_id == 6 || d.class_id == 0 || d.class_id == 2) sign_state.side = -1;
+                else if (d.class_id == 7 || d.class_id == 1) sign_state.side = 1;
+                else sign_state.side = 2;
             }
         }
 
         auto out = lane_follower.step(mask, sign_state);
 
+        // --- UI ---
         cv::Mat ui_frame = frame.clone();
-        
         if (!out.final_path.empty() && out.proc_width > 0) {
             float sx = static_cast<float>(frame.cols) / out.proc_width;
             float sy = static_cast<float>(frame.rows) / out.proc_height;
-            
             for (size_t i = 0; i < out.final_path.size() - 1; ++i) {
                 cv::Point p1(out.final_path[i].x * sx, out.final_path[i].y * sy);
                 cv::Point p2(out.final_path[i+1].x * sx, out.final_path[i+1].y * sy);
-                cv::line(ui_frame, p1, p2, cv::Scalar(0, 255, 0), 3);
+                cv::line(ui_frame, p1, p2, cv::Scalar(0, 255, 0), 3); // Đường xanh lá
             }
         }
 
-        int y_text = 30;
         for (const auto& det : signs) {
             std::string name = GetSignName(det.class_id);
             cv::rectangle(ui_frame, det.bbox, cv::Scalar(0, 255, 255), 2);
             cv::putText(ui_frame, name, cv::Point(det.bbox.x, det.bbox.y - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
         }
 
-        cv::putText(ui_frame, "State: " + out.state_str, cv::Point(10, y_text), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 255), 2);
-        cv::putText(ui_frame, "Spd: " + std::to_string(current_speed), cv::Point(10, y_text + 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
-        cv::putText(ui_frame, "Hdg: " + std::to_string(heading), cv::Point(10, y_text + 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+        cv::putText(ui_frame, "State: " + out.state_str, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 255), 2);
+        cv::putText(ui_frame, "near_e: " + std::to_string((int)out.near_e) + " | far_e: " + std::to_string((int)out.far_e), cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
         
         cv::imshow("Camera", ui_frame);
         if (!mask.empty()) cv::imshow("Mask", mask);
-        
         if (cv::waitKey(1) == 'q') g_running = 0;
 
         float target_speed = out.speed;
@@ -219,7 +196,11 @@ int main() {
         servo.SetAngle(servo_angle);
         motor.SetSpeedCms(current_speed);
         
-        std::cout << "\r[" << frame_idx << "] " << out.state_str << " | Spd=" << current_speed << " PID=" << out.angle << " Srv=" << servo_angle << "   " << std::flush;
+        // In log ra terminal để debug
+        std::cout << "\r[" << frame_idx << "] " << out.state_str 
+                  << " | nE=" << (int)out.near_e << " fE=" << (int)out.far_e 
+                  << " | PID=" << out.angle << " Srv=" << servo_angle 
+                  << " | Spd=" << current_speed << "   " << std::flush;
     }
 
     sign_worker.Stop();
