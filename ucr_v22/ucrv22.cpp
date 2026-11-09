@@ -75,18 +75,16 @@ std::string GetSignName(int id) {
     }
 }
 
-// ĐÃ SỬA: Quay lại dùng Gain 2.2 (V20) thay vì công thức hồi quy gây gãy Servo
+// Đã sửa: Trả lại Gain 2.2 thay vì công thức hồi quy
 int16_t ApplySteeringCalibration(float pid_angle) {
     if (std::isnan(pid_angle) || std::isinf(pid_angle)) pid_angle = 0.0f;
-    
-    float cmd = pid_angle * 2.2f; // Gain 2.2
-    
+    float cmd = pid_angle * 2.2f; 
     if (ucr::config::INVERT_STEER) cmd = -cmd;
     return static_cast<int16_t>(std::clamp(cmd, -ucr::config::MAX_STEER_DEG, ucr::config::MAX_STEER_DEG));
 }
 
 int main() {
-    std::cout << "=== UCR2026 V22 (No Watchdog) ===\n";
+    std::cout << "=== UCR2026 V22 (No Watchdog + Overlay UI) ===\n";
     std::signal(SIGINT, SignalHandler);
 
     Camera camera;
@@ -108,7 +106,7 @@ int main() {
     sign_worker.Start();
 
     v22::Config lane_cfg;
-    lane_cfg.post_pid_gain = 1.0f; // Để 1.0 vì ta đã nhân 2.2 ở hàm ApplySteeringCalibration
+    lane_cfg.post_pid_gain = 1.0f; 
     lane_cfg.max_speed = ucr::config::MAX_SPEED_CMS;
     lane_cfg.min_speed = ucr::config::MIN_SPEED_CMS;
     lane_cfg.corner_radius = 35;   
@@ -163,31 +161,53 @@ int main() {
 
         auto out = lane_follower.step(mask, sign_state);
 
-        // --- UI ---
+        // ============================================================
+        // UI MASK OVERLAY
+        // ============================================================
         cv::Mat ui_frame = frame.clone();
+        
+        if (!mask.empty()) {
+            // Resize mask cho vừa với kích thước ảnh Camera
+            cv::Mat mask_resized;
+            cv::resize(mask, mask_resized, frame.size(), 0, 0, cv::INTER_NEAREST);
+            
+            // Tạo lớp màu xanh lá cây cho vùng đường
+            cv::Mat color_mask = cv::Mat::zeros(frame.size(), CV_8UC3);
+            color_mask.setTo(cv::Scalar(0, 255, 0), mask_resized > 0);
+            
+            // Chồng lớp màu lên ảnh gốc với độ mờ 40% (1.0 - 0.4 = 0.6)
+            cv::addWeighted(ui_frame, 0.6, color_mask, 0.4, 0, ui_frame);
+        }
+
+        // Vẽ quỹ đạo đường đi (Bezier / Centerline)
         if (!out.final_path.empty() && out.proc_width > 0) {
             float sx = static_cast<float>(frame.cols) / out.proc_width;
             float sy = static_cast<float>(frame.rows) / out.proc_height;
             for (size_t i = 0; i < out.final_path.size() - 1; ++i) {
                 cv::Point p1(out.final_path[i].x * sx, out.final_path[i].y * sy);
                 cv::Point p2(out.final_path[i+1].x * sx, out.final_path[i+1].y * sy);
-                cv::line(ui_frame, p1, p2, cv::Scalar(0, 255, 0), 3); // Đường xanh lá
+                cv::line(ui_frame, p1, p2, cv::Scalar(0, 0, 255), 3); // Đường màu đỏ
             }
         }
 
+        // Vẽ bounding box biển báo
         for (const auto& det : signs) {
             std::string name = GetSignName(det.class_id);
             cv::rectangle(ui_frame, det.bbox, cv::Scalar(0, 255, 255), 2);
             cv::putText(ui_frame, name, cv::Point(det.bbox.x, det.bbox.y - 5), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
         }
 
+        // In text thông số lên UI
         cv::putText(ui_frame, "State: " + out.state_str, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 255), 2);
         cv::putText(ui_frame, "near_e: " + std::to_string((int)out.near_e) + " | far_e: " + std::to_string((int)out.far_e), cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
         
-        cv::imshow("Camera", ui_frame);
-        if (!mask.empty()) cv::imshow("Mask", mask);
+        // Hiển thị duy nhất 1 cửa sổ Camera có overlay
+        cv::imshow("Camera & Mask Overlay", ui_frame);
+        
         if (cv::waitKey(1) == 'q') g_running = 0;
+        // ============================================================
 
+        // Gửi lệnh xuống Motor/Servo
         float target_speed = out.speed;
         float max_delta = ucr::config::MAX_ACCEL_CMS2 * (ucr::config::CONTROL_PERIOD_MS / 1000.0f);
         current_speed = (target_speed > current_speed) ? std::min(target_speed, current_speed + max_delta) : target_speed;
@@ -196,7 +216,7 @@ int main() {
         servo.SetAngle(servo_angle);
         motor.SetSpeedCms(current_speed);
         
-        // In log ra terminal để debug
+        // Debug log
         std::cout << "\r[" << frame_idx << "] " << out.state_str 
                   << " | nE=" << (int)out.near_e << " fE=" << (int)out.far_e 
                   << " | PID=" << out.angle << " Srv=" << servo_angle 
