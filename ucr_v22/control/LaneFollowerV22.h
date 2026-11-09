@@ -34,14 +34,12 @@ struct TurnMemory {
 };
 
 struct Config {
-    // V20 Mask & Speed
     int  mask_width   = 320;    
     bool keep_largest = true;   
-    double post_pid_gain = 1.0; // Bắt buộc = 1.0 để dùng hàm hồi quy bên ngoài
+    double post_pid_gain = 1.0; 
     double max_speed = 15.0;    
     double min_speed = 5.0;     
 
-    // V20 PID
     double asym_strength = 0.20, asym_threshold = 8.0, asym_ema = 0.7;
     double asym_cap = 12.0, asym_decay = 0.80;
     double far_delta_clip = 25.0, d_far_clip = 6.0, d_far_ema_alpha = 0.4, lead_rate_gain = 0.8;
@@ -63,13 +61,12 @@ struct Config {
     double coverage_threshold = 0.05;
     double curve_scale = 150.0;
 
-    // V21 Opening Logic
     int    open_thresh = 15;
     int    min_height  = 10;
     int    smooth_win  = 5;
     int    base_win    = 50;
     int    pull_back   = 3;
-    int    corner_radius = 35; // TĂNG LÊN 35 ĐỂ CUA RỘNG HƠN
+    int    corner_radius = 35; // Đã tăng lên 35
     int    min_turn_dist = 4;
     int    extend_len    = 80;
 };
@@ -99,7 +96,8 @@ namespace detail {
         } else out = in.clone();
 
         cv::Mat binary = (out > 0);
-        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(35, 5));
+        // Đã sửa Morphology từ 35,5 xuống 15,5 để không gộp lề đường
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(15, 5));
         cv::morphologyEx(binary, out, cv::MORPH_CLOSE, kernel);
 
         if (!c.keep_largest) return out;
