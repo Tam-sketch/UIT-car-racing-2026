@@ -9,34 +9,17 @@
 #include <utility>
 #include <vector>
 #include <string>
+#include <iostream>
 
 namespace v22 {
 
-struct SignState {
-    bool active = false;
-    int side = 0;      // -1: Left, 1: Right, 2: Both, 0: None
-    int class_id = -1; 
-};
-
-struct Point { int x, y; };
-
-struct Opening {
-    int side;
-    int y_start, y_end, y_mid;
-    int x_extreme, x_baseline;
-};
-
-struct TurnMemory {
-    bool active = false;
-    int side = 0;
-    int turn_width = 0;
-    int last_y_mid = 9999;
-};
-
+// ============================================================
+// CONFIG (Kế thừa V20)
+// ============================================================
 struct Config {
     int  mask_width   = 320;    
     bool keep_largest = true;   
-    double post_pid_gain = 1.0; 
+    double post_pid_gain = 1.0; // Set = 1.0 nếu đã nhân gain ở ngoài
     double max_speed = 15.0;    
     double min_speed = 5.0;     
 
@@ -60,15 +43,6 @@ struct Config {
     int    min_rows = 5;        
     double coverage_threshold = 0.05;
     double curve_scale = 150.0;
-
-    int    open_thresh = 15;
-    int    min_height  = 10;
-    int    smooth_win  = 5;
-    int    base_win    = 50;
-    int    pull_back   = 3;
-    int    corner_radius = 35; // Đã tăng lên 35
-    int    min_turn_dist = 4;
-    int    extend_len    = 80;
 };
 
 namespace detail {
@@ -96,7 +70,6 @@ namespace detail {
         } else out = in.clone();
 
         cv::Mat binary = (out > 0);
-        // Đã sửa Morphology từ 35,5 xuống 15,5 để không gộp lề đường
         cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(15, 5));
         cv::morphologyEx(binary, out, cv::MORPH_CLOSE, kernel);
 
@@ -145,39 +118,6 @@ namespace detail {
         }
         return out;
     }
-
-    inline std::vector<float> movingAvg(const std::vector<float>& arr, int win) {
-        int h = arr.size(); std::vector<float> out(h, -1.0f); int half = win / 2;
-        for (int i = 0; i < h; ++i) {
-            float sum = 0; int count = 0;
-            for (int j = std::max(0, i - half); j <= std::min(h - 1, i + half); ++j) {
-                if (arr[j] >= 0) { sum += arr[j]; count++; }
-            }
-            if (count > 0) out[i] = sum / count;
-        }
-        return out;
-    }
-    inline std::vector<float> rollingMedian(const std::vector<float>& arr, int win) {
-        int h = arr.size(); std::vector<float> out(h, -1.0f); int half = win / 2;
-        for (int i = 0; i < h; ++i) {
-            std::vector<float> vals;
-            for (int j = std::max(0, i - half); j <= std::min(h - 1, i + half); ++j) {
-                if (arr[j] >= 0) vals.push_back(arr[j]);
-            }
-            if (!vals.empty()) { std::sort(vals.begin(), vals.end()); out[i] = vals[vals.size() / 2]; }
-        }
-        return out;
-    }
-    inline std::vector<Point> quadraticBezier(Point P0, Point P1, Point P2, int n = 10) {
-        std::vector<Point> pts;
-        for (int i = 0; i <= n; ++i) {
-            float t = (float)i / n;
-            float x = (1-t)*(1-t)*P0.x + 2*t*(1-t)*P1.x + t*t*P2.x;
-            float y = (1-t)*(1-t)*P0.y + 2*t*(1-t)*P1.y + t*t*P2.y;
-            pts.push_back({(int)x, (int)y});
-        }
-        return pts;
-    }
     inline double planSpeed(double curveSmooth, double maxSp, double minSp, double scale) {
         double ratio = std::min(std::abs(curveSmooth) / scale, 1.0);
         return maxSp - (maxSp - minSp) * ratio;
@@ -191,6 +131,9 @@ namespace detail {
     }
 } // namespace detail
 
+// ============================================================
+// V20 CORE: OcclusionGate, Authority, PID
+// ============================================================
 class OcclusionGate {
 public:
     explicit OcclusionGate(const Config& c = Config()) : c_(c) { reset(); }
@@ -289,6 +232,72 @@ private:
     Config c_; AuthorityManager auth_; double integral_, prevErr_, filtD_, prevOut_; bool first_, emgAuth_, forced_; int emgStreak_;
 };
 
+// ============================================================
+// TURN PLANNER (Ghi đè Centerline)
+// ============================================================
+struct TurnMemory {
+    bool active = false;
+    std::string side = "";
+    int turn_width = 60;
+    int last_y_mid = 9999; // Điểm bắt đầu bẻ lái
+};
+
+class TurnPlanner {
+public:
+    TurnMemory mem;
+   
+    void reset() { mem = TurnMemory(); }
+
+    // Gọi từ bên ngoài khi YOLO thấy biển báo
+    void setSign(const std::string& sign_name, int trigger_y = 150) {
+        if (sign_name == "turn_left" || sign_name == "no_right" || sign_name == "construction_ahead") {
+            mem.active = true;
+            mem.side = "left";
+            mem.turn_width = 60; 
+            mem.last_y_mid = trigger_y; // <-- Gán điểm bắt đầu bẻ lái
+        } else if (sign_name == "turn_right" || sign_name == "no_left") {
+            mem.active = true;
+            mem.side = "right";
+            mem.turn_width = 60;
+            mem.last_y_mid = trigger_y; // <-- Gán điểm bắt đầu bẻ lái
+        }
+    }
+
+    void modifyCenterline(std::vector<std::pair<int, int>>& row_centers, int w) {
+        if (row_centers.empty() || !mem.active) return;
+
+        int idx_turn = -1;
+        int x_c_turn = w / 2;
+        
+        // Tìm điểm bắt đầu bẻ lái (điểm có y nhỏ hơn last_y_mid)
+        for (int i = 0; i < (int)row_centers.size(); i++) {
+            if (row_centers[i].second <= mem.last_y_mid) {
+                idx_turn = i;
+                x_c_turn = row_centers[i].first;
+                break;
+            }
+        }
+
+        if (idx_turn >= 0) {
+            int sign = (mem.side == "left") ? -1 : 1;
+            int target_x = x_c_turn + sign * mem.turn_width;
+
+            // Sửa lỗi Bezier: Điểm P1 nằm giữa P0 và P2 để tạo độ cong mượt
+            int mid_x = (x_c_turn + target_x) / 2;
+
+            for (int i = idx_turn; i < (int)row_centers.size(); i++) {
+                float t = (float)(i - idx_turn) / (row_centers.size() - idx_turn);
+                // Bezier bậc 2: P0=(x_c_turn), P1=(mid_x), P2=(target_x)
+                float x_new = (1-t)*(1-t)*x_c_turn + 2*t*(1-t)*mid_x + t*t*target_x;
+                row_centers[i].first = (int)std::clamp(x_new, 0.0f, (float)w - 1);
+            }
+        }
+    }
+};
+
+// ============================================================
+// LANE FOLLOWER V22 (V20 Core + TurnPlanner)
+// ============================================================
 class LaneFollower {
 public:
     struct Output {
@@ -296,7 +305,7 @@ public:
         bool valid = false, occl = false, forced_emer = false, emer_auth = false, losing = false;
         double near_e = 0, far_e = 0, eff_error = 0, coverage = 0;
         double angle_pre_gain = 0, kept_frac = 1.0; 
-        std::vector<Point> final_path;
+        std::vector<std::pair<int, int>> centerline_pts;
         int proc_width = 0, proc_height = 0;
         std::string state_str = "CENTERLINE";
     };
@@ -310,11 +319,16 @@ public:
         pid_.reset(); gate_.reset();
         lastAngle_ = 0; curveSmooth_ = 0; prevValid_ = false;
         prevFarE_ = 0; dFarFilt_ = 0; asymSmooth_ = 0; emerHold_ = 0;
-        turn_memory_ = TurnMemory();
+        turn_planner_.reset();
     }
     void softReset() { pid_.softReset(); }
 
-    Output step(const cv::Mat& rawMask, const SignState& sign) {
+    // Cổng giao tiếp với AI
+    void setSign(const std::string& sign_name, int trigger_y = 150) {
+        turn_planner_.setSign(sign_name, trigger_y);
+    }
+
+    Output step(const cv::Mat& rawMask) {
         Output o;
         double kept_frac = 1.0;
         cv::Mat cleanMask = detail::preprocessMask(rawMask, c_, kept_frac);
@@ -324,109 +338,95 @@ public:
 
         std::vector<std::pair<int, int>> row_centers;
         auto cl = extractCenterline(cleanMask, curveSmooth_, c_, row_centers);
-        curveSmooth_ = cl.curve_smooth;
+        
+        // === GỌI TURN PLANNER ĐỂ BẺ CONG CENTERLINE ===
+        turn_planner_.modifyCenterline(row_centers, cleanMask.cols);
+        
+        // Tính lại near/far sau khi bị ghi đè
+        if (cl.valid && !row_centers.empty()) {
+            std::vector<int> ys;
+            for (auto& p : row_centers) ys.push_back(p.second);
+            std::sort(ys.begin(), ys.end());
+            int yBot = detail::percentileInt(ys, 0.98);
+            int yTop = detail::percentileInt(ys, 0.02);
+            int span = std::max(yBot - yTop, 1);
+            int ySplitNear = yBot - (int)(span * 0.45);
+            int ySplitFar  = yTop + (int)(span * 0.35);
 
-        double farDelta = std::clamp(cl.far_error - cl.near_error, -c_.far_delta_clip, c_.far_delta_clip);
-        double dFarRaw = (cl.valid && prevValid_) ? (cl.far_error - prevFarE_) : 0.0;
+            std::vector<int> nearC, farC;
+            for (auto& p : row_centers) {
+                if (p.second >= ySplitNear) nearC.push_back(p.first);
+                if (p.second <= ySplitFar)  farC.push_back(p.first);
+            }
+            int nearCx = nearC.empty() ? -1 : (int)detail::medianInts(nearC);
+            int farCx  = farC.empty()  ? -1 : (int)detail::medianInts(farC);
+            
+            cl.near_error = (nearCx != -1) ? (nearCx - cleanMask.cols / 2) : 0;
+            cl.far_error  = (farCx  != -1) ? (farCx  - cleanMask.cols / 2) : 0;
+            int topCx = farC.empty()  ? 0 : (int)detail::medianInts(farC);
+            int botCx = nearC.empty() ? 0 : (int)detail::medianInts(nearC);
+            cl.curve_error = topCx - botCx;
+        }
+
+        curveSmooth_ = 0.90 * curveSmooth_ + 0.10 * cl.curve_error;
+        const double nearE = cl.near_error, farE = cl.far_error;
+        const bool valid = cl.valid;
+
+        double farDelta = std::clamp(farE - nearE, -c_.far_delta_clip, c_.far_delta_clip);
+        double dFarRaw = (valid && prevValid_) ? (farE - prevFarE_) : 0.0;
         double dFar = std::clamp(dFarRaw, -c_.d_far_clip, c_.d_far_clip);
         dFarFilt_ = c_.d_far_ema_alpha * dFar + (1.0 - c_.d_far_ema_alpha) * dFarFilt_;
         double lead = 0.5 * farDelta + c_.lead_rate_gain * dFarFilt_;
-        double blended = cl.near_error + lead;
-        prevFarE_ = cl.far_error;
+        double blended = nearE + lead;
+        prevFarE_ = farE;
 
-        bool occl = gate_.step(blended, cl.coverage, row_centers, cl.valid, cl.far_error, cl.near_error);
+        bool occl = gate_.step(blended, cl.coverage, row_centers, valid, farE, nearE);
         if (occl) emerHold_ = c_.emg_hold_after_occl;
         else if (emerHold_ > 0) emerHold_--;
 
-        if (!occl && cl.valid) {
+        if (!occl && valid) {
             double asymRaw = detectAsymmetry(cleanMask);
             asymSmooth_ = c_.asym_ema * asymSmooth_ + (1.0 - c_.asym_ema) * asymRaw;
-            if (std::abs(cl.near_error) < 5.0 && std::abs(asymSmooth_) < c_.asym_cap) asymSmooth_ *= c_.asym_decay;
+            if (std::abs(nearE) < 5.0 && std::abs(asymSmooth_) < c_.asym_cap) asymSmooth_ *= c_.asym_decay;
             asymSmooth_ = std::clamp(asymSmooth_, -c_.asym_cap, c_.asym_cap);
         }
         double asymApplied = (std::abs(asymSmooth_) < c_.asym_threshold) ? 0.0 : c_.asym_strength * asymSmooth_;
-        double eff_error_v20 = blended + asymApplied;
-
-        std::vector<Point> centerline_pts;
-        for (auto& p : row_centers) centerline_pts.push_back({p.first, p.second});
-
-        auto openings = detectOpenings(cleanMask, sign);
-        updateTurnMemory(sign, openings);
-
-        std::vector<Point> final_path = centerline_pts;
-        o.state_str = "CENTERLINE";
-        bool should_turn = false;
-        Opening target_opening;
-
-        bool has_valid_opening = false;
-        if (!openings.empty()) {
-            target_opening = openings[0];
-            for (const auto& op : openings) if (op.y_mid > target_opening.y_mid) target_opening = op;
-            has_valid_opening = true;
-        }
-
-        if (sign.active) {
-            if (has_valid_opening) {
-                if (sign.class_id == 6 || sign.class_id == 7 || sign.class_id == 0) should_turn = true;
-                else if (sign.class_id == 1 || sign.class_id == 2) {
-                    if (!centerline_pts.empty() && centerline_pts.back().y > target_opening.y_mid - 10) should_turn = true;
-                }
-            } else if (turn_memory_.active) {
-                Point top_pt = centerline_pts.empty() ? Point{cleanMask.cols/2, cleanMask.rows/2} : centerline_pts.back();
-                if (top_pt.y > turn_memory_.last_y_mid + 50) {
-                    target_opening.side = turn_memory_.side;
-                    target_opening.y_mid = top_pt.y;
-                    target_opening.x_baseline = top_pt.x;
-                    target_opening.x_extreme = top_pt.x + (turn_memory_.side == -1 ? -turn_memory_.turn_width : turn_memory_.turn_width);
-                    should_turn = true;
-                    o.state_str = "GHOST TURN " + std::string(turn_memory_.side == -1 ? "LEFT" : "RIGHT");
-                }
-            }
-        }
-
-        if (should_turn) {
-            final_path = buildPathWithTurn(centerline_pts, cleanMask, target_opening);
-            if (o.state_str == "CENTERLINE") {
-                o.state_str = "TURN " + std::string(target_opening.side == -1 ? "LEFT" : "RIGHT");
-            }
-        }
-
-        double final_error = eff_error_v20;
-        
-        if (should_turn && final_path.size() > 5) {
-            int look_idx = final_path.size() * 2 / 3; 
-            final_error = final_path[look_idx].x - (cleanMask.cols / 2.0);
-            speed_ = c_.min_speed + 3.0; 
-        } else {
-            double target_speed = detail::planSpeed(curveSmooth_, c_.max_speed, c_.min_speed, c_.curve_scale);
-            double errMult = detail::errorSpeedFactor(eff_error_v20);
-            double authSpeed = pid_.losing() ? 0.6 : 1.0;
-            target_speed = std::max(target_speed * errMult * authSpeed, 0.0);
-            speed_ = 0.7 * speed_ + 0.3 * target_speed;
-        }
+        double eff = blended + asymApplied;
 
         bool forcedEmer = emerHold_ > 0;
         pid_.setForcedEmergency(forcedEmer);
 
         double angle_pre_gain = 0.0;
-        if (cl.valid) {
+        double angle = 0.0;
+        if (valid) {
             if (!prevValid_) { pid_.softReset(); gate_.reset(); }
-            angle_pre_gain = pid_.step(final_error); 
-            lastAngle_ = angle_pre_gain * c_.post_pid_gain;
+            angle_pre_gain = pid_.step(eff);
+            angle = angle_pre_gain * c_.post_pid_gain;
+            
+            double target = detail::planSpeed(curveSmooth_, c_.max_speed, c_.min_speed, c_.curve_scale);
+            double errMult = detail::errorSpeedFactor(eff);
+            double authSpeed = pid_.losing() ? 0.6 : 1.0;
+            double anomSpeed = (std::abs(asymSmooth_) > 15) ? 0.5 : 1.0;
+            target = std::max(target * errMult * std::min(authSpeed, anomSpeed), 0.0);
+            speed_ = 0.7 * speed_ + 0.3 * target;
+            lastAngle_ = angle;
+
+            if (turn_planner_.mem.active) o.state_str = "TURNING " + turn_planner_.mem.side;
         } else {
-            angle_pre_gain = (c_.post_pid_gain > 0) ? lastAngle_ / c_.post_pid_gain : lastAngle_;
+            angle = lastAngle_;
+            angle_pre_gain = (c_.post_pid_gain > 0.0) ? lastAngle_ / c_.post_pid_gain : lastAngle_;
             speed_ = 0.85 * speed_;
         }
-        prevValid_ = cl.valid;
+        prevValid_ = valid;
 
-        o.angle = lastAngle_;
+        o.angle = angle;
         o.angle_pre_gain = angle_pre_gain;
         o.kept_frac = kept_frac;
         o.speed = speed_;
-        o.valid = cl.valid; o.occl = occl; o.forced_emer = forcedEmer;
+        o.valid = valid; o.occl = occl; o.forced_emer = forcedEmer;
         o.emer_auth = pid_.emergencyAuthority(); o.losing = pid_.losing();
-        o.near_e = cl.near_error; o.far_e = cl.far_error; o.eff_error = final_error; o.coverage = cl.coverage;
-        o.final_path = final_path;
+        o.near_e = nearE; o.far_e = farE; o.eff_error = eff; o.coverage = cl.coverage;
+        o.centerline_pts = row_centers;
 
         return o;
     }
@@ -435,7 +435,7 @@ private:
     Config c_;
     SteeringPID pid_;
     OcclusionGate gate_;
-    TurnMemory turn_memory_;
+    TurnPlanner turn_planner_;
     double speed_, lastAngle_, curveSmooth_, prevFarE_, dFarFilt_, asymSmooth_;
     bool prevValid_;
     int emerHold_;
@@ -520,95 +520,6 @@ private:
         double total = lw + rw;
         if (total < 40) return 0.0;
         return (rw - lw) / total * maxBias;
-    }
-
-    std::vector<Opening> detectOpenings(const cv::Mat& mask, const SignState& sign) {
-        std::vector<Opening> openings;
-        if (!sign.active || sign.side == 0) return openings;
-        int h = mask.rows, w = mask.cols;
-        std::vector<float> xl(h, -1), xr(h, -1);
-        for (int y = 0; y < h; ++y) {
-            const uchar* row = mask.ptr<uchar>(y);
-            int first = -1, last = -1;
-            for (int x = 0; x < w; ++x) if (row[x]) { if (first < 0) first = x; last = x; }
-            if (first >= 0) { xl[y] = first; xr[y] = last; }
-        }
-        auto xl_s = detail::movingAvg(xl, c_.smooth_win);
-        auto xr_s = detail::movingAvg(xr, c_.smooth_win);
-        auto bl = detail::rollingMedian(xl_s, c_.base_win);
-        auto br = detail::rollingMedian(xr_s, c_.base_win);
-        auto findPeaks = [&](const std::vector<float>& dev, const std::vector<float>& edges, const std::vector<float>& base, int side) {
-            bool in_open = false; int y_start = 0;
-            for (int y = 0; y < h; ++y) {
-                if (dev[y] < 0) {
-                    if (in_open && y - y_start >= c_.min_height) {
-                        int y_mid = (y_start + y - 1) / 2;
-                        openings.push_back({side, y_start, y - 1, y_mid, (int)edges[y_mid], (int)base[y_mid]});
-                    }
-                    in_open = false; continue;
-                }
-                if (dev[y] > c_.open_thresh && !in_open) { in_open = true; y_start = y; }
-                else if (dev[y] <= c_.open_thresh && in_open) {
-                    if (y - y_start >= c_.min_height) {
-                        int y_mid = (y_start + y - 1) / 2;
-                        openings.push_back({side, y_start, y - 1, y_mid, (int)edges[y_mid], (int)base[y_mid]});
-                    }
-                    in_open = false;
-                }
-            }
-        };
-        std::vector<float> dev_l(h, -1), dev_r(h, -1);
-        for (int y = 0; y < h; ++y) {
-            if (xl_s[y] >= 0 && bl[y] >= 0) dev_l[y] = bl[y] - xl_s[y];
-            if (xr_s[y] >= 0 && br[y] >= 0) dev_r[y] = xr_s[y] - br[y];
-        }
-        if (sign.side == -1 || sign.side == 2) findPeaks(dev_l, xl_s, bl, -1);
-        if (sign.side == 1  || sign.side == 2) findPeaks(dev_r, xr_s, br, 1);
-        return openings;
-    }
-
-    void updateTurnMemory(const SignState& sign, const std::vector<Opening>& openings) {
-        if (!sign.active) { turn_memory_.active = false; return; }
-        if (!openings.empty()) {
-            Opening best = openings[0];
-            for (const auto& op : openings) if (op.y_mid > best.y_mid) best = op;
-            turn_memory_.active = true;
-            turn_memory_.side = best.side;
-            turn_memory_.turn_width = std::abs(best.x_extreme - best.x_baseline);
-            turn_memory_.last_y_mid = std::min(turn_memory_.last_y_mid, best.y_mid);
-        }
-    }
-
-    std::vector<Point> buildPathWithTurn(const std::vector<Point>& centerline, const cv::Mat& mask, const Opening& opening) {
-        if (centerline.empty()) return centerline;
-        int x_turn = (opening.x_extreme + opening.x_baseline) / 2;
-        int y_turn_raw = opening.y_mid;
-        int idx = 0, min_d = 9999;
-        for (size_t i = 0; i < centerline.size(); ++i) {
-            int d = std::abs(centerline[i].y - y_turn_raw);
-            if (d < min_d) { min_d = d; idx = i; }
-        }
-        int x_c = centerline[idx].x, y_c = centerline[idx].y;
-        int dist = std::abs(x_turn - x_c);
-        if (dist < c_.min_turn_dist) return centerline;
-        int sign = (x_turn < x_c) ? -1 : 1;
-        int d_bez = std::min(dist, c_.corner_radius * 2);
-        int A_y = y_c + d_bez, A_idx = idx;
-        for (int i = idx; i >= 0; --i) if (centerline[i].y >= A_y) { A_idx = i; break; }
-        Point A = centerline[A_idx];
-        Point B = {x_c + sign * d_bez, y_c};
-        Point ctrl = {x_c, y_c};
-        auto bez = detail::quadraticBezier(A, ctrl, B, 10);
-        std::vector<Point> path(centerline.begin(), centerline.begin() + A_idx + 1);
-        path.insert(path.end(), bez.begin(), bez.end());
-        int step = 5, x_curr = x_turn, y_curr = y_c;
-        for (int i = 0; i < c_.extend_len / step; ++i) {
-            x_curr += sign * step;
-            if (x_curr < 0 || x_curr >= mask.cols) break;
-            if (mask.at<uchar>(y_curr, x_curr) == 0) break;
-            path.push_back({x_curr, y_curr});
-        }
-        return path;
     }
 };
 
