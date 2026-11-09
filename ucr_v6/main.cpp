@@ -74,6 +74,46 @@ static v21::SignState MakeSignState(int committed) {
 }
 
 // ============================================================
+// TRAFFIC LIGHT: dominant lit color in the bbox ROI
+// ============================================================
+enum class LightColor { NONE, RED, YELLOW, GREEN };
+
+static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect2f& bbox) {
+    using namespace ucr::config::tl;
+
+    const float cx = bbox.x + bbox.width  * 0.5f;
+    const float cy = bbox.y + bbox.height * 0.5f;
+    const float w  = bbox.width  * ROI_EXPAND;
+    const float h  = bbox.height * ROI_EXPAND;
+    const int x1 = std::max(0, static_cast<int>(cx - w * 0.5f));
+    const int y1 = std::max(0, static_cast<int>(cy - h * 0.5f));
+    const int x2 = std::min(bgr.cols, static_cast<int>(cx + w * 0.5f));
+    const int y2 = std::min(bgr.rows, static_cast<int>(cy + h * 0.5f));
+    if (x2 - x1 < 4 || y2 - y1 < 4) return LightColor::NONE;
+
+    cv::Mat hsv;
+    cv::cvtColor(bgr(cv::Rect(x1, y1, x2 - x1, y2 - y1)), hsv, cv::COLOR_BGR2HSV);
+
+    int nRed = 0, nYel = 0, nGrn = 0;
+    for (int y = 0; y < hsv.rows; ++y) {
+        const uchar* p = hsv.ptr<uchar>(y);
+        for (int x = 0; x < hsv.cols; ++x) {
+            const uchar H = p[x*3+0], S = p[x*3+1], V = p[x*3+2];
+            if (S < S_MIN || V < V_MIN) continue;
+            if ((H >= RED_H1_LO && H <= RED_H1_HI) ||
+                (H >= RED_H2_LO && H <= RED_H2_HI))   { ++nRed; }
+            else if (H >= YEL_H_LO && H <= YEL_H_HI)  { ++nYel; }
+            else if (H >= GRN_H_LO && H <= GRN_H_HI)  { ++nGrn; }
+        }
+    }
+
+    if (nRed >= MIN_LIT_PIXELS && nRed > nYel && nRed > nGrn) return LightColor::RED;
+    if (nYel >= MIN_LIT_PIXELS && nYel > nRed && nYel > nGrn) return LightColor::YELLOW;
+    if (nGrn >= MIN_LIT_PIXELS && nGrn > nRed && nGrn > nYel) return LightColor::GREEN;
+    return LightColor::NONE;
+}
+
+// ============================================================
 // MAIN
 // ============================================================
 int main() {
@@ -146,6 +186,8 @@ int main() {
     auto    next_control  = std::chrono::steady_clock::now();
     float   applied_speed = 0.0f;
     uint32_t tickIdx      = 0;
+    int lastPersonSeenTick = -1;
+    int lastRedSeenTick    = -1;
 
     std::cout << "\n=== UCR2026: Auto Run (turns="
               << (signReady ? "yes" : "no") << ") ===\n"
@@ -190,14 +232,28 @@ int main() {
                 using namespace ucr::config::sign_class;
                 std::vector<int> classIds;
                 classIds.reserve(lastDets.size());
+
                 for (auto& d : lastDets) {
                     if (d.confidence < ucr::config::SIGN_CONF_THRESH) continue;
 
-                    // On this map, construction_ahead is physically a turn-left sign.
+                    // Walking person → stop signal (bypasses the voter)
+                    if (d.class_id == WALKING_PERSON) {
+                        lastPersonSeenTick = static_cast<int>(tickIdx);
+                        continue;
+                    }
+
+                    // Traffic light → HSV color check on the bbox ROI (bypasses the voter)
+                    if (d.class_id == TRAFFIC_LIGHT) {
+                        if (ClassifyTrafficLight(frame, d.bbox) == LightColor::RED) {
+                            lastRedSeenTick = static_cast<int>(tickIdx);
+                        }
+                        continue;
+                    }
+
+                    // Construction ahead is physically a turn-left sign on this map
                     int cls = (d.class_id == CONSTRUCTION_AHEAD) ? TURN_LEFT : d.class_id;
 
-                    // Only turn-related signs feed the voter.
-                    // parking / roundabout / traffic_light are ignored here.
+                    // Only turn-related signs feed the voter
                     if (cls == TURN_LEFT || cls == TURN_RIGHT ||
                         cls == NO_LEFT   || cls == NO_RIGHT) {
                         classIds.push_back(cls);
@@ -239,17 +295,35 @@ int main() {
             // -------------------------------------------------
             // 5. Speed (soft-start + lost-mask creep)
             // -------------------------------------------------
+            // --- Speed ---
             float speed = static_cast<float>(out.speed);
             if (!out.valid && out.coverage > 0.02) {
                 speed = ucr::config::MIN_SPEED_CMS;
             }
 
+            // --- Stop overrides (highest priority) ---
+            const bool stopForPerson =
+                (lastPersonSeenTick >= 0) &&
+                (static_cast<int>(tickIdx) - lastPersonSeenTick <=
+                 ucr::config::PERSON_STOP_HANGOVER_TICKS);
+
+            const bool stopForRedLight =
+                (lastRedSeenTick >= 0) &&
+                (static_cast<int>(tickIdx) - lastRedSeenTick <=
+                 ucr::config::RED_LIGHT_HANGOVER_TICKS);
+
+            const bool stopRequested = stopForPerson || stopForRedLight;
+            if (stopRequested) {
+                speed = 0.0f;
+            }
+
+            // --- Soft-start ramp ---
             const float max_delta = ucr::config::MAX_ACCEL_CMS2 *
                                     (ucr::config::CONTROL_PERIOD_MS / 1000.0f);
             if (speed > applied_speed)
                 applied_speed = std::min(speed, applied_speed + max_delta);
             else
-                applied_speed = speed;
+                applied_speed = speed;   // immediate decel to 0 when stopped
 
             motor.SetSpeedCms(applied_speed);
             servo.SetAngle(final_angle);
@@ -269,18 +343,20 @@ int main() {
             // -------------------------------------------------
             static auto lastLog = std::chrono::steady_clock::now();
             if (now - lastLog >= std::chrono::seconds(1)) {
+                const char* stopStr = stopForPerson   ? "STOP:person"
+                                    : stopForRedLight ? "STOP:red"
+                                    :                   "-";
                 std::printf(
-                    "[t=%u] sign=%-11s(%d) state=%-20s "
-                    "valid=%d near=%6.1f far=%6.1f eff=%6.1f cov=%.3f "
+                    "[t=%u] sign=%-11s(%d) state=%-20s %-11s "
+                    "near=%6.1f far=%6.1f eff=%6.1f cov=%.3f "
                     "spd=%.1f pid=%.1f out=%.1f\n",
                     tickIdx,
                     ucr::config::SignClassName(voter.GetCommitted()),
                     voter.GetCommitted(),
                     out.state_str.c_str(),
-                    static_cast<int>(out.valid),
+                    stopStr,
                     out.near_e, out.far_e, out.eff_error, out.coverage,
                     applied_speed, out.angle_pre_gain, out.angle);
-                lastLog = now;
             }
         }
 

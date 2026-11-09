@@ -111,6 +111,7 @@ namespace sign_class {
     inline constexpr int TRAFFIC_LIGHT      = 5;
     inline constexpr int TURN_LEFT          = 6;
     inline constexpr int TURN_RIGHT         = 7;
+    inline constexpr int WALKING_PERSON     = 8;
 }
 inline constexpr const char* SignClassName(int id) {
     switch (id) {
@@ -122,9 +123,32 @@ inline constexpr const char* SignClassName(int id) {
         case 5: return "traffic_light";
         case 6: return "turn_left";
         case 7: return "turn_right";
+        case 8: return "walking_person";
         default: return "-";
     }
 }
+
+// --------------------------------------------------------
+// Traffic light HSV classifier (OpenCV H:0-180, S/V:0-255)
+// --------------------------------------------------------
+namespace tl {
+    inline constexpr int RED_H1_LO = 0;
+    inline constexpr int RED_H1_HI = 10;
+    inline constexpr int RED_H2_LO = 170;
+    inline constexpr int RED_H2_HI = 180;
+    inline constexpr int YEL_H_LO  = 15;
+    inline constexpr int YEL_H_HI  = 35;
+    inline constexpr int GRN_H_LO  = 40;
+    inline constexpr int GRN_H_HI  = 90;
+    inline constexpr int S_MIN     = 100;
+    inline constexpr int V_MIN     = 100;
+    inline constexpr int MIN_LIT_PIXELS = 20;   // winner needs this many bright px
+    inline constexpr float ROI_EXPAND   = 1.20f;
+}
+
+// Stop hangover after last sighting (control ticks, 10 Hz → ticks = decisec)
+inline constexpr int PERSON_STOP_HANGOVER_TICKS = 20;   // ~2 s
+inline constexpr int RED_LIGHT_HANGOVER_TICKS   = 10;   // ~1 s
 
 // --------------------------------------------------------
 // Sign detect + voter timers (units noted per line)
