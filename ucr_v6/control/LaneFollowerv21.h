@@ -1,57 +1,35 @@
 // ============================================================
-// control/LaneFollowerV21.h  —  ⚠ REFERENCE ONLY, NOT COMPILED
+// control/LaneFollowerV21.h
 //
-// This file preserves the V21 opening-detector + Bezier path-planning
-// algorithm as a design reference. It is NOT part of the current build,
-// and it will NOT compile as-is:
+// V21 = V20 core + V21 opening detector + quadratic-bezier
+// turn path. Turn is triggered when a SignState with active=true
+// is supplied AND an opening is detected on the sign's side.
 //
-//   1. `v21::detail::planSpeed` and `errorSpeedFactor` are CALLED from
-//      step() but are only defined in v20::detail — different namespace.
-//      Add local definitions here or `using v20::detail::planSpeed;`
-//      before attempting a build.
-//
-//   2. `v21::Config` has default member initialisers, and
-//      `explicit LaneFollower(const Config& c = Config())` triggers the
-//      GCC 7.5 nested-default-argument bug (GCC#92357) that already bit
-//      RoadSegmenter::Init. On Jetpack 4.x, split into a zero-arg
-//      overload and a const-Config& overload like RoadSegmenter does.
-//
-//   3. The namespace closes with `} // namespace v22` but opens as
-//      `namespace v21` — cosmetic, fix if you activate this file.
-//
-//   4. `preprocessMask` adds a (35, 5) morph-close that
-//      LaneFollowerV20's preprocessMask does NOT have. This changes mask
-//      shape enough that extractCenterline results will differ from v20
-//      on the same frame. If you A/B v20 vs v21 output, this is a
-//      confound.
-//
-// The live turn gate tested in Log 13 is the area-spike version in
-// control/TurnStateMachine.h. If you port the V21 opening detector into
-// TurnStateMachine::CheckTurnCondition, copy the algorithm from
-// `detectOpenings()` / `updateTurnMemory()` / `buildPathWithTurn()` here
-// — not the whole file.
+// Output angle: v20 convention (+ = right), already multiplied
+// by post_pid_gain. Caller negates → real-left → servo calib.
 // ============================================================
 #pragma once
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <string>
 #include <utility>
 #include <vector>
-#include <string>
 
 namespace v21 {
 
 // ============================================================
-// DATA STRUCTS CHO OPENING LOGIC
+// DATA STRUCTS
 // ============================================================
 struct SignState {
     bool active = false;
-    int side = 0;      // -1: Left, 1: Right, 2: Both, 0: None
-    int class_id = -1; 
+    int  side   = 0;   // -1 left, +1 right, 2 both, 0 disabled
+    int  class_id = -1;
 };
 
 struct Point { int x, y; };
@@ -63,205 +41,267 @@ struct Opening {
 };
 
 struct TurnMemory {
-    bool active = false;
-    int side = 0;
-    int turn_width = 0;
-    int last_y_mid = 9999;
+    bool active     = false;
+    int  side       = 0;
+    int  turn_width = 0;
+    int  last_y_mid = 9999;
 };
 
 // ============================================================
-// CONFIG (Kế thừa V20 + thêm thông số Opening)
+// CONFIG
 // ============================================================
 struct Config {
-    // --- V20 Mask & Speed ---
-    int  mask_width   = 320;    
-    bool keep_largest = true;   
-    double post_pid_gain = 1.0; // Set = 1.0 để dùng hàm hồi quy bên ngoài
-    double max_speed = 15.0;    
-    double min_speed = 5.0;     
+    // --- V20 mask / speed ---
+    int    mask_width    = 320;
+    bool   keep_largest  = true;
+    double post_pid_gain = 1.0;
+    double max_speed     = 15.0;
+    double min_speed     = 5.0;
 
-    // --- V20 PID & Filters ---
+    // --- V20 PID / filters ---
     double asym_strength = 0.20, asym_threshold = 8.0, asym_ema = 0.7;
     double asym_cap = 12.0, asym_decay = 0.80;
-    double far_delta_clip = 25.0, d_far_clip = 6.0, d_far_ema_alpha = 0.4, lead_rate_gain = 0.8;
-    double hard_step_px = 30.0, err_step_px = 18.0, cov_drop = 0.22, jagged_px = 15.0;
+    double far_delta_clip = 25.0, d_far_clip = 6.0;
+    double d_far_ema_alpha = 0.4, lead_rate_gain = 0.8;
+    double hard_step_px = 30.0, err_step_px = 18.0;
+    double cov_drop = 0.22, jagged_px = 15.0;
     int    occl_hangover = 4;
     double far_outlier_px = 40.0, far_outlier_near_px = 20.0, far_spread_px = 40.0;
     int    far_window = 5;
     double cov_ema_alpha = 0.9;
-    int emergency_streak_req = 2;
-    int emg_hold_after_occl  = 5;
+    int    emergency_streak_req = 2;
+    int    emg_hold_after_occl  = 5;
     double kp = 0.32, ki = 0.0, kd = 0.6;
     double integral_limit = 2.0, derivative_alpha = 0.55;
     double output_limit = 22.0, rate_limit = 10.0, deadband = 1.5;
-    double emergency_output_limit = 25.0, emergency_rate_limit = 20.0, emergency_error_px = 30.0;
+    double emergency_output_limit = 25.0, emergency_rate_limit = 20.0;
+    double emergency_error_px = 30.0;
     double auth_tau = 0.35, auth_sat_frac = 0.9;
     int    auth_sat_frames = 3;
     double auth_lose_enter_px = 30.0, auth_lose_exit_px = 20.0;
-    int    min_rows = 5;        // Tăng độ nhạy cho xe thật
+    int    min_rows = 5;
     double coverage_threshold = 0.05;
     double curve_scale = 150.0;
 
-    // --- V21 Opening Logic ---
-    int    open_thresh = 15;
-    int    min_height  = 10;
-    int    smooth_win  = 5;
-    int    base_win    = 50;
-    int    pull_back   = 3;
-    int    corner_radius = 20;
-    int    min_turn_dist = 4;
-    int    extend_len    = 80;
+    // --- V21 opening logic ---
+    int open_thresh    = 15;
+    int min_height     = 10;
+    int smooth_win     = 5;
+    int base_win       = 50;
+    int pull_back      = 3;
+    int corner_radius  = 20;
+    int min_turn_dist  = 4;
+    int extend_len     = 80;
 };
 
+// ============================================================
+// DETAIL HELPERS
+// ============================================================
 namespace detail {
-    inline double medianInts(std::vector<int> v) {
-        std::sort(v.begin(), v.end());
-        size_t n = v.size();
-        return (n % 2) ? (double)v[n / 2] : ((double)v[n / 2 - 1] + (double)v[n / 2]) / 2.0;
+
+inline double medianInts(std::vector<int> v) {
+    std::sort(v.begin(), v.end());
+    size_t n = v.size();
+    return (n % 2) ? (double)v[n / 2]
+                   : ((double)v[n / 2 - 1] + (double)v[n / 2]) / 2.0;
+}
+
+inline int percentileInt(const std::vector<int>& sorted, double q) {
+    double pos = q * (double)(sorted.size() - 1);
+    size_t lo  = (size_t)pos;
+    double fr  = pos - (double)lo;
+    double v   = (double)sorted[lo] +
+                 (lo + 1 < sorted.size()
+                      ? fr * (double)(sorted[lo + 1] - sorted[lo])
+                      : 0.0);
+    return (int)v;
+}
+
+inline double sgn(double x) { return (x > 0) - (x < 0); }
+
+// --- ADDED (were missing from V21, required by step()) ---
+inline double planSpeed(double curveSmooth, double maxSp,
+                        double minSp, double scale) {
+    double ratio = std::min(std::abs(curveSmooth) / scale, 1.0);
+    return maxSp - (maxSp - minSp) * ratio;
+}
+
+inline double errorSpeedFactor(double error, double startPx = 8.0,
+                               double fullPx = 35.0, double minFactor = 0.30) {
+    double a = std::abs(error);
+    if (a <= startPx) return 1.0;
+    if (a >= fullPx)  return minFactor;
+    double t = (a - startPx) / (fullPx - startPx);
+    return 1.0 - t * (1.0 - minFactor);
+}
+
+// V20 morphology + largest-component (kept for opening detection).
+inline cv::Mat preprocessMask(const cv::Mat& in, const Config& c,
+                              double& kept_frac_out) {
+    kept_frac_out = 1.0;
+    if (in.empty() || in.type() != CV_8UC1) return cv::Mat();
+
+    cv::Mat out;
+    if (c.mask_width > 0 && in.cols != c.mask_width) {
+        cv::resize(in, out,
+                   cv::Size(c.mask_width, in.rows * c.mask_width / in.cols),
+                   0, 0, cv::INTER_NEAREST);
+    } else {
+        out = in.clone();
     }
-    inline int percentileInt(const std::vector<int>& sorted, double q) {
-        double pos = q * (double)(sorted.size() - 1);
-        size_t lo = (size_t)pos;
-        double fr = pos - (double)lo;
-        double v = (double)sorted[lo] + (lo + 1 < sorted.size() ? fr * (double)(sorted[lo + 1] - sorted[lo]) : 0.0);
-        return (int)v;
-    }
-    inline double sgn(double x) { return (x > 0) - (x < 0); }
 
-    // V20 Preprocess: Morph close (lấp bóng đổ) + Keep Largest
-    inline cv::Mat preprocessMask(const cv::Mat& in, const Config& c, double& kept_frac_out) {
-        kept_frac_out = 1.0;
-        if (in.empty() || in.type() != CV_8UC1) return cv::Mat();
-        
-        cv::Mat out;
-        if (c.mask_width > 0 && in.cols != c.mask_width) {
-            cv::resize(in, out, cv::Size(c.mask_width, in.rows * c.mask_width / in.cols), 0, 0, cv::INTER_NEAREST);
-        } else {
-            out = in.clone();
-        }
+    cv::Mat binary = (out > 0);
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(35, 5));
+    cv::morphologyEx(binary, out, cv::MORPH_CLOSE, kernel);
 
-        // V21: Morphology Close để lấp đầy các lỗ hổng nhỏ (vạch kẻ, bóng râm)
-        cv::Mat binary = (out > 0);
-        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(35, 5));
-        cv::morphologyEx(binary, out, cv::MORPH_CLOSE, kernel);
+    if (!c.keep_largest) return out;
 
-        if (!c.keep_largest) return out;
-
-        // V20: Keep largest component (BFS)
-        std::vector<int> labels((size_t)out.rows * out.cols, 0);
-        std::vector<int> stack, areas(1, 0);
-        int nLabels = 0;
-        for (int y = 0; y < out.rows; y++) {
-            const uchar* row = out.ptr<uchar>(y);
-            for (int x = 0; x < out.cols; x++) {
-                if (!row[x] || labels[(size_t)y * out.cols + x]) continue;
-                ++nLabels;
-                int area = 0;
-                stack.clear(); stack.push_back(y * out.cols + x);
-                labels[(size_t)y * out.cols + x] = nLabels;
-                while (!stack.empty()) {
-                    int p = stack.back(); stack.pop_back();
-                    area++;
-                    int py = p / out.cols, px = p % out.cols;
-                    for (int dy = -1; dy <= 1; dy++) {
-                        int ny = py + dy;
-                        if (ny < 0 || ny >= out.rows) continue;
-                        const uchar* nrow = out.ptr<uchar>(ny);
-                        for (int dx = -1; dx <= 1; dx++) {
-                            if (!dx && !dy) continue;
-                            int nx = px + dx;
-                            if (nx < 0 || nx >= out.cols) continue;
-                            size_t q = (size_t)ny * out.cols + nx;
-                            if (nrow[nx] && !labels[q]) { labels[q] = nLabels; stack.push_back((int)q); }
+    std::vector<int> labels((size_t)out.rows * out.cols, 0);
+    std::vector<int> stack, areas(1, 0);
+    int nLabels = 0;
+    for (int y = 0; y < out.rows; y++) {
+        const uchar* row = out.ptr<uchar>(y);
+        for (int x = 0; x < out.cols; x++) {
+            if (!row[x] || labels[(size_t)y * out.cols + x]) continue;
+            ++nLabels;
+            int area = 0;
+            stack.clear();
+            stack.push_back(y * out.cols + x);
+            labels[(size_t)y * out.cols + x] = nLabels;
+            while (!stack.empty()) {
+                int p = stack.back(); stack.pop_back();
+                area++;
+                int py = p / out.cols, px = p % out.cols;
+                for (int dy = -1; dy <= 1; dy++) {
+                    int ny = py + dy;
+                    if (ny < 0 || ny >= out.rows) continue;
+                    const uchar* nrow = out.ptr<uchar>(ny);
+                    for (int dx = -1; dx <= 1; dx++) {
+                        if (!dx && !dy) continue;
+                        int nx = px + dx;
+                        if (nx < 0 || nx >= out.cols) continue;
+                        size_t q = (size_t)ny * out.cols + nx;
+                        if (nrow[nx] && !labels[q]) {
+                            labels[q] = nLabels;
+                            stack.push_back((int)q);
                         }
                     }
                 }
-                areas.push_back(area);
             }
+            areas.push_back(area);
         }
-        if (nLabels <= 1) return out;
-        int best = 1; int total_area = 0;
-        for (int i = 1; i <= nLabels; i++) total_area += areas[i];
-        for (int i = 2; i <= nLabels; i++) if (areas[i] > areas[best]) best = i;
-        kept_frac_out = (total_area > 0) ? (double)areas[best] / (double)total_area : 1.0;
+    }
+    if (nLabels <= 1) return out;
 
-        for (int y = 0; y < out.rows; y++) {
-            uchar* row = out.ptr<uchar>(y);
-            for (int x = 0; x < out.cols; x++) if (labels[(size_t)y * out.cols + x] != best) row[x] = 0;
-        }
-        return out;
-    }
+    int best = 1, total_area = 0;
+    for (int i = 1; i <= nLabels; i++) total_area += areas[i];
+    for (int i = 2; i <= nLabels; i++) if (areas[i] > areas[best]) best = i;
+    kept_frac_out = (total_area > 0)
+                    ? (double)areas[best] / (double)total_area : 1.0;
 
-    inline std::vector<float> movingAvg(const std::vector<float>& arr, int win) {
-        int h = arr.size();
-        std::vector<float> out(h, -1.0f);
-        int half = win / 2;
-        for (int i = 0; i < h; ++i) {
-            float sum = 0; int count = 0;
-            for (int j = std::max(0, i - half); j <= std::min(h - 1, i + half); ++j) {
-                if (arr[j] >= 0) { sum += arr[j]; count++; }
-            }
-            if (count > 0) out[i] = sum / count;
-        }
-        return out;
+    for (int y = 0; y < out.rows; y++) {
+        uchar* row = out.ptr<uchar>(y);
+        for (int x = 0; x < out.cols; x++)
+            if (labels[(size_t)y * out.cols + x] != best) row[x] = 0;
     }
-    inline std::vector<float> rollingMedian(const std::vector<float>& arr, int win) {
-        int h = arr.size();
-        std::vector<float> out(h, -1.0f);
-        int half = win / 2;
-        for (int i = 0; i < h; ++i) {
-            std::vector<float> vals;
-            for (int j = std::max(0, i - half); j <= std::min(h - 1, i + half); ++j) {
-                if (arr[j] >= 0) vals.push_back(arr[j]);
-            }
-            if (!vals.empty()) { std::sort(vals.begin(), vals.end()); out[i] = vals[vals.size() / 2]; }
-        }
-        return out;
+    return out;
+}
+
+inline std::vector<float> movingAvg(const std::vector<float>& arr, int win) {
+    int h = (int)arr.size();
+    std::vector<float> out(h, -1.0f);
+    int half = win / 2;
+    for (int i = 0; i < h; ++i) {
+        float sum = 0; int count = 0;
+        for (int j = std::max(0, i - half); j <= std::min(h - 1, i + half); ++j)
+            if (arr[j] >= 0) { sum += arr[j]; count++; }
+        if (count > 0) out[i] = sum / count;
     }
-    inline std::vector<Point> quadraticBezier(Point P0, Point P1, Point P2, int n = 10) {
-        std::vector<Point> pts;
-        for (int i = 0; i <= n; ++i) {
-            float t = (float)i / n;
-            float x = (1-t)*(1-t)*P0.x + 2*t*(1-t)*P1.x + t*t*P2.x;
-            float y = (1-t)*(1-t)*P0.y + 2*t*(1-t)*P1.y + t*t*P2.y;
-            pts.push_back({(int)x, (int)y});
+    return out;
+}
+
+inline std::vector<float> rollingMedian(const std::vector<float>& arr, int win) {
+    int h = (int)arr.size();
+    std::vector<float> out(h, -1.0f);
+    int half = win / 2;
+    for (int i = 0; i < h; ++i) {
+        std::vector<float> vals;
+        for (int j = std::max(0, i - half); j <= std::min(h - 1, i + half); ++j)
+            if (arr[j] >= 0) vals.push_back(arr[j]);
+        if (!vals.empty()) {
+            std::sort(vals.begin(), vals.end());
+            out[i] = vals[vals.size() / 2];
         }
-        return pts;
     }
-} // namespace detail
+    return out;
+}
+
+inline std::vector<Point> quadraticBezier(Point P0, Point P1, Point P2,
+                                          int n = 10) {
+    std::vector<Point> pts;
+    for (int i = 0; i <= n; ++i) {
+        float t = (float)i / n;
+        float x = (1-t)*(1-t)*P0.x + 2*t*(1-t)*P1.x + t*t*P2.x;
+        float y = (1-t)*(1-t)*P0.y + 2*t*(1-t)*P1.y + t*t*P2.y;
+        pts.push_back({(int)x, (int)y});
+    }
+    return pts;
+}
+
+}  // namespace detail
 
 // ============================================================
-// V20 CORE: OcclusionGate, Authority, PID
+// V20 CORE
 // ============================================================
 class OcclusionGate {
 public:
     explicit OcclusionGate(const Config& c = Config()) : c_(c) { reset(); }
-    void reset() { covEma_ = 0; prevErr_ = 0; init_ = false; hangover_ = 0; farHist_.clear(); farSpread_ = 0; lastHard_ = false; lastFarOutlier_ = false; }
-    bool step(double error, double coverage, const std::vector<std::pair<int, int>>& rows, bool valid, double farE, double nearE) {
+    void reset() {
+        covEma_ = 0; prevErr_ = 0; init_ = false; hangover_ = 0;
+        farHist_.clear(); farSpread_ = 0;
+        lastHard_ = false; lastFarOutlier_ = false;
+    }
+    bool step(double error, double coverage,
+              const std::vector<std::pair<int, int>>& rows,
+              bool valid, double farE, double nearE) {
         farHist_.push_back(farE);
         if ((int)farHist_.size() > c_.far_window) farHist_.pop_front();
-        if (farHist_.size() >= 2) { auto mm = std::minmax_element(farHist_.begin(), farHist_.end()); farSpread_ = *mm.second - *mm.first; } else farSpread_ = 0;
-        if (!init_) { covEma_ = coverage; prevErr_ = error; init_ = true; hangover_ = 0; lastHard_ = false; lastFarOutlier_ = false; return false; }
+        if (farHist_.size() >= 2) {
+            auto mm = std::minmax_element(farHist_.begin(), farHist_.end());
+            farSpread_ = *mm.second - *mm.first;
+        } else farSpread_ = 0;
+
+        if (!init_) {
+            covEma_ = coverage; prevErr_ = error; init_ = true; hangover_ = 0;
+            lastHard_ = false; lastFarOutlier_ = false; return false;
+        }
         covEma_ = c_.cov_ema_alpha * covEma_ + (1.0 - c_.cov_ema_alpha) * coverage;
         if (!valid) { prevErr_ = error; hangover_ = c_.occl_hangover; lastHard_ = false; return true; }
 
         double errStep = std::abs(error - prevErr_);
-        double covDrop = (covEma_ > 0.05) ? std::max(0.0, (covEma_ - coverage) / covEma_) : 0.0;
+        double covDrop = (covEma_ > 0.05)
+                        ? std::max(0.0, (covEma_ - coverage) / covEma_) : 0.0;
         double jagged = 0;
         if (rows.size() >= 6) {
             double sum = 0; int n = 0;
-            for (size_t i = 1; i + 1 < rows.size(); i++) { sum += std::abs(rows[i + 1].first - 2 * rows[i].first + rows[i - 1].first); n++; }
+            for (size_t i = 1; i + 1 < rows.size(); i++) {
+                sum += std::abs(rows[i + 1].first - 2 * rows[i].first + rows[i - 1].first);
+                n++;
+            }
             jagged = n ? sum / n : 0;
         }
-        bool farOutlier = std::abs(farE) > c_.far_outlier_px && std::abs(nearE) < c_.far_outlier_near_px;
+        bool farOutlier = std::abs(farE) > c_.far_outlier_px
+                       && std::abs(nearE) < c_.far_outlier_near_px;
         lastFarOutlier_ = farOutlier;
-        bool farSpreadTrig = (int)farHist_.size() >= c_.far_window && farSpread_ > c_.far_spread_px;
+        bool farSpreadTrig = (int)farHist_.size() >= c_.far_window
+                          && farSpread_ > c_.far_spread_px;
         int sig = 0;
         if (errStep > c_.err_step_px) sig++;
-        if (covDrop > c_.cov_drop) sig++;
-        if (jagged > c_.jagged_px) sig++;
-        if (farOutlier) sig++;
-        if (farSpreadTrig) sig++;
+        if (covDrop > c_.cov_drop)    sig++;
+        if (jagged > c_.jagged_px)    sig++;
+        if (farOutlier)               sig++;
+        if (farSpreadTrig)            sig++;
+
         prevErr_ = error;
         bool hard = errStep > c_.hard_step_px;
         lastHard_ = hard;
@@ -270,10 +310,15 @@ public:
         return false;
     }
     bool lastFarOutlier() const { return lastFarOutlier_; }
-    bool lastHardStep() const { return lastHard_; }
-    double farSpread() const { return farSpread_; }
+    bool lastHardStep()   const { return lastHard_; }
+    double farSpread()    const { return farSpread_; }
+
 private:
-    Config c_; double covEma_, prevErr_, farSpread_; bool init_, lastHard_, lastFarOutlier_; int hangover_; std::deque<double> farHist_;
+    Config c_;
+    double covEma_, prevErr_, farSpread_;
+    bool init_, lastHard_, lastFarOutlier_;
+    int hangover_;
+    std::deque<double> farHist_;
 };
 
 class AuthorityManager {
@@ -281,15 +326,21 @@ public:
     explicit AuthorityManager(const Config& c = Config()) : c_(c) { reset(); }
     void reset() { satStreak_ = 0; losing_ = false; }
     void step(double error, double prevError, double pidOut) {
-        double dErr = error - prevError; double pred = error + c_.auth_tau * dErr;
-        if (std::abs(pidOut) > c_.auth_sat_frac * c_.output_limit) satStreak_++; else satStreak_ = 0;
+        double dErr = error - prevError;
+        double pred = error + c_.auth_tau * dErr;
+        if (std::abs(pidOut) > c_.auth_sat_frac * c_.output_limit) satStreak_++;
+        else satStreak_ = 0;
         if (!losing_) {
-            if (satStreak_ >= c_.auth_sat_frames && std::abs(pred) > std::abs(error) && std::abs(error) > c_.auth_lose_enter_px) losing_ = true;
+            if (satStreak_ >= c_.auth_sat_frames
+                && std::abs(pred) > std::abs(error)
+                && std::abs(error) > c_.auth_lose_enter_px) losing_ = true;
         } else {
-            if (std::abs(error) < c_.auth_lose_exit_px || satStreak_ < c_.auth_sat_frames) losing_ = false;
+            if (std::abs(error) < c_.auth_lose_exit_px
+                || satStreak_ < c_.auth_sat_frames) losing_ = false;
         }
     }
     bool losing() const { return losing_; }
+
 private:
     Config c_; int satStreak_; bool losing_;
 };
@@ -297,22 +348,41 @@ private:
 class SteeringPID {
 public:
     explicit SteeringPID(const Config& c = Config()) : c_(c), auth_(c) { reset(); }
-    void reset() { integral_ = prevErr_ = filtD_ = prevOut_ = 0; first_ = true; auth_.reset(); emgAuth_ = false; emgStreak_ = 0; forced_ = false; }
+    void reset() {
+        integral_ = prevErr_ = filtD_ = prevOut_ = 0; first_ = true;
+        auth_.reset(); emgAuth_ = false; emgStreak_ = 0; forced_ = false;
+    }
     void softReset() { integral_ = prevErr_ = filtD_ = 0; first_ = true; }
     void setForcedEmergency(bool f) { forced_ = f; }
-    bool losing() const { return auth_.losing(); }
+    bool losing()            const { return auth_.losing(); }
     bool emergencyAuthority() const { return emgAuth_; }
+
     double step(double error) {
-        double kpEff = c_.kp * (auth_.losing() ? 1.5 : 1.0); double kdEff = c_.kd * (auth_.losing() ? 0.7 : 1.0);
+        double kpEff = c_.kp * (auth_.losing() ? 1.5 : 1.0);
+        double kdEff = c_.kd * (auth_.losing() ? 0.7 : 1.0);
         double outLim, rateLim;
-        if (forced_) { emgStreak_ = c_.emergency_streak_req; outLim = c_.emergency_output_limit; rateLim = c_.emergency_rate_limit; emgAuth_ = true; }
-        else {
-            if (std::abs(error) > c_.emergency_error_px) emgStreak_++; else emgStreak_ = 0;
-            if (emgStreak_ >= c_.emergency_streak_req) { outLim = c_.emergency_output_limit; rateLim = c_.emergency_rate_limit; emgAuth_ = true; }
-            else { outLim = c_.output_limit; rateLim = c_.rate_limit; emgAuth_ = false; }
+        if (forced_) {
+            emgStreak_ = c_.emergency_streak_req;
+            outLim = c_.emergency_output_limit;
+            rateLim = c_.emergency_rate_limit;
+            emgAuth_ = true;
+        } else {
+            if (std::abs(error) > c_.emergency_error_px) emgStreak_++;
+            else emgStreak_ = 0;
+            if (emgStreak_ >= c_.emergency_streak_req) {
+                outLim = c_.emergency_output_limit;
+                rateLim = c_.emergency_rate_limit;
+                emgAuth_ = true;
+            } else {
+                outLim = c_.output_limit;
+                rateLim = c_.rate_limit;
+                emgAuth_ = false;
+            }
         }
         double sg = detail::sgn(error);
-        double e = (std::abs(error) < c_.deadband) ? sg * (std::abs(error) - c_.deadband) : error - sg * c_.deadband;
+        double e  = (std::abs(error) < c_.deadband)
+                    ? sg * (std::abs(error) - c_.deadband)
+                    : error - sg * c_.deadband;
         double p = kpEff * e;
         integral_ = std::clamp(integral_ + e, -c_.integral_limit, c_.integral_limit);
         double i = c_.ki * integral_;
@@ -328,26 +398,32 @@ public:
         prevErr_ = error; prevOut_ = out; first_ = false;
         return out;
     }
+
 private:
-    Config c_; AuthorityManager auth_; double integral_, prevErr_, filtD_, prevOut_; bool first_, emgAuth_, forced_; int emgStreak_;
+    Config c_; AuthorityManager auth_;
+    double integral_, prevErr_, filtD_, prevOut_;
+    bool first_, emgAuth_, forced_;
+    int emgStreak_;
 };
 
 // ============================================================
-// V22 LANE FOLLOWER (V20 Core + V21 Opening Logic)
+// V21 LANE FOLLOWER
 // ============================================================
 class LaneFollower {
 public:
     struct Output {
-        double angle = 0, speed = 0;              
-        bool valid = false, occl = false, forced_emer = false, emer_auth = false, losing = false;
+        double angle = 0, speed = 0;
+        bool valid = false, occl = false, forced_emer = false;
+        bool emer_auth = false, losing = false;
         double near_e = 0, far_e = 0, eff_error = 0, coverage = 0;
-        double angle_pre_gain = 0, kept_frac = 1.0; 
+        double angle_pre_gain = 0, kept_frac = 1.0;
         std::vector<Point> final_path;
         int proc_width = 0, proc_height = 0;
         std::string state_str = "CENTERLINE";
     };
 
-    explicit LaneFollower(const Config& c = Config()) : c_(c), pid_(c), gate_(c) {
+    explicit LaneFollower(const Config& c = Config())
+        : c_(c), pid_(c), gate_(c) {
         speed_ = c_.min_speed;
         resetTracking();
     }
@@ -364,46 +440,53 @@ public:
         Output o;
         double kept_frac = 1.0;
         cv::Mat cleanMask = detail::preprocessMask(rawMask, c_, kept_frac);
-        
+
         if (cleanMask.empty()) {
             o.state_str = "INVALID MASK";
             return o;
         }
-        o.proc_width = cleanMask.cols;
+        o.proc_width  = cleanMask.cols;
         o.proc_height = cleanMask.rows;
 
-        // 1. Lấy Centerline theo chuẩn V20
+        // 1. Centerline
         std::vector<std::pair<int, int>> row_centers;
         auto cl = extractCenterline(cleanMask, curveSmooth_, c_, row_centers);
         curveSmooth_ = cl.curve_smooth;
 
-        // 2. Tính toán Sai số V20 (near/far)
-        double farDelta = std::clamp(cl.far_error - cl.near_error, -c_.far_delta_clip, c_.far_delta_clip);
-        double dFarRaw = (cl.valid && prevValid_) ? (cl.far_error - prevFarE_) : 0.0;
+        // 2. Near/far/lead/blended
+        double farDelta = std::clamp(cl.far_error - cl.near_error,
+                                     -c_.far_delta_clip, c_.far_delta_clip);
+        double dFarRaw = (cl.valid && prevValid_)
+                       ? (cl.far_error - prevFarE_) : 0.0;
         double dFar = std::clamp(dFarRaw, -c_.d_far_clip, c_.d_far_clip);
-        dFarFilt_ = c_.d_far_ema_alpha * dFar + (1.0 - c_.d_far_ema_alpha) * dFarFilt_;
+        dFarFilt_ = c_.d_far_ema_alpha * dFar
+                  + (1.0 - c_.d_far_ema_alpha) * dFarFilt_;
         double lead = 0.5 * farDelta + c_.lead_rate_gain * dFarFilt_;
         double blended = cl.near_error + lead;
         prevFarE_ = cl.far_error;
 
-        // 3. Kiểm tra Occlusion
-        bool occl = gate_.step(blended, cl.coverage, row_centers, cl.valid, cl.far_error, cl.near_error);
+        // 3. Occlusion
+        bool occl = gate_.step(blended, cl.coverage, row_centers, cl.valid,
+                               cl.far_error, cl.near_error);
         if (occl) emerHold_ = c_.emg_hold_after_occl;
         else if (emerHold_ > 0) emerHold_--;
 
-        // 4. Tính Asymmetry (nếu không bị che khuất)
+        // 4. Asymmetry
         if (!occl && cl.valid) {
             double asymRaw = detectAsymmetry(cleanMask);
-            asymSmooth_ = c_.asym_ema * asymSmooth_ + (1.0 - c_.asym_ema) * asymRaw;
-            if (std::abs(cl.near_error) < 5.0 && std::abs(asymSmooth_) < c_.asym_cap) asymSmooth_ *= c_.asym_decay;
+            asymSmooth_ = c_.asym_ema * asymSmooth_
+                        + (1.0 - c_.asym_ema) * asymRaw;
+            if (std::abs(cl.near_error) < 5.0
+                && std::abs(asymSmooth_) < c_.asym_cap)
+                asymSmooth_ *= c_.asym_decay;
             asymSmooth_ = std::clamp(asymSmooth_, -c_.asym_cap, c_.asym_cap);
         }
-        double asymApplied = (std::abs(asymSmooth_) < c_.asym_threshold) ? 0.0 : c_.asym_strength * asymSmooth_;
+        double asymApplied =
+            (std::abs(asymSmooth_) < c_.asym_threshold)
+                ? 0.0 : c_.asym_strength * asymSmooth_;
         double eff_error_v20 = blended + asymApplied;
 
-        // ============================================================
-        // 5. OPENING LOGIC (Từ V21)
-        // ============================================================
+        // 5. OPENING LOGIC + BEZIER TURN
         std::vector<Point> centerline_pts;
         for (auto& p : row_centers) centerline_pts.push_back({p.first, p.second});
 
@@ -413,56 +496,63 @@ public:
         std::vector<Point> final_path = centerline_pts;
         o.state_str = "CENTERLINE";
         bool should_turn = false;
-        Opening target_opening;
+        Opening target_opening{};
 
         bool has_valid_opening = false;
         if (!openings.empty()) {
             target_opening = openings[0];
-            for (const auto& op : openings) if (op.y_mid > target_opening.y_mid) target_opening = op;
+            for (const auto& op : openings)
+                if (op.y_mid > target_opening.y_mid) target_opening = op;
             has_valid_opening = true;
         }
 
         if (sign.active) {
             if (has_valid_opening) {
-                if (sign.class_id == 6 || sign.class_id == 7 || sign.class_id == 0) should_turn = true;
+                if (sign.class_id == 6 || sign.class_id == 7 || sign.class_id == 0)
+                    should_turn = true;
                 else if (sign.class_id == 1 || sign.class_id == 2) {
-                    if (!centerline_pts.empty() && centerline_pts.back().y > target_opening.y_mid - 10) should_turn = true;
+                    if (!centerline_pts.empty()
+                        && centerline_pts.back().y > target_opening.y_mid - 10)
+                        should_turn = true;
                 }
             } else if (turn_memory_.active) {
-                Point top_pt = centerline_pts.empty() ? Point{cleanMask.cols/2, cleanMask.rows/2} : centerline_pts.back();
+                Point top_pt = centerline_pts.empty()
+                             ? Point{cleanMask.cols/2, cleanMask.rows/2}
+                             : centerline_pts.back();
                 if (top_pt.y > turn_memory_.last_y_mid + 50) {
-                    target_opening.side = turn_memory_.side;
-                    target_opening.y_mid = top_pt.y;
+                    target_opening.side       = turn_memory_.side;
+                    target_opening.y_mid      = top_pt.y;
                     target_opening.x_baseline = top_pt.x;
-                    target_opening.x_extreme = top_pt.x + (turn_memory_.side == -1 ? -turn_memory_.turn_width : turn_memory_.turn_width);
+                    target_opening.x_extreme  = top_pt.x +
+                        (turn_memory_.side == -1
+                             ? -turn_memory_.turn_width
+                             :  turn_memory_.turn_width);
                     should_turn = true;
-                    o.state_str = "GHOST TURN " + std::string(turn_memory_.side == -1 ? "LEFT" : "RIGHT");
+                    o.state_str = "GHOST TURN " +
+                        std::string(turn_memory_.side == -1 ? "LEFT" : "RIGHT");
                 }
             }
         }
 
         if (should_turn) {
-            final_path = buildPathWithTurn(centerline_pts, cleanMask, target_opening);
+            final_path = buildPathWithTurn(centerline_pts, cleanMask,
+                                           target_opening);
             if (o.state_str == "CENTERLINE") {
-                o.state_str = "TURN " + std::string(target_opening.side == -1 ? "LEFT" : "RIGHT");
+                o.state_str = "TURN " +
+                    std::string(target_opening.side == -1 ? "LEFT" : "RIGHT");
             }
         }
 
-        // ============================================================
-        // 6. CHỌN SAI SỐ ĐỂ ĐƯA VÀO PID V20
-        // ============================================================
+        // 6. Error into PID
         double final_error = eff_error_v20;
-        
         if (should_turn && final_path.size() > 5) {
-            // Nếu đang rẽ, dùng Lookahead Point của đường Bezier làm sai số
-            int look_idx = final_path.size() * 2 / 3; 
+            int look_idx = (int)final_path.size() * 2 / 3;
             final_error = final_path[look_idx].x - (cleanMask.cols / 2.0);
-            // Khi đang rẽ, giảm tốc độ
-            speed_ = c_.min_speed + 3.0; 
+            speed_ = c_.min_speed + 3.0;
         } else {
-            // Nếu chạy thẳng, dùng thuật toán Speed Planning của V20
-            double target_speed = detail::planSpeed(curveSmooth_, c_.max_speed, c_.min_speed, c_.curve_scale);
-            double errMult = detail::errorSpeedFactor(eff_error_v20);
+            double target_speed = detail::planSpeed(
+                curveSmooth_, c_.max_speed, c_.min_speed, c_.curve_scale);
+            double errMult   = detail::errorSpeedFactor(eff_error_v20);
             double authSpeed = pid_.losing() ? 0.6 : 1.0;
             target_speed = std::max(target_speed * errMult * authSpeed, 0.0);
             speed_ = 0.7 * speed_ + 0.3 * target_speed;
@@ -474,24 +564,29 @@ public:
         double angle_pre_gain = 0.0;
         if (cl.valid) {
             if (!prevValid_) { pid_.softReset(); gate_.reset(); }
-            angle_pre_gain = pid_.step(final_error); // Đưa final_error vào PID V20
+            angle_pre_gain = pid_.step(final_error);
             lastAngle_ = angle_pre_gain * c_.post_pid_gain;
         } else {
-            angle_pre_gain = (c_.post_pid_gain > 0) ? lastAngle_ / c_.post_pid_gain : lastAngle_;
+            angle_pre_gain = (c_.post_pid_gain > 0)
+                           ? lastAngle_ / c_.post_pid_gain : lastAngle_;
             speed_ = 0.85 * speed_;
         }
         prevValid_ = cl.valid;
 
-        // 7. Đóng gói Output
-        o.angle = lastAngle_;
+        o.angle          = lastAngle_;
         o.angle_pre_gain = angle_pre_gain;
-        o.kept_frac = kept_frac;
-        o.speed = speed_;
-        o.valid = cl.valid; o.occl = occl; o.forced_emer = forcedEmer;
-        o.emer_auth = pid_.emergencyAuthority(); o.losing = pid_.losing();
-        o.near_e = cl.near_error; o.far_e = cl.far_error; o.eff_error = final_error; o.coverage = cl.coverage;
-        o.final_path = final_path;
-
+        o.kept_frac      = kept_frac;
+        o.speed          = speed_;
+        o.valid          = cl.valid;
+        o.occl           = occl;
+        o.forced_emer    = forcedEmer;
+        o.emer_auth      = pid_.emergencyAuthority();
+        o.losing         = pid_.losing();
+        o.near_e         = cl.near_error;
+        o.far_e          = cl.far_error;
+        o.eff_error      = final_error;
+        o.coverage       = cl.coverage;
+        o.final_path     = final_path;
         return o;
     }
 
@@ -504,9 +599,12 @@ private:
     bool prevValid_;
     int emerHold_;
 
-    // --- CÁC HÀM TỪ V20 ---
-    struct CenterlineInfo { double near_error = 0, far_error = 0, curve_error = 0, curve_smooth = 0, coverage = 0; bool valid = false; };
-    
+    struct CenterlineInfo {
+        double near_error = 0, far_error = 0, curve_error = 0;
+        double curve_smooth = 0, coverage = 0;
+        bool valid = false;
+    };
+
     bool largestRun(const uchar* row, int w, int& bs, int& be) {
         int bestLen = -1, s = -1; bs = be = -1;
         for (int x = 0; x <= w; x++) {
@@ -521,7 +619,9 @@ private:
         return bs >= 0;
     }
 
-    CenterlineInfo extractCenterline(const cv::Mat& m, double prevCurveSmooth, const Config& c, std::vector<std::pair<int, int>>& row_centers) {
+    CenterlineInfo extractCenterline(const cv::Mat& m, double prevCurveSmooth,
+                                     const Config& c,
+                                     std::vector<std::pair<int, int>>& row_centers) {
         CenterlineInfo r;
         const int h = m.rows, w = m.cols;
         long nz = 0;
@@ -532,9 +632,9 @@ private:
             if (largestRun(row, w, s, e)) row_centers.push_back({(s + e) / 2, y});
         }
         r.coverage = (double)nz / ((double)h * (double)w);
-        if ((int)row_centers.size() < c.min_rows || r.coverage < c.coverage_threshold) {
-            r.valid = false; return r;
-        }
+        if ((int)row_centers.size() < c.min_rows
+            || r.coverage < c.coverage_threshold) { r.valid = false; return r; }
+
         std::vector<int> ys;
         for (auto& p : row_centers) ys.push_back(p.second);
         std::sort(ys.begin(), ys.end());
@@ -560,23 +660,27 @@ private:
         return r;
     }
 
-    double detectAsymmetry(const cv::Mat& m, double maxBias = 45.0, double y0f = 0.18, double y1f = 0.60) {
+    double detectAsymmetry(const cv::Mat& m, double maxBias = 45.0,
+                           double y0f = 0.18, double y1f = 0.60) {
         const int h = m.rows, w = m.cols;
         auto firstLast = [&](int y, int& a, int& b) {
             const uchar* row = m.ptr<uchar>(y);
             int cnt = 0; a = b = -1;
-            for (int x = 0; x < w; x++) if (row[x] > 0) { if (a < 0) a = x; b = x; cnt++; }
+            for (int x = 0; x < w; x++)
+                if (row[x] > 0) { if (a < 0) a = x; b = x; cnt++; }
             return cnt >= 2;
         };
         std::vector<int> bottomCxs;
         for (int y = (int)(h * 0.80); y < h; y += 4) {
-            int a, b; if (firstLast(y, a, b)) bottomCxs.push_back((a + b) / 2);
+            int a, b;
+            if (firstLast(y, a, b)) bottomCxs.push_back((a + b) / 2);
         }
         if (bottomCxs.empty()) return 0.0;
         int refCx = (int)detail::medianInts(bottomCxs);
         std::vector<int> lws, rws;
         for (int y = (int)(h * y0f); y < (int)(h * y1f); y += 4) {
-            int a, b; if (!firstLast(y, a, b)) continue;
+            int a, b;
+            if (!firstLast(y, a, b)) continue;
             int lw = refCx - a, rw = b - refCx;
             if (lw > 0 && rw > 0) { lws.push_back(lw); rws.push_back(rw); }
         }
@@ -587,8 +691,8 @@ private:
         return (rw - lw) / total * maxBias;
     }
 
-    // --- CÁC HÀM TỪ V21 ---
-    std::vector<Opening> detectOpenings(const cv::Mat& mask, const SignState& sign) {
+    std::vector<Opening> detectOpenings(const cv::Mat& mask,
+                                        const SignState& sign) {
         std::vector<Opening> openings;
         if (!sign.active || sign.side == 0) return openings;
         int h = mask.rows, w = mask.cols;
@@ -596,28 +700,35 @@ private:
         for (int y = 0; y < h; ++y) {
             const uchar* row = mask.ptr<uchar>(y);
             int first = -1, last = -1;
-            for (int x = 0; x < w; ++x) if (row[x]) { if (first < 0) first = x; last = x; }
+            for (int x = 0; x < w; ++x)
+                if (row[x]) { if (first < 0) first = x; last = x; }
             if (first >= 0) { xl[y] = first; xr[y] = last; }
         }
         auto xl_s = detail::movingAvg(xl, c_.smooth_win);
         auto xr_s = detail::movingAvg(xr, c_.smooth_win);
-        auto bl = detail::rollingMedian(xl_s, c_.base_win);
-        auto br = detail::rollingMedian(xr_s, c_.base_win);
-        auto findPeaks = [&](const std::vector<float>& dev, const std::vector<float>& edges, const std::vector<float>& base, int side) {
+        auto bl   = detail::rollingMedian(xl_s, c_.base_win);
+        auto br   = detail::rollingMedian(xr_s, c_.base_win);
+
+        auto findPeaks = [&](const std::vector<float>& dev,
+                             const std::vector<float>& edges,
+                             const std::vector<float>& base, int side) {
             bool in_open = false; int y_start = 0;
             for (int y = 0; y < h; ++y) {
                 if (dev[y] < 0) {
                     if (in_open && y - y_start >= c_.min_height) {
                         int y_mid = (y_start + y - 1) / 2;
-                        openings.push_back({side, y_start, y - 1, y_mid, (int)edges[y_mid], (int)base[y_mid]});
+                        openings.push_back({side, y_start, y - 1, y_mid,
+                                            (int)edges[y_mid], (int)base[y_mid]});
                     }
                     in_open = false; continue;
                 }
-                if (dev[y] > c_.open_thresh && !in_open) { in_open = true; y_start = y; }
-                else if (dev[y] <= c_.open_thresh && in_open) {
+                if (dev[y] > c_.open_thresh && !in_open) {
+                    in_open = true; y_start = y;
+                } else if (dev[y] <= c_.open_thresh && in_open) {
                     if (y - y_start >= c_.min_height) {
                         int y_mid = (y_start + y - 1) / 2;
-                        openings.push_back({side, y_start, y - 1, y_mid, (int)edges[y_mid], (int)base[y_mid]});
+                        openings.push_back({side, y_start, y - 1, y_mid,
+                                            (int)edges[y_mid], (int)base[y_mid]});
                     }
                     in_open = false;
                 }
@@ -629,30 +740,40 @@ private:
             if (xr_s[y] >= 0 && br[y] >= 0) dev_r[y] = xr_s[y] - br[y];
         }
         if (sign.side == -1 || sign.side == 2) findPeaks(dev_l, xl_s, bl, -1);
-        if (sign.side == 1  || sign.side == 2) findPeaks(dev_r, xr_s, br, 1);
+        if (sign.side ==  1 || sign.side == 2) findPeaks(dev_r, xr_s, br, +1);
         return openings;
     }
 
-    void updateTurnMemory(const SignState& sign, const std::vector<Opening>& openings) {
+    void updateTurnMemory(const SignState& sign,
+                          const std::vector<Opening>& openings) {
         if (!sign.active) { turn_memory_.active = false; return; }
         if (!openings.empty()) {
             Opening best = openings[0];
-            for (const auto& op : openings) if (op.y_mid > best.y_mid) best = op;
-            turn_memory_.active = true;
-            turn_memory_.side = best.side;
-            turn_memory_.turn_width = std::abs(best.x_extreme - best.x_baseline);
-            turn_memory_.last_y_mid = std::min(turn_memory_.last_y_mid, best.y_mid);
+            for (const auto& op : openings)
+                if (op.y_mid > best.y_mid) best = op;
+            turn_memory_.active     = true;
+            turn_memory_.side       = best.side;
+            turn_memory_.turn_width =
+                std::abs(best.x_extreme - best.x_baseline);
+            // NOTE: std::min preserves upstream V21 behavior. If the ghost
+            // turn fires too early on-car, change to plain assignment
+            // (turn_memory_.last_y_mid = best.y_mid;) so it tracks the most
+            // recent observation instead of the furthest one.
+            turn_memory_.last_y_mid =
+                std::min(turn_memory_.last_y_mid, best.y_mid);
         }
     }
 
-    std::vector<Point> buildPathWithTurn(const std::vector<Point>& centerline, const cv::Mat& mask, const Opening& opening) {
+    std::vector<Point> buildPathWithTurn(const std::vector<Point>& centerline,
+                                         const cv::Mat& mask,
+                                         const Opening& opening) {
         if (centerline.empty()) return centerline;
         int x_turn = (opening.x_extreme + opening.x_baseline) / 2;
         int y_turn_raw = opening.y_mid;
         int idx = 0, min_d = 9999;
         for (size_t i = 0; i < centerline.size(); ++i) {
             int d = std::abs(centerline[i].y - y_turn_raw);
-            if (d < min_d) { min_d = d; idx = i; }
+            if (d < min_d) { min_d = d; idx = (int)i; }
         }
         int x_c = centerline[idx].x, y_c = centerline[idx].y;
         int dist = std::abs(x_turn - x_c);
@@ -660,12 +781,14 @@ private:
         int sign = (x_turn < x_c) ? -1 : 1;
         int d_bez = std::min(dist, c_.corner_radius * 2);
         int A_y = y_c + d_bez, A_idx = idx;
-        for (int i = idx; i >= 0; --i) if (centerline[i].y >= A_y) { A_idx = i; break; }
-        Point A = centerline[A_idx];
-        Point B = {x_c + sign * d_bez, y_c};
+        for (int i = idx; i >= 0; --i)
+            if (centerline[i].y >= A_y) { A_idx = i; break; }
+        Point A    = centerline[A_idx];
+        Point B    = {x_c + sign * d_bez, y_c};
         Point ctrl = {x_c, y_c};
         auto bez = detail::quadraticBezier(A, ctrl, B, 10);
-        std::vector<Point> path(centerline.begin(), centerline.begin() + A_idx + 1);
+        std::vector<Point> path(centerline.begin(),
+                                centerline.begin() + A_idx + 1);
         path.insert(path.end(), bez.begin(), bez.end());
         int step = 5, x_curr = x_turn, y_curr = y_c;
         for (int i = 0; i < c_.extend_len / step; ++i) {
@@ -678,4 +801,4 @@ private:
     }
 };
 
-} // namespace v22
+}  // namespace v21   ← FIXED (was v22)

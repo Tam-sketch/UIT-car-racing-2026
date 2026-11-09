@@ -1,30 +1,31 @@
 // ============================================================
-// main.cpp  (a.k.a. ucrv6)
+// main.cpp  (ucrv5)
 //
-// UCR 2026 — autonomous road following on the Jetson Nano car.
+// UCR 2026 — autonomous road following with sign-triggered
+// quadratic-bezier turns.
 //
 // Pipeline:
-//   Camera (BGR 640×384)
-//     → RoadSegmenter (TwinLiteNet ONNX/TensorRT)
-//     → LaneFollowerV20 (v20 PID) ──┐
-//                                   ├─→ combine → servo/motor
-//   Camera → SignDetector (thread) ─┤
-//     → SignVoter → TurnStateMachine┘
+//   Camera (BGR 640x384)
+//     → RoadSegmenter (TwinLiteNet TensorRT)
+//     → binary mask at model output resolution
+//     → SignDetector (YOLO 416x416, 8-class)  [throttled]
+//     → SignVoter (temporal commit)
+//     → v21::LaneFollower (V20 PID + V21 opening detector +
+//                          quadratic bezier turn path)
+//     → motor / servo commands
 //
-// Turn arming uses the V21 opening-detector + quadratic bezier.
-// Steering during turn follows the bezier lookahead.
-// Fixed 10 Hz control tick, rate-limited handoff between v20 and turn.
+// The control loop ticks at a fixed rate (CONTROL_PERIOD_MS=100).
+// Sign inference runs every SIGN_DETECT_EVERY control ticks.
+// The voter's timeout/activate counters are in control-tick units.
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
 #include "hardware/Servo.h"
-#include "sensor/BNO055.h"
 #include "common/Logger.h"
-#include "control/LaneFollowerV20.h"
-#include "control/TurnStateMachine.h"
+#include "control/LaneFollowerV21.h"
+#include "control/SignVoter.h"
 #include "perception/RoadSegmenter.h"
 #include "perception/SignDetector.h"
-#include "perception/SkeletonTopology.h"
 #include "config/RobotConfig.h"
 
 #include <opencv2/opencv.hpp>
@@ -32,11 +33,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <iostream>
-#include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -47,59 +48,32 @@ volatile std::sig_atomic_t g_stopSignal = 0;
 static void SignalHandler(int) { g_stopSignal = 1; }
 
 // ============================================================
-// SIGN WORKER — runs SignDetector off the control loop.
+// SIGN CLASS → v21::SignState
+//
+// side convention (matches LaneFollowerV21::detectOpenings):
+//   -1 = look left, +1 = look right, 2 = both sides, 0 = disabled
+//
+// active=false disables the whole turn block inside v21::LaneFollower,
+// including the ghost-turn branch. Non-turn classes (parking,
+// roundabout, traffic_light) are detected but not acted on yet.
 // ============================================================
-struct SignWorker {
-    ucr::perception::SignDetector& detector;
-    std::mutex mtx;
-    std::condition_variable cv;
-    cv::Mat latest_frame;
-    std::vector<ucr::perception::SignDetector::Detection> current_detections;
-    bool new_frame_ready = false;
-    bool stop_thread     = false;
-    std::thread thread;
+static v21::SignState MakeSignState(int committed) {
+    v21::SignState s;
+    if (committed < 0) return s;   // default: active=false, side=0, class=-1
 
-    explicit SignWorker(ucr::perception::SignDetector& d) : detector(d) {}
-
-    void Start() { thread = std::thread(&SignWorker::Run, this); }
-
-    void Stop() {
-        { std::lock_guard<std::mutex> lock(mtx); stop_thread = true; }
-        cv.notify_all();
-        if (thread.joinable()) thread.join();
+    using namespace ucr::config::sign_class;
+    s.class_id = committed;
+    switch (committed) {
+        case TURN_LEFT:          s.active = true; s.side = -1; break;
+        case TURN_RIGHT:         s.active = true; s.side = +1; break;
+        case NO_LEFT:            s.active = true; s.side = +1; break; // must go right
+        case NO_RIGHT:           s.active = true; s.side = -1; break; // must go left
+        case CONSTRUCTION_AHEAD: s.active = true; s.side =  2; break; // both sides
+        // PARKING / ROUNDABOUT / TRAFFIC_LIGHT: detect only
+        default:                 s.active = false; s.side = 0; break;
     }
-
-    void PushFrame(const cv::Mat& frame) {
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            latest_frame = frame;
-            new_frame_ready = true;
-        }
-        cv.notify_one();
-    }
-
-    std::vector<ucr::perception::SignDetector::Detection> GetLatest() {
-        std::lock_guard<std::mutex> lock(mtx);
-        return current_detections;
-    }
-
-private:
-    void Run() {
-        while (true) {
-            cv::Mat frame_to_process;
-            {
-                std::unique_lock<std::mutex> lock(mtx);
-                cv.wait(lock, [this] { return new_frame_ready || stop_thread; });
-                if (stop_thread) break;
-                frame_to_process = latest_frame;
-                new_frame_ready = false;
-            }
-            std::vector<ucr::perception::SignDetector::Detection> dets;
-            detector.Detect(frame_to_process, dets);
-            { std::lock_guard<std::mutex> lock(mtx); current_detections = dets; }
-        }
-    }
-};
+    return s;
+}
 
 // ============================================================
 // MAIN
@@ -125,11 +99,7 @@ int main() {
     motor.SetSpeedCms(0.0f);
     servo.SetAngle(0);
 
-    BNO055 imu;
-    imu.initialize();
-    auto last_imu_time = std::chrono::steady_clock::now();
-
-    // --- Perception: road ---
+    // --- Road segmentation ---
     ucr::perception::RoadSegmenter road;
     ucr::perception::RoadSegmenter::Config roadCfg;
     roadCfg.daChannel        = ucr::config::ROAD_DA_CHANNEL;
@@ -139,116 +109,62 @@ int main() {
         return -1;
     }
 
-    // --- Perception: sign ---
-    ucr::perception::SignDetector sign_det;
-    if (!sign_det.Init(ucr::config::SIGN_ENGINE_PATH)) {
-        std::cerr << "Sign model init failed\n";
-        return -1;
+    // --- Sign detector (non-fatal on failure — lane following still works) ---
+    ucr::perception::SignDetector sign;
+    ucr::perception::SignDetector::Config signCfg;
+    signCfg.conf_thresh = ucr::config::SIGN_CONF_THRESH;
+    signCfg.iou_thresh  = ucr::config::SIGN_IOU_THRESH;
+    signCfg.input_size  = ucr::config::SIGN_INPUT_SIZE;
+    bool signReady = sign.Init(ucr::config::SIGN_ENGINE_PATH, signCfg);
+    if (!signReady) {
+        std::cerr << "[Main] Sign detector init failed — turns DISABLED\n";
     }
-    SignWorker sign_worker(sign_det);
-    sign_worker.Start();
 
-    // --- Topo latch ---
-    ucr::perception::TopoLatch topo_latch(ucr::config::TOPO_CONFIRM_FRAMES);
-    ucr::perception::SkeletonConfig topo_cfg;
+    // --- Sign voter ---
+    ucr::control::SignVoter voter(
+        ucr::config::SIGN_VOTER_ACTIVATE_FRAMES,
+        ucr::config::SIGN_VOTER_TIMEOUT_FRAMES);
 
-    // --- Control: v20 PID ---
-    v20::Config cfg;
+    // --- Lane follower (V21 = V20 + opening detector + bezier turn) ---
+    v21::Config cfg;
     cfg.max_speed          = ucr::config::MAX_SPEED_CMS;
     cfg.min_speed          = ucr::config::MIN_SPEED_CMS;
     cfg.curve_scale        = ucr::config::CURVE_SCALE;
     cfg.post_pid_gain      = ucr::config::POST_PID_GAIN;
     cfg.min_rows           = ucr::config::MIN_ROWS;
     cfg.coverage_threshold = ucr::config::COVERAGE_THRESHOLD;
-    v20::LaneFollower follower(cfg);
-
-    // --- Control: turn SM ---
-    ucr::control::TurnConfig turnCfg;
-    turnCfg.force_angle             = ucr::config::FORCE_ANGLE;
-    turnCfg.force_approach_speed    = ucr::config::FORCE_APPROACH_SPEED;
-    turnCfg.force_turning_speed     = ucr::config::FORCE_TURNING_SPEED;
-    turnCfg.force_exit_speed        = ucr::config::FORCE_EXIT_SPEED;
-    turnCfg.force_turn_phase_deg    = ucr::config::FORCE_TURN_PHASE_DEG;
-    turnCfg.force_exit_phase_deg    = ucr::config::FORCE_EXIT_PHASE_DEG;
-    turnCfg.heading_reset_deg       = ucr::config::HEADING_RESET_DEG;
-    turnCfg.reset_debounce_ticks    = ucr::config::RESET_DEBOUNCE_FRAMES;
-    turnCfg.sign_snapshot_hold_ticks= ucr::config::SIGN_SNAPSHOT_HOLD_FRAMES;
-    turnCfg.max_force_ticks         = ucr::config::MAX_FORCE_TICKS;
-    turnCfg.slow_speed              = ucr::config::SLOW_SPEED_CMS;
-    turnCfg.max_speed               = ucr::config::MAX_SPEED_CMS;
-    turnCfg.sign_hold_ticks         = ucr::config::SIGN_HOLD_FRAMES;
-    turnCfg.open_thresh             = ucr::config::OPEN_THRESH;
-    turnCfg.open_min_height         = ucr::config::OPEN_MIN_HEIGHT;
-    turnCfg.open_smooth_win         = ucr::config::OPEN_SMOOTH_WIN;
-    turnCfg.open_base_win           = ucr::config::OPEN_BASE_WIN;
-    turnCfg.turn_opening_proximity  = ucr::config::TURN_OPENING_PROXIMITY;
-    turnCfg.turn_arm_confirm        = ucr::config::TURN_ARM_CONFIRM;
-    turnCfg.bezier_corner_radius    = ucr::config::BEZIER_CORNER_RADIUS;
-    turnCfg.bezier_min_turn_dist    = ucr::config::BEZIER_MIN_TURN_DIST;
-    turnCfg.bezier_extend_len       = ucr::config::BEZIER_EXTEND_LEN;
-    turnCfg.bezier_lookahead_frac   = ucr::config::BEZIER_LOOKAHEAD_FRAC;
-    turnCfg.bezier_steer_gain       = ucr::config::BEZIER_STEER_GAIN;
-    turnCfg.idx_construction_ahead  = ucr::config::sign_class::CONSTRUCTION_AHEAD;
-    turnCfg.idx_no_left             = ucr::config::sign_class::NO_LEFT;
-    turnCfg.idx_no_right            = ucr::config::sign_class::NO_RIGHT;
-    turnCfg.idx_parking             = ucr::config::sign_class::PARKING;
-    turnCfg.idx_roundabout          = ucr::config::sign_class::ROUNDABOUT;
-    turnCfg.idx_traffic_light       = ucr::config::sign_class::TRAFFIC_LIGHT;
-    turnCfg.idx_turn_left           = ucr::config::sign_class::TURN_LEFT;
-    turnCfg.idx_turn_right          = ucr::config::sign_class::TURN_RIGHT;
-
-    ucr::control::TurnStateMachine turn_sm(
-        turnCfg,
-        ucr::config::SIGN_VOTER_ACTIVATE_FRAMES,
-        ucr::config::SIGN_VOTER_TIMEOUT_FRAMES);
+    v21::LaneFollower follower(cfg);
 
     // --- Runtime state ---
     cv::Mat frame, small_mask;
-    v20::LaneFollower::Output out;
-    ucr::control::TurnStateMachine::Output turn_out;
+    v21::LaneFollower::Output out;
+    using SignDetection = ucr::perception::SignDetector::Detection;
+    std::vector<SignDetection> lastDets;   // retained for UI drawing
 
     double fps = 0.0;
     int    frameCount = 0;
     auto   tPrev = std::chrono::high_resolution_clock::now();
 
-    auto  next_control     = std::chrono::steady_clock::now();
-    auto  last_loop_time   = std::chrono::steady_clock::now();
-    float applied_speed    = 0.0f;
-    float last_pid_angle   = 0.0f;   // for rate-limited handoff
-    uint32_t ctrl_tick     = 0;
-    float last_heading     = 0.0f;
+    auto    next_control  = std::chrono::steady_clock::now();
+    float   applied_speed = 0.0f;
+    uint32_t tickIdx      = 0;
 
-    std::cout << "\n=== UCR2026: Auto Run (v20 + opening/bezier turn) ===\n"
-              << "Road engine: " << ucr::config::ROAD_ENGINE_PATH << "\n"
-              << "Sign engine: " << ucr::config::SIGN_ENGINE_PATH << "\n"
-              << "Control period: " << ucr::config::CONTROL_PERIOD_MS << " ms\n"
+    std::cout << "\n=== UCR2026: Auto Run (turns="
+              << (signReady ? "yes" : "no") << ") ===\n"
+              << "Road engine: " << ucr::config::ROAD_ENGINE_PATH << "\n";
+    if (signReady)
+        std::cout << "Sign engine: " << ucr::config::SIGN_ENGINE_PATH << "\n";
+    std::cout << "Control period: " << ucr::config::CONTROL_PERIOD_MS << " ms\n"
+              << "Sign detect every " << ucr::config::SIGN_DETECT_EVERY
+              << " ticks\n"
               << "Press 'q' to quit\n\n";
 
+    // =========================================================
+    // MAIN LOOP
+    // =========================================================
     while (!g_stopSignal) {
-        const auto loop_now = std::chrono::steady_clock::now();
-        const double loop_dt =
-            std::chrono::duration<double>(loop_now - last_loop_time).count();
-        last_loop_time = loop_now;
-
-        // Watchdog: if the loop is running too slowly, stop safely.
-        if (loop_dt > 0.30) {
-            std::cerr << "\n[WATCHDOG] loop_dt = " << loop_dt
-                      << "s. EMERGENCY STOP.\n";
-            motor.SetSpeedCms(0.0f);
-            servo.SetAngle(0);
-            applied_speed = 0.0f;
-            next_control  = std::chrono::steady_clock::now();
-            continue;
-        }
-
-        if (loop_now < next_control) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-        next_control += std::chrono::milliseconds(ucr::config::CONTROL_PERIOD_MS);
-        ++ctrl_tick;
-
         camera.GetFrame(frame);
+
         if (frame.empty()) {
             motor.SetSpeedCms(0.0f);
             servo.SetAngle(0);
@@ -257,184 +173,201 @@ int main() {
             continue;
         }
 
-        // --- IMU heading (best effort) ---
-        {
-            BNO055::Data imu_data;
-            if (imu.read(imu_data)) {
-                const auto now_i = std::chrono::steady_clock::now();
-                const double dt_i =
-                    std::chrono::duration<double>(now_i - last_imu_time).count();
-                last_imu_time = now_i;
-                imu.integrateYawRate(dt_i);
-                last_heading = static_cast<float>(imu.relativeYawDeg());
-            }
-        }
-        const float heading = last_heading;
-
-        // --- Road inference ---
         const bool inferOK = road.Predict(frame, small_mask);
         const auto now     = std::chrono::steady_clock::now();
+
         if (!inferOK) {
             motor.SetSpeedCms(0.0f);
             servo.SetAngle(0);
             follower.resetTracking();
-            turn_sm.Reset();
             applied_speed = 0.0f;
-            last_pid_angle = 0.0f;
-            continue;
         }
+        else if (now >= next_control) {
+            // -------------------------------------------------
+            // 1. Sign detection (throttled)
+            // -------------------------------------------------
+            if (signReady && (tickIdx % ucr::config::SIGN_DETECT_EVERY) == 0) {
+                sign.Detect(frame, lastDets);
 
-        // --- Push frame to sign worker ---
-        sign_worker.PushFrame(frame);
-        const auto dets = sign_worker.GetLatest();
+                std::vector<int> classIds;
+                classIds.reserve(lastDets.size());
+                for (auto& d : lastDets) {
+                    if (d.confidence >= ucr::config::SIGN_CONF_THRESH)
+                        classIds.push_back(d.class_id);
+                }
+                voter.Update(classIds, tickIdx);
+            }
 
-        // --- Sign detect + topo, every SIGN_DETECT_EVERY ticks ---
-        if ((ctrl_tick % ucr::config::SIGN_DETECT_EVERY) == 0) {
-            std::vector<int> class_ids;
-            class_ids.reserve(dets.size());
-            for (const auto& d : dets) class_ids.push_back(d.class_id);
-            turn_sm.UpdateVoter(class_ids, ctrl_tick);
+            // -------------------------------------------------
+            // 2. Build the SignState from the voter's committed class
+            // -------------------------------------------------
+            v21::SignState signState = MakeSignState(voter.GetCommitted());
 
-            ucr::perception::TopoResult raw_topo =
-                ucr::perception::ComputeTopology(small_mask, topo_cfg);
-            turn_sm.SetTopo(topo_latch.Update(raw_topo));
+            // -------------------------------------------------
+            // 3. Control tick — v21::LaneFollower does the rest:
+            //    • v20 PID for straight/curve
+            //    • detectOpenings on the sign's side when active
+            //    • buildPathWithTurn → quadratic bezier on turn
+            //    • lookahead-based final_error during turn
+            // -------------------------------------------------
+            out = follower.step(small_mask, signState);
+
+            // -------------------------------------------------
+            // 4. Steering: PID (+ = right) → real-angle (+ = left)
+            //    → bound → servo cmd via calibration
+            // -------------------------------------------------
+            float desired_real_left = -static_cast<float>(out.angle);
+            desired_real_left = std::clamp(desired_real_left,
+                                           -ucr::config::MAX_REAL_ANGLE_DEG,
+                                            ucr::config::MAX_REAL_ANGLE_DEG);
+
+            float servo_cmd = ucr::config::RealAngleToServo(desired_real_left);
+            servo_cmd = std::clamp(servo_cmd,
+                                   -static_cast<float>(ucr::config::MAX_SERVO_CMD),
+                                    static_cast<float>(ucr::config::MAX_SERVO_CMD));
+
+            const int final_angle = static_cast<int>(std::lround(servo_cmd));
+
+            // -------------------------------------------------
+            // 5. Speed (soft-start + lost-mask creep)
+            // -------------------------------------------------
+            float speed = static_cast<float>(out.speed);
+            if (!out.valid && out.coverage > 0.02) {
+                speed = ucr::config::MIN_SPEED_CMS;
+            }
+
+            const float max_delta = ucr::config::MAX_ACCEL_CMS2 *
+                                    (ucr::config::CONTROL_PERIOD_MS / 1000.0f);
+            if (speed > applied_speed)
+                applied_speed = std::min(speed, applied_speed + max_delta);
+            else
+                applied_speed = speed;
+
+            motor.SetSpeedCms(applied_speed);
+            servo.SetAngle(final_angle);
+
+            // -------------------------------------------------
+            // 6. Advance tick
+            // -------------------------------------------------
+            ++tickIdx;
+            next_control += std::chrono::milliseconds(ucr::config::CONTROL_PERIOD_MS);
+            if (now - next_control > std::chrono::seconds(1)) {
+                next_control = now +
+                    std::chrono::milliseconds(ucr::config::CONTROL_PERIOD_MS);
+            }
+
+            // -------------------------------------------------
+            // 7. Periodic debug log (1 Hz)
+            // -------------------------------------------------
+            static auto lastLog = std::chrono::steady_clock::now();
+            if (now - lastLog >= std::chrono::seconds(1)) {
+                std::printf(
+                    "[t=%u] sign=%-11s(%d) state=%-20s "
+                    "valid=%d near=%6.1f far=%6.1f eff=%6.1f cov=%.3f "
+                    "spd=%.1f pid=%.1f out=%.1f\n",
+                    tickIdx,
+                    ucr::config::SignClassName(voter.GetCommitted()),
+                    voter.GetCommitted(),
+                    out.state_str.c_str(),
+                    static_cast<int>(out.valid),
+                    out.near_e, out.far_e, out.eff_error, out.coverage,
+                    applied_speed, out.angle_pre_gain, out.angle);
+                lastLog = now;
+            }
         }
-
-        // --- v20 lane following ---
-        out = follower.step(small_mask);
-
-        // --- Turn state machine ---
-        turn_out = turn_sm.Update(ctrl_tick, heading, small_mask, out.centerline_pts);
-
-        // --- Combine angle + speed ---
-        float target_pid_angle = turn_out.in_force_turn
-                               ? turn_out.force_angle_deg
-                               : (float)out.angle;
-
-        // Rate-limited handoff
-        {
-            float delta = target_pid_angle - last_pid_angle;
-            delta = std::clamp(delta,
-                               -ucr::config::PID_RATE_LIMIT_DEG,
-                               +ucr::config::PID_RATE_LIMIT_DEG);
-            last_pid_angle += delta;
-        }
-        const float final_angle_pid = last_pid_angle;
-
-        float target_speed;
-        if (turn_out.in_force_turn) {
-            target_speed = turn_out.force_speed_cms;
-        } else {
-            target_speed = std::min((float)out.speed, turn_out.max_speed_cap_cms);
-        }
-        // Lost-mask creep
-        if (!out.valid && out.coverage > 0.02f && !turn_out.in_force_turn) {
-            target_speed = ucr::config::MIN_SPEED_CMS;
-        }
-
-        // --- Servo command via calibration ---
-        float desired_real_left = -final_angle_pid;
-        desired_real_left = std::clamp(desired_real_left,
-                                        -ucr::config::MAX_REAL_ANGLE_DEG,
-                                        +ucr::config::MAX_REAL_ANGLE_DEG);
-        float servo_cmd = ucr::config::RealAngleToServo(desired_real_left);
-        servo_cmd = std::clamp(servo_cmd,
-                                -(float)ucr::config::MAX_SERVO_CMD,
-                                +(float)ucr::config::MAX_SERVO_CMD);
-        const int final_servo = (int)std::lround(servo_cmd);
-
-        // --- Soft-start ramp ---
-        const float max_delta = ucr::config::MAX_ACCEL_CMS2 *
-                                (ucr::config::CONTROL_PERIOD_MS / 1000.0f);
-        if (target_speed > applied_speed) {
-            applied_speed = std::min(target_speed, applied_speed + max_delta);
-        } else {
-            applied_speed = target_speed;
-        }
-
-        motor.SetSpeedCms(applied_speed);
-        servo.SetAngle(final_servo);
 
         // --- FPS ---
         ++frameCount;
-        const auto tNow = std::chrono::high_resolution_clock::now();
-        const double dt = std::chrono::duration<double>(tNow - tPrev).count();
+        auto tNow = std::chrono::high_resolution_clock::now();
+        double dt = std::chrono::duration<double>(tNow - tPrev).count();
         if (dt > 0.5) {
             fps = frameCount / dt;
             frameCount = 0;
             tPrev = tNow;
         }
 
-        // --- UI ---
+        // =====================================================
+        // UI
+        // =====================================================
         if (ucr::config::SHOW_UI) {
             cv::Mat overlay = frame.clone();
 
-            // Mask overlay
-            cv::Mat ui_mask;
-            cv::resize(small_mask, ui_mask, frame.size(), 0, 0, cv::INTER_NEAREST);
-            cv::Mat green(frame.size(), frame.type(), cv::Scalar(0, 255, 0));
-            cv::Mat blended;
-            cv::addWeighted(frame, 0.6, green, 0.4, 0, blended);
-            blended.copyTo(overlay, ui_mask);
+            if (inferOK) {
+                // Mask overlay
+                cv::Mat ui_mask;
+                cv::resize(small_mask, ui_mask, frame.size(), 0, 0, cv::INTER_NEAREST);
+                cv::Mat green(frame.size(), frame.type(), cv::Scalar(0, 255, 0));
+                cv::Mat blended;
+                cv::addWeighted(frame, 0.6, green, 0.4, 0, blended);
+                blended.copyTo(overlay, ui_mask);
 
-            // Centerline (from v20)
-            if (!out.centerline_pts.empty() &&
-                out.proc_width > 0 && out.proc_height > 0) {
-                const float sx = (float)frame.cols / (float)out.proc_width;
-                const float sy = (float)frame.rows / (float)out.proc_height;
-                std::vector<cv::Point> pts;
-                pts.reserve(out.centerline_pts.size());
-                for (const auto& p : out.centerline_pts) {
-                    pts.emplace_back((int)(p.first * sx), (int)(p.second * sy));
-                }
-                for (size_t i = 0; i + 1 < pts.size(); ++i) {
-                    cv::line(overlay, pts[i], pts[i + 1],
-                             cv::Scalar(0, 0, 255), 2);
+                // Path overlay: final_path is the centerline, or the
+                // bezier turn path when v21::LaneFollower is turning.
+                if (!out.final_path.empty() &&
+                    out.proc_width > 0 && out.proc_height > 0) {
+                    const float sx = float(frame.cols) / out.proc_width;
+                    const float sy = float(frame.rows) / out.proc_height;
+
+                    std::vector<cv::Point> pts;
+                    pts.reserve(out.final_path.size());
+                    for (const auto& p : out.final_path)
+                        pts.emplace_back(int(p.x * sx), int(p.y * sy));
+
+                    cv::Scalar color(0, 0, 255);                     // red = centerline
+                    if (out.state_str.find("TURN") != std::string::npos)
+                        color = cv::Scalar(255, 0, 255);             // magenta = bezier turn
+                    if (out.state_str.find("GHOST") != std::string::npos)
+                        color = cv::Scalar(0, 255, 255);             // yellow  = ghost turn
+
+                    for (size_t i = 0; i + 1 < pts.size(); ++i)
+                        cv::line(overlay, pts[i], pts[i + 1], color, 2);
+                    if (!pts.empty()) {
+                        cv::circle(overlay, pts.front(), 4, cv::Scalar(255, 0, 0), -1);
+                        cv::circle(overlay, pts.back(),  4, cv::Scalar(0, 255, 255), -1);
+                    }
                 }
             }
 
-            // Sign boxes
-            for (const auto& det : dets) {
-                cv::rectangle(overlay, det.bbox, cv::Scalar(0, 255, 255), 2);
-                cv::putText(overlay,
-                    ucr::config::SignClassName(det.class_id),
-                    cv::Point((int)det.bbox.x, (int)det.bbox.y - 5),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                    cv::Scalar(0, 255, 255), 1);
+            // Sign detections
+            for (const auto& d : lastDets) {
+                cv::rectangle(overlay, cv::Rect(d.bbox), cv::Scalar(0, 255, 255), 2);
+                char label[64];
+                std::snprintf(label, sizeof(label), "%s %.2f",
+                              ucr::config::SignClassName(d.class_id), d.confidence);
+                cv::putText(overlay, label,
+                            {int(d.bbox.x), std::max(12, int(d.bbox.y) - 5)},
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                            cv::Scalar(0, 255, 255), 1);
             }
 
-            char text[256];
-            std::snprintf(text, sizeof(text),
-                "FPS %.1f | spd %.1f/%.1f | PID %.1f | srv %d | kf %.2f%s%s",
-                fps, applied_speed, target_speed,
-                out.angle_pre_gain, final_servo, out.kept_frac,
-                (!out.valid && inferOK) ? " INV" : "",
-                turn_out.in_force_turn ? " TURN" : "");
-            cv::putText(overlay, text, {10, 30},
+            // HUD
+            char text1[192], text2[192];
+            std::snprintf(text1, sizeof(text1),
+                "FPS %.1f | spd %.1f/%.1f | PID %.1f | out %d | kf %.2f%s",
+                fps, applied_speed, out.speed, out.angle_pre_gain,
+                static_cast<int>(std::lround(out.angle)), out.kept_frac,
+                (!out.valid && inferOK) ? " INV" : "");
+            std::snprintf(text2, sizeof(text2),
+                "sign %s | %s | near %.1f far %.1f cov %.3f",
+                ucr::config::SignClassName(voter.GetCommitted()),
+                out.state_str.c_str(),
+                out.near_e, out.far_e, out.coverage);
+
+            cv::putText(overlay, text1, {10, 30},
                         cv::FONT_HERSHEY_SIMPLEX, 0.55,
                         cv::Scalar(0, 255, 0), 2);
-
-            char line2[256];
-            std::snprintf(line2, sizeof(line2),
-                "sign=%s | phase=%s | dH %.1f | openings=%d | y_mid=%d",
-                ucr::config::SignClassName(turn_out.sign_id),
-                turn_out.phase,
-                turn_out.d_heading,
-                turn_out.n_openings,
-                turn_out.chosen_y_mid);
-            cv::putText(overlay, line2, {10, 58},
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                        cv::Scalar(0, 200, 255), 1);
+            cv::putText(overlay, text2, {10, 55},
+                        cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                        cv::Scalar(0, 255, 0), 2);
 
             cv::imshow("Lane Follower", overlay);
             const int key = cv::waitKey(1) & 0xFF;
             if (key == 27 || key == 'q') break;
         } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 
-    sign_worker.Stop();
     motor.SetSpeedCms(0.0f);
     servo.SetAngle(0);
     if (ucr::config::SHOW_UI) cv::destroyAllWindows();
