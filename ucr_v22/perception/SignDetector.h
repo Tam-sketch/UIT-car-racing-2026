@@ -37,7 +37,6 @@ public:
         
         int d1 = outB.dims.d[1];
         int d2 = outB.dims.d[2];
-
         if (d1 < d2) { numChannels_ = d1; numAnchors_ = d2; strideC_ = numAnchors_; strideA_ = 1; }
         else         { numChannels_ = d2; numAnchors_ = d1; strideC_ = 1; strideA_ = numChannels_; }
 
@@ -53,7 +52,6 @@ public:
         detections.clear();
         if (!session_.IsReady() || bgrFrame.empty()) return false;
 
-        // Letterbox
         float r = std::min(static_cast<float>(inW_) / bgrFrame.cols, static_cast<float>(inH_) / bgrFrame.rows);
         int new_unpad_w = static_cast<int>(bgrFrame.cols * r);
         int new_unpad_h = static_cast<int>(bgrFrame.rows * r);
@@ -118,7 +116,7 @@ public:
 
         for (int idx : indices) {
             int cls = class_ids[idx];
-            if (cls == 0) cls = 6; // Map construction_ahead -> turn_left
+            if (cls == 0) cls = 6; // construction_ahead -> turn_left
             detections.push_back({cls, confidences[idx], boxes[idx]});
         }
         return true;
