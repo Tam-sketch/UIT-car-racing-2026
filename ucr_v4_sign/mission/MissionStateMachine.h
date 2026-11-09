@@ -1,10 +1,10 @@
 #pragma once
 #include "control/LaneFollowerV20.h"
-#include "control/SignVoter.h"
 #include "control/TurnController.h"
 #include "perception/SignDetector.h"
 #include "config/RobotConfig.h"
 #include <opencv2/opencv.hpp>
+#include <vector>
 
 namespace ucr {
 namespace mission {
@@ -21,35 +21,38 @@ public:
         float angle; 
     };
 
-    // Constructor nhận Config của LaneFollower để truyền post_pid_gain = 1.0
-    explicit MissionStateMachine(const v20::Config& lane_cfg = v20::Config())
-        : lane_follower_(lane_cfg) {}
-
     Command Update(const cv::Mat& mask, 
                    const std::vector<perception::Detection>& signs,
                    float heading, int frame_idx) {
         
-        std::vector<int> cls_ids;
-        for (const auto& d : signs) cls_ids.push_back(d.class_id);
-        voter_.Update(cls_ids, frame_idx);
+        // 1. Tìm biển báo có độ tin cậy cao nhất trong frame hiện tại
+        int commit = -1;
+        float max_conf = 0.0f;
+        for (const auto& d : signs) {
+            if (d.confidence > max_conf) {
+                max_conf = d.confidence;
+                commit = d.class_id;
+            }
+        }
 
-        int commit = voter_.Committed();
-
+        // 2. Nếu đang trong quá trình rẽ cưỡng bức (FORCE_TURN)
         if (state_ == State::FORCE_TURN) {
             auto out = turn_ctrl_.Step(heading);
             if (out.done) {
                 state_ = State::LANE_FOLLOW;
-                voter_.ClearCommitted();
-                lane_follower_.softReset(); // Đã có hàm này nhờ patch ở trên
+                lane_follower_.softReset();
                 auto fo = lane_follower_.step(mask);
                 return {fo.speed, fo.angle};
             }
             return {out.speed, out.angle};
         }
 
+        // 3. Nếu đang bám làn (LANE_FOLLOW), kiểm tra xem có biển báo nào không
         if (commit != -1) {
             int dir = DecideForceDir(commit);
             if (dir != 0 && CheckTurnCondition(mask)) {
+                std::cout << "[Mission] Kich hoat FORCE_TURN (Class ID: " 
+                          << commit << ", Conf: " << max_conf << ")\n";
                 state_ = State::FORCE_TURN;
                 turn_ctrl_.Start(dir, heading);
                 lane_follower_.resetTracking();
@@ -58,6 +61,7 @@ public:
             }
         }
 
+        // 4. Mặc định: Bám làn bằng PID
         auto fo = lane_follower_.step(mask);
         return {fo.speed, fo.angle};
     }
@@ -86,9 +90,8 @@ private:
     }
 
     State state_ = State::LANE_FOLLOW;
-    control::SignVoter      voter_;
     control::TurnController turn_ctrl_;
-    v20::LaneFollower       lane_follower_; // Sửa thành v20::
+    v20::LaneFollower       lane_follower_;
 };
 
 } // namespace mission
