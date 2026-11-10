@@ -28,8 +28,8 @@ inline constexpr char SIGN_ENGINE_PATH[] =
 // --------------------------------------------------------
 // Hardware limits
 // --------------------------------------------------------
-inline constexpr float MAX_SPEED_CMS = 20.0f;
-inline constexpr float MIN_SPEED_CMS = 10.0f;
+inline constexpr float MAX_SPEED_CMS = 30.0f;
+inline constexpr float MIN_SPEED_CMS = 20.0f;
 
 // --------------------------------------------------------
 // Servo calibration (measured empirically, Log 12)
@@ -98,7 +98,7 @@ inline constexpr bool SHOW_UI = true;
 // --------------------------------------------------------
 // Sign model
 // --------------------------------------------------------
-inline constexpr float SIGN_CONF_THRESH = 0.5f;
+inline constexpr float SIGN_CONF_THRESH = 0.7f;
 inline constexpr float SIGN_IOU_THRESH  = 0.45f;
 inline constexpr int   SIGN_INPUT_SIZE  = 416;
 

@@ -89,7 +89,7 @@ struct Config {
     int smooth_win     = 5;
     int base_win       = 50;
     int pull_back      = 3;
-    int corner_radius  = 40;
+    int corner_radius  = 15;
     int min_turn_dist  = 4;
     int extend_len     = 80;
 
@@ -112,6 +112,7 @@ struct Config {
     double turn_lookahead_y_ratio = 0.30;   // far band  (keep)
     double turn_near_y_ratio      = 0.85;   // near band (add)
 
+    double turn_far_weight    = 0.85;   // 0.5 = V20-equivalent blend; 1.0 = pure bezier
     // Blend from V20 near-band error to bezier far-weighted error
     // over this many control ticks at the start of every turn.
     int    turn_ramp_ticks    = 8;     // 0.8 s @ 10 Hz
