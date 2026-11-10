@@ -109,7 +109,7 @@ struct Config {
     // Lookahead for the bezier turn. 0.30 = 30% down from top of mask
     // (upper-middle). Lower = further ahead / more aggressive turn.
     // 0.20 = aggressive, 0.30 = moderate, 0.45 = conservative.
-    double turn_lookahead_y_ratio = 0.30;
+    double turn_lookahead_y_ratio = 0.5;
 };
 
 // ============================================================
@@ -874,10 +874,34 @@ private:
         int dist = std::abs(x_turn - x_c);
         if (dist < c_.min_turn_dist) return centerline;
         int sign = (x_turn < x_c) ? -1 : 1;
-        int d_bez = std::min(dist, c_.corner_radius * 2);
+
+        // Available vertical room below ctrl on the centerline.
+        const int y_bottom_max = centerline.front().y;
+        const int max_room     = y_bottom_max - y_c;
+        const int MIN_BEZ_DEPTH = 10;   // need this many rows below ctrl for a real curve
+
+        if (max_room < MIN_BEZ_DEPTH) {
+            // Opening too near the bottom of the mask — not enough room to start
+            // the bezier below ctrl. Fall back to a diagonal extension toward
+            // the turn direction. Next tick the car advances, opening moves up,
+            // and the bezier can run for real.
+            std::vector<Point> path(centerline.begin(), centerline.begin() + idx + 1);
+            for (int step = 5; step <= c_.extend_len; step += 5) {
+                int y_curr = y_c - step;
+                int x_curr = x_c + sign * step;
+                if (y_curr < 0 || x_curr < 0 || x_curr >= mask.cols) break;
+                if (mask.at<uchar>(y_curr, x_curr) == 0) break;
+                path.push_back({x_curr, y_curr});
+            }
+            return path;
+        }
+
+        int d_bez = std::min({dist, c_.corner_radius * 2, max_room});
         int A_y = y_c + d_bez, A_idx = idx;
         for (int i = idx; i >= 0; --i)
             if (centerline[i].y >= A_y) { A_idx = i; break; }
+        // Defensive: should never trigger now, but keeps the guarantee explicit.
+        if (A_idx >= idx) return centerline;
         Point A    = centerline[A_idx];
         Point B    = {x_c + sign * d_bez, y_c};
         Point ctrl = {x_c, y_c};
