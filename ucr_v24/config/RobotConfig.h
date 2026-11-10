@@ -136,7 +136,7 @@ inline constexpr int OPEN_BASE_WIN    = 50;
 // --------------------------------------------------------
 // Bezier path
 // --------------------------------------------------------
-inline constexpr int BEZIER_CORNER_RADIUS  = 20;
+inline constexpr int BEZIER_CORNER_RADIUS  = 40;
 inline constexpr int BEZIER_MIN_TURN_DIST  = 4;
 inline constexpr int BEZIER_EXTEND_LEN     = 80;
 

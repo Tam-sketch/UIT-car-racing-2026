@@ -89,7 +89,7 @@ struct Config {
     int smooth_win     = 5;
     int base_win       = 50;
     int pull_back      = 3;
-    int corner_radius  = 40;
+    int corner_radius  = 15;
     int min_turn_dist  = 4;
     int extend_len     = 80;
 
@@ -111,6 +111,13 @@ struct Config {
     // 0.20 = aggressive, 0.30 = moderate, 0.45 = conservative.
     double turn_lookahead_y_ratio = 0.30;   // far band  (keep)
     double turn_near_y_ratio      = 0.85;   // near band (add)
+
+    double turn_far_weight    = 0.85;   // 0.5 = V20-equivalent blend; 1.0 = pure bezier
+    // Blend from V20 near-band error to bezier far-weighted error
+    // over this many control ticks at the start of every turn.
+    int    turn_ramp_ticks    = 8;     // 0.8 s @ 10 Hz
+    // Hard cap on |final_error| during turn mode (px).
+    double turn_error_cap     = 60.0;
 };
 
 // ============================================================
@@ -646,7 +653,21 @@ public:
             const double far_e_path  = pathXAtY(far_y);
             const double lead_path   = 0.5 * (far_e_path - near_e_path);
 
-            final_error = near_e_path + lead_path;
+            const double bezier_error =
+                near_e_path + c_.turn_far_weight * (far_e_path - near_e_path);
+
+            const double ramp = std::min(1.0,
+                static_cast<double>(turn_tick_) / c_.turn_ramp_ticks);
+
+            // Turn mode = bezier authority. Do NOT blend with eff_error_v20 —
+            // V20's error can point opposite the bezier if the car was off-center
+            // at commit (common for a right-turn approach where the car is on the
+            // right side of the road). Ramp handles "too much too soon"; bezier
+            // handles direction.
+            final_error = std::clamp(ramp * bezier_error,
+                                    -c_.turn_error_cap,
+                                    +c_.turn_error_cap);
+
             speed_ = c_.min_speed + 3.0;
         } else {
             double target_speed = detail::planSpeed(
