@@ -109,7 +109,8 @@ struct Config {
     // Lookahead for the bezier turn. 0.30 = 30% down from top of mask
     // (upper-middle). Lower = further ahead / more aggressive turn.
     // 0.20 = aggressive, 0.30 = moderate, 0.45 = conservative.
-    double turn_lookahead_y_ratio = 0.5;
+    double turn_lookahead_y_ratio = 0.30;   // far band  (keep)
+    double turn_near_y_ratio      = 0.85;   // near band (add)
 };
 
 // ============================================================
@@ -638,9 +639,8 @@ public:
                 return best_x - cleanMask.cols / 2.0;
             };
 
-            const int near_y = (int)(cleanMask.rows * 0.85);   // near band  (~y=156)
-            const int far_y  = (int)(cleanMask.rows *
-                                    c_.turn_lookahead_y_ratio); // far band (~y=55)
+            const int near_y = (int)(cleanMask.rows * c_.turn_near_y_ratio);
+            const int far_y  = (int)(cleanMask.rows * c_.turn_lookahead_y_ratio);
 
             const double near_e_path = pathXAtY(near_y);
             const double far_e_path  = pathXAtY(far_y);
