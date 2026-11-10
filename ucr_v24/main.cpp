@@ -12,6 +12,7 @@
 #include "config/RobotConfig.h"
 
 #include <opencv2/opencv.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -26,27 +27,28 @@
 volatile std::sig_atomic_t g_stopSignal = 0;
 static void SignalHandler(int) { g_stopSignal = 1; }
 
-// --------------------------------------------------------
-// Sign class → v21::SignState
-// --------------------------------------------------------
+// ============================================================
+// Sign class → v21::SignState (UNCHANGED — đúng luật GT)
+// ============================================================
 static v21::SignState MakeSignState(int committed) {
     v21::SignState s;
     if (committed < 0) return s;
+
     using namespace ucr::config::sign_class;
     s.class_id = committed;
     switch (committed) {
-        case TURN_LEFT:  s.active = true; s.side = -1; break;
-        case TURN_RIGHT: s.active = true; s.side = +1; break;
-        case NO_LEFT:    s.active = true; s.side = +1; break;
-        case NO_RIGHT:   s.active = true; s.side = -1; break;
+        case TURN_LEFT:  s.active = true; s.side = -1; break;  // trái
+        case TURN_RIGHT: s.active = true; s.side = +1; break;  // phải
+        case NO_LEFT:    s.active = true; s.side = +1; break;  // CẤM trái → phải
+        case NO_RIGHT:   s.active = true; s.side = -1; break;  // CẤM phải → trái
         default:         s.active = false; s.side = 0; break;
     }
     return s;
 }
 
-// --------------------------------------------------------
-// Traffic light HSV classifier (V6.1: optimized with cv::inRange)
-// --------------------------------------------------------
+// ============================================================
+// Traffic light classifier (V6.1: cv::inRange — 5-10× faster)
+// ============================================================
 enum class LightColor { NONE, RED, YELLOW, GREEN };
 
 static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect2f& bbox) {
@@ -65,7 +67,6 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect2f& bbo
     cv::Mat hsv;
     cv::cvtColor(bgr(cv::Rect(x1, y1, x2 - x1, y2 - y1)), hsv, cv::COLOR_BGR2HSV);
 
-    // Red has two H ranges (0-10 and 170-180)
     cv::Mat maskRed1, maskRed2, maskRed;
     cv::inRange(hsv, cv::Scalar(RED_H1_LO, S_MIN, V_MIN),
                      cv::Scalar(RED_H1_HI, 255, 255), maskRed1);
@@ -97,7 +98,6 @@ int main() {
     std::signal(SIGINT,  SignalHandler);
     std::signal(SIGTERM, SignalHandler);
 
-    // --- Hardware ---
     Camera camera;
     if (!camera.Init()) { std::cerr << "Camera init failed\n"; return -1; }
 
@@ -107,14 +107,11 @@ int main() {
 
     Servo servo;
     if (!servo.Init() || !servo.SetPWMFreq(50)) {
-        std::cerr << "Servo init failed\n";
-        motor.SetSpeedCms(0.0f);
-        return -1;
+        std::cerr << "Servo init failed\n"; motor.SetSpeedCms(0.0f); return -1;
     }
     motor.SetSpeedCms(0.0f);
     servo.SetAngle(0);
 
-    // --- Road ---
     ucr::perception::RoadSegmenter road;
     ucr::perception::RoadSegmenter::Config roadCfg;
     roadCfg.daChannel        = ucr::config::ROAD_DA_CHANNEL;
@@ -123,7 +120,6 @@ int main() {
         std::cerr << "Road model init failed\n"; return -1;
     }
 
-    // --- Signs ---
     ucr::perception::SignDetector sign;
     ucr::perception::SignDetector::Config signCfg;
     signCfg.conf_thresh = ucr::config::SIGN_CONF_THRESH;
@@ -136,7 +132,6 @@ int main() {
         ucr::config::SIGN_VOTER_ACTIVATE_FRAMES,
         ucr::config::SIGN_VOTER_TIMEOUT_FRAMES);
 
-    // --- Lane follower ---
     v21::Config cfg;
     cfg.max_speed          = ucr::config::MAX_SPEED_CMS;
     cfg.min_speed          = ucr::config::MIN_SPEED_CMS;
@@ -160,7 +155,6 @@ int main() {
     cfg.turn_complete_deg      = ucr::config::TURN_COMPLETE_DEG;
     v21::LaneFollower follower(cfg);
 
-    // --- State ---
     cv::Mat frame, small_mask;
     v21::LaneFollower::Output out;
     using SignDetection = ucr::perception::SignDetector::Detection;
@@ -184,9 +178,6 @@ int main() {
     std::cout << "Control: " << ucr::config::CONTROL_PERIOD_MS << " ms\n"
               << "Press 'q' to quit\n\n";
 
-    // =========================================================
-    // MAIN LOOP
-    // =========================================================
     while (!g_stopSignal) {
         camera.GetFrame(frame);
 
@@ -208,7 +199,6 @@ int main() {
             applied_speed = 0.0f;
         }
         else if (now >= next_control) {
-            // ---- 1. Sign detection ----
             if (signReady && (tickIdx % ucr::config::SIGN_DETECT_EVERY) == 0) {
                 sign.Detect(frame, lastDets);
 
@@ -218,24 +208,21 @@ int main() {
                 for (auto& d : lastDets) {
                     if (d.confidence < ucr::config::SIGN_CONF_THRESH) continue;
 
-                    // Pedestrian → stop
                     if (d.class_id == WALKING_PERSON) {
                         lastPersonSeenTick = static_cast<int>(tickIdx);
                         continue;
                     }
 
-                    // Traffic light → HSV check
                     if (d.class_id == TRAFFIC_LIGHT) {
                         LightColor color = ClassifyTrafficLight(frame, d.bbox);
                         if (color == LightColor::RED) {
                             lastRedSeenTick = static_cast<int>(tickIdx);
                         } else if (color == LightColor::GREEN) {
-                            lastRedSeenTick = -1;   // V6.1: green clears red-hold
+                            lastRedSeenTick = -1;   // V6.1: green clears red
                         }
                         continue;
                     }
 
-                    // Construction → turn left (map-specific)
                     int cls = (d.class_id == CONSTRUCTION_AHEAD) ? TURN_LEFT : d.class_id;
                     if (cls == TURN_LEFT || cls == TURN_RIGHT ||
                         cls == NO_LEFT   || cls == NO_RIGHT) {
@@ -245,11 +232,9 @@ int main() {
                 voter.Update(classIds, tickIdx);
             }
 
-            // ---- 2. SignState + step (no IMU passed for now) ----
             v21::SignState signState = MakeSignState(voter.GetCommitted());
             out = follower.step(small_mask, signState);
 
-            // ---- 3. Steering ----
             float desired_real_left = -static_cast<float>(out.angle);
             desired_real_left = std::clamp(desired_real_left,
                                            -ucr::config::MAX_REAL_ANGLE_DEG,
@@ -260,12 +245,10 @@ int main() {
                                     static_cast<float>(ucr::config::MAX_SERVO_CMD));
             const int final_angle = static_cast<int>(std::lround(servo_cmd));
 
-            // ---- 4. Speed ----
             float speed = static_cast<float>(out.speed);
             if (!out.valid && out.coverage > 0.02)
                 speed = ucr::config::MIN_SPEED_CMS;
 
-            // Stop overrides (person + red light; person WINS)
             const bool stopForPerson =
                 (lastPersonSeenTick >= 0) &&
                 ((int)tickIdx - lastPersonSeenTick <= ucr::config::PERSON_STOP_HANGOVER_TICKS);
@@ -275,25 +258,21 @@ int main() {
             const bool stopRequested = stopForPerson || stopForRedLight;
             if (stopRequested) speed = 0.0f;
 
-            // Soft-start ramp
             const float max_delta = ucr::config::MAX_ACCEL_CMS2 *
                                     (ucr::config::CONTROL_PERIOD_MS / 1000.0f);
             if (speed > applied_speed)
                 applied_speed = std::min(speed, applied_speed + max_delta);
             else
-                applied_speed = speed;   // instant decel to 0
+                applied_speed = speed;
 
             motor.SetSpeedCms(applied_speed);
             servo.SetAngle(final_angle);
 
-            // ---- 5. Advance tick ----
             ++tickIdx;
             next_control += std::chrono::milliseconds(ucr::config::CONTROL_PERIOD_MS);
-            if (now - next_control > std::chrono::seconds(1)) {
+            if (now - next_control > std::chrono::seconds(1))
                 next_control = now + std::chrono::milliseconds(ucr::config::CONTROL_PERIOD_MS);
-            }
 
-            // ---- 6. Debug log (1 Hz) ----
             static auto lastLog = std::chrono::steady_clock::now();
             if (now - lastLog >= std::chrono::seconds(1)) {
                 const char* stopStr = stopForPerson   ? "STOP:person"
@@ -314,13 +293,11 @@ int main() {
             }
         }
 
-        // ---- FPS ----
         ++frameCount;
         auto tNow = std::chrono::high_resolution_clock::now();
         double dt = std::chrono::duration<double>(tNow - tPrev).count();
         if (dt > 0.5) { fps = frameCount / dt; frameCount = 0; tPrev = tNow; }
 
-        // ---- UI ----
         if (ucr::config::SHOW_UI) {
             cv::Mat overlay = frame.clone();
 
@@ -340,11 +317,11 @@ int main() {
                     for (const auto& p : out.final_path)
                         pts.emplace_back(int(p.x * sx), int(p.y * sy));
 
-                    cv::Scalar color(0, 0, 255);                        // red = centerline
+                    cv::Scalar color(0, 0, 255);
                     if (out.state_str.find("TURN") != std::string::npos)
-                        color = cv::Scalar(255, 0, 255);                // magenta = turn
+                        color = cv::Scalar(255, 0, 255);
                     if (out.state_str.find("GHOST") != std::string::npos)
-                        color = cv::Scalar(0, 255, 255);                // yellow = ghost
+                        color = cv::Scalar(0, 255, 255);
 
                     for (size_t i = 0; i + 1 < pts.size(); ++i)
                         cv::line(overlay, pts[i], pts[i + 1], color, 2);

@@ -1,19 +1,11 @@
 // ============================================================
 // control/LaneFollowerV21.h — V6.1
-//
-// = V20 PID + V21 opening detection + Bezier path + V6.1 patches:
-//   [1] Multi-branch mask when turn_committed_ (skip keep_largest)
-//   [2] Tangent sanity check before commit
-//   [3] Release via mask-at-turn-point (not cl.near_error)
-//   [4] Optional heading release (BNO055)
-//   [5] Max-ticks fallback
-//
-// Output angle: v20 convention (+ = right), already × post_pid_gain
 // ============================================================
 #pragma once
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -24,12 +16,9 @@
 
 namespace v21 {
 
-// ============================================================
-// DATA STRUCTS
-// ============================================================
 struct SignState {
     bool active = false;
-    int  side = 0;       // -1 left, +1 right, 2 both, 0 disabled
+    int  side = 0;
     int  class_id = -1;
 };
 
@@ -42,24 +31,22 @@ struct Opening {
 };
 
 struct TurnMemory {
-    bool active = false;
-    int  side = 0;
+    bool active     = false;
+    int  side       = 0;
     int  turn_width = 0;
     int  last_y_mid = 9999;
 };
 
 // ============================================================
-// CONFIG
+// CONFIG (v6.1 — no duplicate fields)
 // ============================================================
 struct Config {
-    // V20 mask / speed
     int    mask_width    = 320;
     bool   keep_largest  = true;
     double post_pid_gain = 1.0;
     double max_speed     = 15.0;
     double min_speed     = 5.0;
 
-    // V20 PID / filters
     double asym_strength = 0.20, asym_threshold = 8.0, asym_ema = 0.7;
     double asym_cap = 12.0, asym_decay = 0.80;
     double far_delta_clip = 25.0, d_far_clip = 6.0;
@@ -94,7 +81,7 @@ struct Config {
     int min_turn_dist  = 4;
     int extend_len     = 80;
 
-    // V6.1 turn completion
+    // V6.1 turn completion (single declaration, no duplicates)
     int   turn_min_ticks         = 8;
     int   turn_max_ticks         = 30;
     int   turn_synth_width_px    = 60;
@@ -259,7 +246,6 @@ inline std::vector<Point> quadraticBezier(Point P0, Point P1, Point P2, int n = 
     return pts;
 }
 
-// V6.1 helper: check road coverage in a square around `pt`
 inline bool isRoadAt(const cv::Mat& mask, Point pt, float threshold, int half_win) {
     if (mask.empty()) return false;
     if (pt.x < 0 || pt.y < 0 || pt.x >= mask.cols || pt.y >= mask.rows) return false;
@@ -278,14 +264,13 @@ inline bool isRoadAt(const cv::Mat& mask, Point pt, float threshold, int half_wi
     return totalCount > 0 && ((float)roadCount / totalCount) >= threshold;
 }
 
-// V6.1 helper: reject centerline if it bends clearly AGAINST the turn direction
 inline bool branchLooksCorrect(const std::vector<Point>& cl, int turn_side) {
     if (cl.size() < 5) return false;
     int n = std::min(15, (int)cl.size());
     float dx = 0;
     for (int i = 1; i < n; ++i) dx += cl[i].x - cl[i-1].x;
-    if (turn_side < 0 && dx >  5.0f) return false;  // left turn but bending right
-    if (turn_side > 0 && dx < -5.0f) return false;  // right turn but bending left
+    if (turn_side < 0 && dx >  5.0f) return false;
+    if (turn_side > 0 && dx < -5.0f) return false;
     return true;
 }
 
@@ -481,7 +466,6 @@ public:
                 float heading_deg = NAN) {
         Output o;
 
-        // V6.1 [1]: disable keep_largest while turning
         double kept_frac = 1.0;
         cv::Mat cleanMask = detail::preprocessMask(
             rawMask, c_, kept_frac, /*force_disable_largest=*/turn_committed_);
@@ -490,12 +474,10 @@ public:
         o.proc_width  = cleanMask.cols;
         o.proc_height = cleanMask.rows;
 
-        // 1. Centerline
         std::vector<std::pair<int, int>> row_centers;
         auto cl = extractCenterline(cleanMask, curveSmooth_, c_, row_centers);
         curveSmooth_ = cl.curve_smooth;
 
-        // 2. Near/far/lead/blended
         double farDelta = std::clamp(cl.far_error - cl.near_error,
                                      -c_.far_delta_clip, c_.far_delta_clip);
         double dFarRaw = (cl.valid && prevValid_) ? (cl.far_error - prevFarE_) : 0.0;
@@ -505,7 +487,6 @@ public:
         double blended = cl.near_error + lead;
         prevFarE_ = cl.far_error;
 
-        // 3. Occlusion — V6.1: skip gate while turning (avoid false occl)
         bool occl = false;
         if (!turn_committed_) {
             occl = gate_.step(blended, cl.coverage, row_centers, cl.valid,
@@ -517,7 +498,6 @@ public:
             emerHold_ = 0;
         }
 
-        // 4. Asymmetry
         if (!occl && cl.valid) {
             double asymRaw = detectAsymmetry(cleanMask);
             asymSmooth_ = c_.asym_ema * asymSmooth_ + (1.0 - c_.asym_ema) * asymRaw;
@@ -529,7 +509,6 @@ public:
                              ? 0.0 : c_.asym_strength * asymSmooth_;
         double eff_error_v20 = blended + asymApplied;
 
-        // 5. Turn logic
         std::vector<Point> centerline_pts;
         for (auto& p : row_centers) centerline_pts.push_back({p.first, p.second});
 
@@ -549,7 +528,6 @@ public:
             has_valid_opening = true;
         }
 
-        // 5a. Preliminary should_turn from sign + opening
         if (sign.active) {
             if (has_valid_opening) {
                 if (sign.class_id == 6 || sign.class_id == 7 || sign.class_id == 0)
@@ -576,7 +554,6 @@ public:
             }
         }
 
-        // 5b. V6.1 [2]: commit with tangent sanity + proximity gate
         if (should_turn && !turn_committed_) {
             bool close_enough =
                 target_opening.y_mid > cleanMask.rows * c_.turn_commit_proximity;
@@ -600,11 +577,9 @@ public:
             }
         }
 
-        // 5c. V6.1 [3][4][5]: active turn management — release or continue
         if (turn_committed_) {
             ++turn_tick_;
 
-            // Signal A: mask present at fixed turn_point
             bool at_turn_point = false;
             if (commit_turn_point_.x >= 0 && commit_turn_point_.x < cleanMask.cols &&
                 commit_turn_point_.y >= 0 && commit_turn_point_.y < cleanMask.rows) {
@@ -614,16 +589,13 @@ public:
                     c_.turn_release_window_px);
             }
 
-            // Signal B: heading delta
             bool heading_done = false;
             if (commit_heading_valid_ && !std::isnan(heading_deg)) {
                 float d = std::abs(detail::wrapDeg180(heading_deg - commit_heading_));
                 heading_done = d >= c_.turn_complete_deg;
             }
 
-            // Signal C: hard cap
             bool timed_out = turn_tick_ >= c_.turn_max_ticks;
-
             bool ready_min = turn_tick_ >= c_.turn_min_ticks;
             bool release = timed_out || (ready_min && (at_turn_point || heading_done));
 
@@ -638,7 +610,6 @@ public:
                 should_turn = true;
 
                 if (!has_valid_opening) {
-                    // Synthesize from commit point / memory
                     Point top_pt = centerline_pts.empty()
                         ? Point{cleanMask.cols / 2, cleanMask.rows / 2}
                         : centerline_pts.back();
@@ -659,7 +630,6 @@ public:
             }
         }
 
-        // 5d. Build Bezier if turning
         if (should_turn) {
             final_path = buildPathWithTurn(centerline_pts, cleanMask, target_opening);
             if (o.state_str == "CENTERLINE")
@@ -667,7 +637,6 @@ public:
                     std::string(target_opening.side == -1 ? "LEFT" : "RIGHT");
         }
 
-        // 6. Error into PID
         double final_error = eff_error_v20;
         if (should_turn && final_path.size() > 5) {
             int look_idx = (int)final_path.size() * 2 / 3;
@@ -723,7 +692,6 @@ private:
     bool prevValid_;
     int emerHold_;
 
-    // V6.1 commit state
     bool  turn_committed_       = false;
     int   turn_committed_side_  = 0;
     int   turn_tick_            = 0;
@@ -885,7 +853,7 @@ private:
             turn_memory_.active     = true;
             turn_memory_.side       = best.side;
             turn_memory_.turn_width = std::abs(best.x_extreme - best.x_baseline);
-            turn_memory_.last_y_mid = best.y_mid;   // V6.1: direct assignment
+            turn_memory_.last_y_mid = best.y_mid;   // direct assignment (FIX 2)
         }
     }
 
