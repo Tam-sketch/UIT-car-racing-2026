@@ -118,6 +118,11 @@ struct Config {
     int    turn_ramp_ticks    = 8;     // 0.8 s @ 10 Hz
     // Hard cap on |final_error| during turn mode (px).
     double turn_error_cap     = 60.0;
+    // Lower B (the horizontal reach of the bezier) toward the car.
+    // 0.0 = current behavior (B.y == ctrl.y)
+    // 0.3 = B is ~30% of the way from ctrl down to the bottom of the mask
+    // 1.0 = B at mask bottom (closest to car)
+    double turn_b_lower_ratio = 0.30;
 };
 
 // ============================================================
@@ -921,6 +926,7 @@ private:
             }
             return path;
         }
+        const int y_b = y_c + (int)((mask.rows - 1 - y_c) * c_.turn_b_lower_ratio);
 
         Point A    = { centerline.front().x, y_bottom };
         Point ctrl = { x_c, y_c };
@@ -930,7 +936,7 @@ private:
         auto path = detail::quadraticBezier(A, ctrl, B, 20);
 
         // Extend tail from B horizontally (unchanged)
-        int step = 5, x_curr = x_turn, y_curr = y_c;
+        int step = 5, x_curr = B.x, y_curr = B.y;
         for (int i = 0; i < c_.extend_len / step; ++i) {
             x_curr += sign * step;
             if (x_curr < 0 || x_curr >= mask.cols) break;
