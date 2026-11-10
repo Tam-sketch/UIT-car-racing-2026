@@ -104,7 +104,7 @@ struct Config {
 
     // --- Turn completion ---
     float turn_complete_deg     = 60.0f;   // release when |Δheading| >= this
-    float turn_overshoot_deg    = 130.0f;  // hard safety cap regardless of min_ticks
+    float turn_overshoot_deg    = 100.0f;  // hard safety cap regardless of min_ticks
 
     // Lookahead for the bezier turn. 0.30 = 30% down from top of mask
     // (upper-middle). Lower = further ahead / more aggressive turn.
