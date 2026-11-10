@@ -94,6 +94,19 @@ struct Config {
     int extend_len     = 80;
 
     // --- Turn completion ---
+    // Mask-based fallback (used when IMU unavailable)
+    int   turn_min_ticks        = 25;   // 2.5 s @ 10 Hz
+    int   turn_max_ticks        = 100;  // 10 s hard cap
+    int   turn_straight_near_px = 15;
+    int   turn_straight_far_px  = 20;
+    int   turn_straight_ticks   = 5;
+    int   turn_synth_width_px   = 60;
+
+    // Heading-based primary (only referenced if you pasted the heading version)
+    float turn_complete_deg     = 60.0f;
+    float turn_overshoot_deg    = 130.0f;
+
+    // --- Turn completion ---
     float turn_complete_deg     = 60.0f;   // release when |Δheading| >= this
     float turn_overshoot_deg    = 130.0f;  // hard safety cap regardless of min_ticks
 };
