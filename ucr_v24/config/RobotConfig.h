@@ -1,6 +1,6 @@
 // ============================================================
-// config/RobotConfig.h — UCR 2026 V6.5
-// (V6.4 + split RB bias left/right)
+// config/RobotConfig.h — UCR 2026 V6.4
+// (Roundabout bias split RIGHT/LEFT)
 // ============================================================
 #pragma once
 
@@ -164,19 +164,21 @@ inline constexpr float BEZ_ERR_CLAMP_PX    = 60.0f;
 inline constexpr float BEZ_CTRL_OFFSET_FRAC = 0.40f;
 
 // --------------------------------------------------------
-// Roundabout bias state machine (V6.5 — split L/R)
+// Roundabout bias-based state machine (V6.4)
 //
-//   NONE         bias  0
-//   APPROACH     bias  +RB_BIAS_PX      (right, né lề phải)
-//   IN_CIRCLE    bias  -RB_BIAS_PX_LEFT (left,  bám đảo) ← TÁCH RIÊNG
-//   EXIT_PREP    bias  +RB_BIAS_PX      (right, chuẩn bị ra)
-//   EXIT_SEARCH  bias  -RB_BIAS_PX_LEFT (left)  + force side=+1
-//   EXITING      bias  0
+//   NONE         bias  0   → rb_committed
+//   APPROACH     bias +R  → sign missing 5t
+//   IN_CIRCLE    bias -L  → timeout OR rb_seen#2
+//   EXIT_PREP    bias +R  → sign missing 5t
+//   EXIT_SEARCH  bias -L + force side=+1
+//   EXITING      bias  0  → CENTERLINE
 //
-// Giảm RB_BIAS_PX_LEFT để xe bớt bám trái → ít va đảo.
+// RIGHT và LEFT tách riêng để tune độc lập:
+//   - RIGHT dùng cho APPROACH và EXIT_PREP (né lề phải, chuẩn bị ra)
+//   - LEFT  dùng cho IN_CIRCLE và EXIT_SEARCH (bám đảo)
 // --------------------------------------------------------
-inline constexpr float RB_BIAS_PX              = 55.0f;   // RIGHT (APPROACH, EXIT_PREP)
-inline constexpr float RB_BIAS_PX_LEFT         = 30.0f;   // LEFT  (IN_CIRCLE, EXIT_SEARCH)
+inline constexpr float RB_BIAS_PX_RIGHT        = 55.0f;   // APPROACH, EXIT_PREP
+inline constexpr float RB_BIAS_PX_LEFT         = 30.0f;   // IN_CIRCLE, EXIT_SEARCH
 inline constexpr float RB_BIAS_EMA             = 0.3f;
 inline constexpr int   RB_MISSING_SIGN_TICKS   = 5;
 inline constexpr int   RB_CIRCLE_TIMEOUT       = 100;
