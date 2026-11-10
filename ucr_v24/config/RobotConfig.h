@@ -97,7 +97,7 @@ inline constexpr const char* SignClassName(int id) {
 }
 
 // --------------------------------------------------------
-// Traffic light HSV ranges
+// Traffic light HSV
 // --------------------------------------------------------
 namespace tl {
     inline constexpr int RED_H1_LO = 0;
@@ -114,15 +114,15 @@ namespace tl {
     inline constexpr float ROI_EXPAND   = 1.20f;
 }
 
-inline constexpr int PERSON_STOP_HANGOVER_TICKS = 20;   // ~2s
-inline constexpr int RED_LIGHT_HANGOVER_TICKS   = 10;   // ~1s
+inline constexpr int PERSON_STOP_HANGOVER_TICKS = 20;
+inline constexpr int RED_LIGHT_HANGOVER_TICKS   = 10;
 
 // --------------------------------------------------------
 // Sign detect + voter
 // --------------------------------------------------------
-inline constexpr int SIGN_DETECT_EVERY          = 2;
-inline constexpr int SIGN_VOTER_ACTIVATE_FRAMES = 2;
-inline constexpr int SIGN_VOTER_TIMEOUT_FRAMES  = 60;
+inline constexpr int SIGN_DETECT_EVERY             = 2;
+inline constexpr int SIGN_VOTER_ACTIVATE_FRAMES    = 2;
+inline constexpr int SIGN_VOTER_TIMEOUT_FRAMES     = 30;   // ~3s (V6.1: shorter to avoid stale)
 
 // --------------------------------------------------------
 // Opening detection
@@ -140,18 +140,18 @@ inline constexpr int   BEZIER_MIN_TURN_DIST  = 4;
 inline constexpr int   BEZIER_EXTEND_LEN     = 80;
 
 // --------------------------------------------------------
-// Turn completion (V6.1)
+// Turn completion (V6.1) — NEW
 // --------------------------------------------------------
-inline constexpr int   TURN_MIN_TICKS           = 8;      // ~0.8s
-inline constexpr int   TURN_MAX_TICKS           = 30;     // ~3s hard cap
+inline constexpr int   TURN_MIN_TICKS           = 8;      // 0.8s min
+inline constexpr int   TURN_MAX_TICKS           = 30;     // 3s hard cap
 inline constexpr int   TURN_SYNTH_WIDTH_PX      = 60;
 inline constexpr float TURN_RELEASE_ROAD_FRAC   = 0.65f;
 inline constexpr int   TURN_RELEASE_WINDOW_PX   = 12;
-inline constexpr float TURN_COMMIT_PROXIMITY    = 0.50f;  // commit when op.y_mid > 0.5*H
-inline constexpr float TURN_COMPLETE_DEG        = 60.0f;  // heading release (optional)
+inline constexpr float TURN_COMMIT_PROXIMITY    = 0.50f;
+inline constexpr float TURN_COMPLETE_DEG        = 60.0f;
 
 // --------------------------------------------------------
-// BNO055 heading transform
+// Heading (BNO055) — optional
 // --------------------------------------------------------
 inline constexpr float HEADING_SIGN       = 1.0f;
 inline constexpr float HEADING_OFFSET_DEG = 0.0f;
