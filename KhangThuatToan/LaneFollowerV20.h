@@ -438,11 +438,12 @@ public:
     double turn_bias_current = 0.0;
 
     // Giới hạn thời gian để tránh xe ép cua vô hạn
-    double MAX_TURN_TIME = 8.0;
-    double CURVE_THRESHOLD = 18.0;
+    double MAX_TURN_TIME = 4.0;
+    double CURVE_THRESHOLD = 20.0;
     double STRAIGHT_THRESHOLD = 12.0;
-    double COUNTDOWN_TIME = 0.0;    
-    double TURN_BIAS_PX = 40.0;
+    int REQUIRED_STRAIGHT_FRAMES = 3;  // BẮT BUỘC thẳng liên tục trong 3 frame
+    int straight_frames = 0;    
+    double TURN_BIAS_PX = 35.0;
 
     State state = State::IDLE;
     std::string direction = "NONE";
@@ -450,6 +451,10 @@ public:
     double turn_elapsed = 0.0;
     bool curve_detected = false;
     bool completed = false;
+
+    // THÊM 2 DÒNG NÀY VÀO ĐÂY:
+    double get_countdown() const { return countdown; }
+    double get_turn_elapsed() const { return turn_elapsed; }
 
     std::vector<cv::Point> select_three_points(std::vector<cv::Point> points) {
         std::sort(points.begin(), points.end(), [](const cv::Point& a, const cv::Point& b){ return a.y < b.y; });
@@ -482,22 +487,15 @@ public:
         turn_elapsed = 0.0;
 
         aligned_frames = 0;
+        straight_frames = 0; // Reset bộ đếm frame thẳng
         turn_bias_current = 0.0;
 
         curve_detected = false;
         completed = false;
 
-        std::cout << "[TURN] Requested: "
-                << dir << "\n";
+        std::cout << "[TURN] Requested: " << dir << " -> Waiting for scanline curve...\n";
     }
 
-    double get_countdown() const {
-        return countdown;
-    }
-
-    double get_turn_elapsed() const {
-        return turn_elapsed;
-    }
 
 
     struct TurnResult {
@@ -516,12 +514,12 @@ public:
         double dev = calculate_deviation(pts);
 
 
-        // Kiểm tra xem mép đường phía trước đã mở rộng ra sát biên ảnh chưa (dấu hiệu đã tới miệng ngã rẽ)
+        // Vẫn ghi nhận mouth_reached cho telemetry nhưng KHÔNG dùng để bypass rẽ
         bool mouth_reached = false;
         if (!pts.empty()) {
             int touch_count = 0;
             for (const auto& p : pts) {
-                if (p.y <= 220) { // Loại trừ y_bottom (287) không cho kích hoạt sớm
+                if (p.y <= 220) { // Bỏ qua chân cản trước ở đáy ảnh
                     if (direction == "LEFT" && p.x <= 15) touch_count++;
                     if (direction == "RIGHT" && p.x >= 465) touch_count++;
                 }
@@ -529,43 +527,50 @@ public:
             if (touch_count >= 1) mouth_reached = true;
         }
 
-        if (dev < 0 && !mouth_reached) { res.state = state; return res; }
+        res.dev = dev;
+        res.mouth_reached = mouth_reached;
 
+        // BƯỚC 1: CHỜ KHÚC CONG XUẤT HIỆN
         if (state == State::WAIT_CURVE) {
+            straight_frames = 0;
             if (dev >= CURVE_THRESHOLD) {
                 curve_detected = true;
                 state = State::WAIT_STRAIGHT;
-                std::cout << "[TURN] CURVE DETECTED (dev: " << dev << ")\n";
+                std::cout << "[TURN] >> SCANLINE CURVE DETECTED (dev: " << dev << " px) -> Waiting for straight path\n";
             }
         }
+        // BƯỚC 2: QUY TẮC 3 FRAME THẲNG (SCANLINE NẮM QUYỀN ƯU TIÊN TUYỆT ĐỐI)
         else if (state == State::WAIT_STRAIGHT) {
-            // Khi đã phát hiện cua trước đó, chờ dev hạ nhiệt hoặc chóp cua chạm biên ảnh
-            if ((dev >= 0 && dev <= STRAIGHT_THRESHOLD) || mouth_reached) {
+            if (dev >= 0.0 && dev <= STRAIGHT_THRESHOLD) {
+                straight_frames++;
+                std::cout << "[TURN] Scanline straightening: " << straight_frames 
+                          << "/" << REQUIRED_STRAIGHT_FRAMES << " frames (dev: " << dev << " px)\n";
+            } else {
+                // Nếu bị nhiễu hoặc đường vẫn đang uốn gắt -> reset đếm lại từ đầu
+                if (straight_frames > 0) {
+                    std::cout << "[TURN] Scanline jittered (dev: " << dev << " px) -> Reset straight counter\n";
+                }
+                straight_frames = 0;
+            }
+
+            // ĐỦ 3 FRAME THẲNG MỚI ĐƯỢC PHÉP BẺ LÁI
+            if (straight_frames >= REQUIRED_STRAIGHT_FRAMES) {
                 state = State::EXECUTE;
                 turn_elapsed = 0.0;
                 aligned_frames = 0;
                 turn_bias_current = (direction == "LEFT") ? -TURN_BIAS_PX : TURN_BIAS_PX;
                 res.steer_bias_px = turn_bias_current;
-                std::cout << "[TURN] >> EXECUTING TURN (Smooth 40 deg target)\n";
+                std::cout << "[TURN] >>> EXECUTING TURN NOW (Verified straight for 3 frames! Bias: " 
+                          << turn_bias_current << " px)\n";
             }
         }
-        else if (state == State::COUNTDOWN) {
-            countdown += dt;
-            if (countdown >= COUNTDOWN_TIME) {
-                state = State::EXECUTE;
-                turn_elapsed = 0.0;
-                aligned_frames = 0;
-                turn_bias_current = (direction == "LEFT") ? -TURN_BIAS_PX : TURN_BIAS_PX;
-                res.steer_bias_px = turn_bias_current; // Áp dụng ngay lập tức không trễ 1 frame
-                std::cout << "[TURN] EXECUTING TURN\n";
-            }
-        }
+        // BƯỚC 3: THỰC THI BẺ LÁI
         else if (state == State::EXECUTE) {
             turn_elapsed += dt;
 
             const double heading_error = std::abs(far_error - near_error);
 
-            // Chỉ kiểm tra aligned sau khi đã bẻ lái được tối thiểu 0.6s (tránh nhận nhầm làn cũ lúc mới bắt đầu rẽ)
+            // Chỉ xét điều kiện thẳng làn mới sau khi đã bẻ lái tối thiểu 0.6 giây
             const bool lane_aligned =
                 (turn_elapsed > 0.6) &&
                 lane_valid &&
@@ -613,6 +618,7 @@ public:
             countdown = 0.0;
             turn_elapsed = 0.0;
             aligned_frames = 0;
+            straight_frames = 0;
             turn_bias_current = 0.0;
             curve_detected = false;
             settle_start_bias = 0.0;
@@ -620,8 +626,6 @@ public:
             std::cout << "[TURN] RESET TO IDLE\n";
         }
 
-        res.dev = dev;
-        res.mouth_reached = mouth_reached;
         res.state = state;
         return res;
     }
