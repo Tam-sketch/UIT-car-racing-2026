@@ -1,6 +1,6 @@
 // ============================================================
-// main.cpp — UCR 2026 V6.4
-// (Roundabout bias split RIGHT/LEFT, UI bias removed)
+// main.cpp — UCR 2026 V6.5
+// (Roundabout: bias split + min-ticks + shared speed clamp)
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -197,19 +197,24 @@ int main() {
     // --- Roundabout state ---
     RbState  rb_state            = RbState::NONE;
     uint32_t rb_enter_tick       = 0;
+    uint32_t rb_state_enter_tick = 0;
     int      rb_missing_sign     = 0;
     int      rb_exit_search_tick = 0;
     int      rb_cooldown_ticks   = 0;
 
-    std::cout << "\n=== UCR2026 V6.4 (turns="
+    std::cout << "\n=== UCR2026 V6.5 (turns="
               << (signReady ? "yes" : "no") << ") ===\n"
               << "Road: " << ucr::config::ROAD_ENGINE_PATH << "\n";
     if (signReady)
         std::cout << "Sign: " << ucr::config::SIGN_ENGINE_PATH << "\n";
     std::cout << "Control: " << ucr::config::CONTROL_PERIOD_MS << " ms\n"
-              << "Roundabout: bias R="
-              << ucr::config::RB_BIAS_PX_RIGHT
-              << " L=" << ucr::config::RB_BIAS_PX_LEFT << "\n"
+              << "Roundabout: bias R=" << ucr::config::RB_BIAS_PX_RIGHT
+              << " L=" << ucr::config::RB_BIAS_PX_LEFT
+              << " | speed [" << ucr::config::RB_SPEED_MIN_CMS
+              << ", " << ucr::config::RB_SPEED_MAX_CMS << "]\n"
+              << "  min_ticks AP=" << ucr::config::RB_APPROACH_MIN_TICKS
+              << " IC=" << ucr::config::RB_IN_CIRCLE_MIN_TICKS
+              << " EP=" << ucr::config::RB_EXIT_PREP_MIN_TICKS << "\n"
               << "Press 'q' to quit\n\n";
 
     while (!g_stopSignal) {
@@ -299,39 +304,54 @@ int main() {
                 case RbState::NONE:
                     if (rb_committed && rb_cooldown_ticks <= 0) {
                         rb_state = RbState::APPROACH;
+                        rb_state_enter_tick = tickIdx;
                         rb_missing_sign = 0;
                     }
                     break;
 
-                case RbState::APPROACH:
-                    if (rb_missing_sign >= ucr::config::RB_MISSING_SIGN_TICKS) {
+                case RbState::APPROACH: {
+                    const uint32_t dur = tickIdx - rb_state_enter_tick;
+                    const bool min_ok = dur >= (uint32_t)ucr::config::RB_APPROACH_MIN_TICKS;
+                    const bool sign_gone = rb_missing_sign >= ucr::config::RB_MISSING_SIGN_TICKS;
+                    if (min_ok && sign_gone) {
                         rb_state = RbState::IN_CIRCLE;
+                        rb_state_enter_tick = tickIdx;
                         rb_enter_tick = tickIdx;
                     }
                     break;
+                }
 
                 case RbState::IN_CIRCLE: {
+                    const uint32_t dur = tickIdx - rb_state_enter_tick;
+                    const bool min_ok = dur >= (uint32_t)ucr::config::RB_IN_CIRCLE_MIN_TICKS;
                     const bool timeout =
                         (int)(tickIdx - rb_enter_tick) >= ucr::config::RB_CIRCLE_TIMEOUT;
                     const bool rb_seen_again = rb_committed && rb_visible_now;
-                    if (timeout || rb_seen_again) {
+                    if (min_ok && (timeout || rb_seen_again)) {
                         rb_state = RbState::EXIT_PREP;
+                        rb_state_enter_tick = tickIdx;
                         rb_missing_sign = 0;
                     }
                     break;
                 }
 
-                case RbState::EXIT_PREP:
-                    if (rb_missing_sign >= ucr::config::RB_MISSING_SIGN_TICKS) {
+                case RbState::EXIT_PREP: {
+                    const uint32_t dur = tickIdx - rb_state_enter_tick;
+                    const bool min_ok = dur >= (uint32_t)ucr::config::RB_EXIT_PREP_MIN_TICKS;
+                    const bool sign_gone = rb_missing_sign >= ucr::config::RB_MISSING_SIGN_TICKS;
+                    if (min_ok && sign_gone) {
                         rb_state = RbState::EXIT_SEARCH;
+                        rb_state_enter_tick = tickIdx;
                         rb_exit_search_tick = 0;
                     }
                     break;
+                }
 
                 case RbState::EXIT_SEARCH:
                     ++rb_exit_search_tick;
                     if (rb_exit_search_tick >= ucr::config::RB_EXIT_SEARCH_TIMEOUT) {
                         rb_state = RbState::EXITING;
+                        rb_state_enter_tick = tickIdx;
                     }
                     break;
 
@@ -385,10 +405,12 @@ int main() {
             if (rb_state == RbState::EXIT_SEARCH &&
                 out.state_str.find("TURN") != std::string::npos) {
                 rb_state = RbState::EXITING;
+                rb_state_enter_tick = tickIdx;
             }
             if (rb_state == RbState::EXITING &&
                 out.state_str == "CENTERLINE") {
                 rb_state = RbState::NONE;
+                rb_state_enter_tick = tickIdx;
                 rb_cooldown_ticks = ucr::config::RB_COOLDOWN_TICKS;
                 voter.Reset();
             }
@@ -414,9 +436,11 @@ int main() {
             if (!out.valid && out.coverage > 0.02)
                 speed = ucr::config::MIN_SPEED_CMS;
 
-            // Roundabout speed cap
+            // Roundabout shared speed clamp (min/max)
             if (rb_state != RbState::NONE) {
-                speed = std::min(speed, ucr::config::RB_SPEED_CAP_CMS);
+                speed = std::clamp(speed,
+                                   ucr::config::RB_SPEED_MIN_CMS,
+                                   ucr::config::RB_SPEED_MAX_CMS);
             }
 
             // Stop overrides (person priority > red light)
@@ -478,7 +502,7 @@ int main() {
         if (dt > 0.5) { fps = frameCount / dt; frameCount = 0; tPrev = tNow; }
 
         // =====================================================
-        // UI  (bias line removed)
+        // UI
         // =====================================================
         if (ucr::config::SHOW_UI) {
             cv::Mat overlay = frame.clone();
