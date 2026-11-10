@@ -1,5 +1,11 @@
 // ============================================================
-// control/LaneFollowerV21.h — V6.1
+// control/LaneFollowerV21.h — V6.2 (A + B applied)
+//
+// V6.1 patches: 5 fixes (multi-branch, tangent, mask-release,
+//               heading-release, max-ticks fallback)
+// V6.2 patches:
+//   [A] turn_commit_proximity = 0.30 (in RobotConfig.h)
+//   [B] Pure Pursuit lookahead (replaces 2/3 * path.size())
 // ============================================================
 #pragma once
 
@@ -38,7 +44,7 @@ struct TurnMemory {
 };
 
 // ============================================================
-// CONFIG (v6.1 — no duplicate fields)
+// CONFIG
 // ============================================================
 struct Config {
     int    mask_width    = 320;
@@ -81,14 +87,19 @@ struct Config {
     int min_turn_dist  = 4;
     int extend_len     = 80;
 
-    // V6.1 turn completion (single declaration, no duplicates)
+    // V6.1 turn completion
     int   turn_min_ticks         = 8;
     int   turn_max_ticks         = 30;
     int   turn_synth_width_px    = 60;
     float turn_release_road_frac = 0.65f;
     int   turn_release_window_px = 12;
-    float turn_commit_proximity  = 0.50f;
+    float turn_commit_proximity  = 0.30f;   // [A] default updated
     float turn_complete_deg      = 60.0f;
+
+    // [B] Pure Pursuit
+    float bez_look_dist_base  = 40.0f;
+    float bez_look_dist_scale = 30.0f;
+    float bez_err_clamp_px    = 60.0f;
 };
 
 // ============================================================
@@ -274,6 +285,33 @@ inline bool branchLooksCorrect(const std::vector<Point>& cl, int turn_side) {
     return true;
 }
 
+// ============================================================
+// [B] Pure Pursuit lookahead on a path
+//
+// Cho trước:
+//   - path: vector of points, front() = gần car nhất, back() = xa nhất
+//   - car_pt: vị trí car trong mask coords (thường = (cols/2, rows))
+//   - look_dist: khoảng cách lookahead (px)
+// Trả về: điểm đầu tiên trên path có Euclidean distance >= look_dist
+//         (hoặc path.back() nếu không có điểm nào đủ xa)
+// ============================================================
+inline Point purePursuitLookahead(const std::vector<Point>& path,
+                                   Point car_pt,
+                                   double look_dist) {
+    if (path.empty()) return car_pt;
+    Point best = path.back();
+    for (size_t i = 0; i < path.size(); ++i) {
+        const double dx = path[i].x - car_pt.x;
+        const double dy = path[i].y - car_pt.y;
+        const double d  = std::sqrt(dx*dx + dy*dy);
+        if (d >= look_dist) {
+            best = path[i];
+            break;
+        }
+    }
+    return best;
+}
+
 }  // namespace detail
 
 // ============================================================
@@ -426,7 +464,7 @@ private:
 };
 
 // ============================================================
-// V21 LANE FOLLOWER (V6.1)
+// V21 LANE FOLLOWER (V6.2)
 // ============================================================
 class LaneFollower {
 public:
@@ -637,10 +675,34 @@ public:
                     std::string(target_opening.side == -1 ? "LEFT" : "RIGHT");
         }
 
+        // ============================================================
+        // 6. Error into PID
+        //    [B] Pure Pursuit lookahead replaces 2/3 * path.size()
+        // ============================================================
         double final_error = eff_error_v20;
         if (should_turn && final_path.size() > 5) {
-            int look_idx = (int)final_path.size() * 2 / 3;
-            final_error = final_path[look_idx].x - (cleanMask.cols / 2.0);
+            // Car position = bottom-center of image (camera origin)
+            const Point car_pt = { cleanMask.cols / 2, cleanMask.rows };
+
+            // Speed-dependent lookahead distance
+            // At min+3 (13 cm/s): look ≈ 40 + 30*0.65 ≈ 59 px
+            // At max (20 cm/s):   look ≈ 40 + 30*1.00 = 70 px
+            const double speed_ratio =
+                std::min(1.0, std::max(0.0, speed_ / std::max(c_.max_speed, 1.0)));
+            const double look_dist =
+                c_.bez_look_dist_base + c_.bez_look_dist_scale * speed_ratio;
+
+            // Find first point on path at distance >= look_dist
+            const Point target = detail::purePursuitLookahead(
+                final_path, car_pt, look_dist);
+
+            final_error = target.x - (cleanMask.cols / 2.0);
+
+            // Clamp to prevent PID saturation if mask jumps
+            final_error = std::clamp(final_error,
+                                     -(double)c_.bez_err_clamp_px,
+                                      (double)c_.bez_err_clamp_px);
+
             speed_ = c_.min_speed + 3.0;
         } else {
             double target_speed = detail::planSpeed(
@@ -853,7 +915,7 @@ private:
             turn_memory_.active     = true;
             turn_memory_.side       = best.side;
             turn_memory_.turn_width = std::abs(best.x_extreme - best.x_baseline);
-            turn_memory_.last_y_mid = best.y_mid;   // direct assignment (FIX 2)
+            turn_memory_.last_y_mid = best.y_mid;
         }
     }
 
