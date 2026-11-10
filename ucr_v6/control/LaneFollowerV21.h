@@ -624,20 +624,29 @@ public:
         // 6. Error into PID
         double final_error = eff_error_v20;
         if (should_turn && final_path.size() > 5) {
-            // Fixed y-band lookahead. Path points run bottom → top, so find
-            // the point closest to a target row high in the mask (near the far
-            // part of the turn). 0.30 → roughly V20's far-band centre.
-            const int target_y =
-                (int)(cleanMask.rows * c_.turn_lookahead_y_ratio);
+            // Two-point sampling of the path: near band + far lookahead.
+            // Blending them gives the PID the curve's *gradient*, not just
+            // its endpoint, so it starts steering from the bottom of the mask
+            // instead of waiting for the lookahead point.
+            auto pathXAtY = [&](int target_y) -> double {
+                int best_x = final_path.front().x;
+                int best_dy = 1 << 30;
+                for (const auto& p : final_path) {
+                    int dy = std::abs(p.y - target_y);
+                    if (dy < best_dy) { best_dy = dy; best_x = p.x; }
+                }
+                return best_x - cleanMask.cols / 2.0;
+            };
 
-            int look_idx = 0;
-            int best_dy  = std::abs(final_path[0].y - target_y);
-            for (size_t i = 1; i < final_path.size(); ++i) {
-                int dy = std::abs(final_path[i].y - target_y);
-                if (dy < best_dy) { best_dy = dy; look_idx = (int)i; }
-            }
+            const int near_y = (int)(cleanMask.rows * 0.85);   // near band  (~y=156)
+            const int far_y  = (int)(cleanMask.rows *
+                                    c_.turn_lookahead_y_ratio); // far band (~y=55)
 
-            final_error = final_path[look_idx].x - (cleanMask.cols / 2.0);
+            const double near_e_path = pathXAtY(near_y);
+            const double far_e_path  = pathXAtY(far_y);
+            const double lead_path   = 0.5 * (far_e_path - near_e_path);
+
+            final_error = near_e_path + lead_path;
             speed_ = c_.min_speed + 3.0;
         } else {
             double target_speed = detail::planSpeed(
@@ -860,31 +869,30 @@ private:
     }
 
     std::vector<Point> buildPathWithTurn(const std::vector<Point>& centerline,
-                                         const cv::Mat& mask,
-                                         const Opening& opening) {
+                                        const cv::Mat& mask,
+                                        const Opening& opening) {
         if (centerline.empty()) return centerline;
+
         int x_turn = (opening.x_extreme + opening.x_baseline) / 2;
-        int y_turn_raw = opening.y_mid;
         int idx = 0, min_d = 9999;
         for (size_t i = 0; i < centerline.size(); ++i) {
-            int d = std::abs(centerline[i].y - y_turn_raw);
+            int d = std::abs(centerline[i].y - opening.y_mid);
             if (d < min_d) { min_d = d; idx = (int)i; }
         }
         int x_c = centerline[idx].x, y_c = centerline[idx].y;
         int dist = std::abs(x_turn - x_c);
         if (dist < c_.min_turn_dist) return centerline;
         int sign = (x_turn < x_c) ? -1 : 1;
+        int d_bez = std::min(dist, c_.corner_radius * 2);
 
-        // Available vertical room below ctrl on the centerline.
-        const int y_bottom_max = centerline.front().y;
-        const int max_room     = y_bottom_max - y_c;
-        const int MIN_BEZ_DEPTH = 10;   // need this many rows below ctrl for a real curve
+        // ---- A is now the bottom row of the mask ----
+        const int y_bottom = mask.rows - 1;
+        const int max_room = y_bottom - y_c;
+        const int MIN_BEZ_DEPTH = 20;
 
         if (max_room < MIN_BEZ_DEPTH) {
-            // Opening too near the bottom of the mask — not enough room to start
-            // the bezier below ctrl. Fall back to a diagonal extension toward
-            // the turn direction. Next tick the car advances, opening moves up,
-            // and the bezier can run for real.
+            // Opening too near the bottom — no room for a real curve this tick.
+            // Diagonal fallback; next tick the car advances and the real bezier fires.
             std::vector<Point> path(centerline.begin(), centerline.begin() + idx + 1);
             for (int step = 5; step <= c_.extend_len; step += 5) {
                 int y_curr = y_c - step;
@@ -896,19 +904,14 @@ private:
             return path;
         }
 
-        int d_bez = std::min({dist, c_.corner_radius * 2, max_room});
-        int A_y = y_c + d_bez, A_idx = idx;
-        for (int i = idx; i >= 0; --i)
-            if (centerline[i].y >= A_y) { A_idx = i; break; }
-        // Defensive: should never trigger now, but keeps the guarantee explicit.
-        if (A_idx >= idx) return centerline;
-        Point A    = centerline[A_idx];
-        Point B    = {x_c + sign * d_bez, y_c};
-        Point ctrl = {x_c, y_c};
-        auto bez = detail::quadraticBezier(A, ctrl, B, 10);
-        std::vector<Point> path(centerline.begin(),
-                                centerline.begin() + A_idx + 1);
-        path.insert(path.end(), bez.begin(), bez.end());
+        Point A    = { centerline.front().x, y_bottom };
+        Point ctrl = { x_c, y_c };
+        Point B    = { x_c + sign * d_bez, y_c };
+
+        // More segments because the curve is longer now.
+        auto path = detail::quadraticBezier(A, ctrl, B, 20);
+
+        // Extend tail from B horizontally (unchanged)
         int step = 5, x_curr = x_turn, y_curr = y_c;
         for (int i = 0; i < c_.extend_len / step; ++i) {
             x_curr += sign * step;
