@@ -659,9 +659,12 @@ public:
             const double ramp = std::min(1.0,
                 static_cast<double>(turn_tick_) / c_.turn_ramp_ticks);
 
-            final_error = (1.0 - ramp) * eff_error_v20 + ramp * bezier_error;
-
-            final_error = std::clamp(final_error,
+            // Turn mode = bezier authority. Do NOT blend with eff_error_v20 —
+            // V20's error can point opposite the bezier if the car was off-center
+            // at commit (common for a right-turn approach where the car is on the
+            // right side of the road). Ramp handles "too much too soon"; bezier
+            // handles direction.
+            final_error = std::clamp(ramp * bezier_error,
                                     -c_.turn_error_cap,
                                     +c_.turn_error_cap);
 
