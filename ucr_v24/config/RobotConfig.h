@@ -1,6 +1,6 @@
 // ============================================================
-// config/RobotConfig.h — UCR 2026 V6.4
-// (Roundabout bias split RIGHT/LEFT)
+// config/RobotConfig.h — UCR 2026 V6.5
+// (Roundabout: bias split + min-ticks + shared speed clamp)
 // ============================================================
 #pragma once
 
@@ -16,8 +16,8 @@ inline constexpr char SIGN_ENGINE_PATH[] = "/home/car4/Downloads/sign/signv4.eng
 // --------------------------------------------------------
 // Hardware limits
 // --------------------------------------------------------
-inline constexpr float MAX_SPEED_CMS = 20.0f;
-inline constexpr float MIN_SPEED_CMS = 10.0f;
+inline constexpr float MAX_SPEED_CMS = 30.0f;
+inline constexpr float MIN_SPEED_CMS = 20.0f;
 
 // --------------------------------------------------------
 // Servo calibration
@@ -66,7 +66,7 @@ inline constexpr bool SHOW_UI = true;
 // --------------------------------------------------------
 // Sign model
 // --------------------------------------------------------
-inline constexpr float SIGN_CONF_THRESH = 0.5f;
+inline constexpr float SIGN_CONF_THRESH = 0.7f;
 inline constexpr float SIGN_IOU_THRESH  = 0.45f;
 inline constexpr int   SIGN_INPUT_SIZE  = 416;
 
@@ -136,7 +136,7 @@ inline constexpr int OPEN_BASE_WIN    = 50;
 // --------------------------------------------------------
 // Bezier path
 // --------------------------------------------------------
-inline constexpr int BEZIER_CORNER_RADIUS  = 40;
+inline constexpr int BEZIER_CORNER_RADIUS  = 20;
 inline constexpr int BEZIER_MIN_TURN_DIST  = 4;
 inline constexpr int BEZIER_EXTEND_LEN     = 80;
 
@@ -155,7 +155,7 @@ inline constexpr float TURN_COMPLETE_DEG      = 60.0f;
 // Pure Pursuit lookahead
 // --------------------------------------------------------
 inline constexpr float BEZ_LOOK_DIST_BASE  = 40.0f;
-inline constexpr float BEZ_LOOK_DIST_SCALE = 30.0f;
+inline constexpr float BEZ_LOOK_DIST_SCALE = 10.0f;
 inline constexpr float BEZ_ERR_CLAMP_PX    = 60.0f;
 
 // --------------------------------------------------------
@@ -164,26 +164,34 @@ inline constexpr float BEZ_ERR_CLAMP_PX    = 60.0f;
 inline constexpr float BEZ_CTRL_OFFSET_FRAC = 0.40f;
 
 // --------------------------------------------------------
-// Roundabout bias-based state machine (V6.4)
+// Roundabout bias-based state machine (V6.5)
 //
-//   NONE         bias  0   → rb_committed
-//   APPROACH     bias +R  → sign missing 5t
-//   IN_CIRCLE    bias -L  → timeout OR rb_seen#2
-//   EXIT_PREP    bias +R  → sign missing 5t
-//   EXIT_SEARCH  bias -L + force side=+1
-//   EXITING      bias  0  → CENTERLINE
-//
-// RIGHT và LEFT tách riêng để tune độc lập:
-//   - RIGHT dùng cho APPROACH và EXIT_PREP (né lề phải, chuẩn bị ra)
-//   - LEFT  dùng cho IN_CIRCLE và EXIT_SEARCH (bám đảo)
+//   NONE         bias  0
+//   APPROACH     bias +R  min RB_APPROACH_MIN_TICKS   [speed clamp]
+//   IN_CIRCLE    bias -L  min RB_IN_CIRCLE_MIN_TICKS  [speed clamp]
+//   EXIT_PREP    bias +R  min RB_EXIT_PREP_MIN_TICKS  [speed clamp]
+//   EXIT_SEARCH  bias -L  + force side=+1 (Bezier)    [speed clamp]
+//   EXITING      bias  0  (Bezier active)             [speed clamp]
 // --------------------------------------------------------
-inline constexpr float RB_BIAS_PX_RIGHT        = 55.0f;   // APPROACH, EXIT_PREP
-inline constexpr float RB_BIAS_PX_LEFT         = 30.0f;   // IN_CIRCLE, EXIT_SEARCH
+inline constexpr float RB_BIAS_PX_RIGHT        = 55.0f;
+inline constexpr float RB_BIAS_PX_LEFT         = 30.0f;
 inline constexpr float RB_BIAS_EMA             = 0.3f;
 inline constexpr int   RB_MISSING_SIGN_TICKS   = 5;
+
+// Minimum time per state (ensures bias reaches full value)
+inline constexpr int   RB_APPROACH_MIN_TICKS   = 15;   // 1.5s right-steer
+inline constexpr int   RB_IN_CIRCLE_MIN_TICKS  = 20;   // 2.0s left-steer
+inline constexpr int   RB_EXIT_PREP_MIN_TICKS  = 10;   // 1.0s right-steer
+
 inline constexpr int   RB_CIRCLE_TIMEOUT       = 100;
 inline constexpr int   RB_EXIT_SEARCH_TIMEOUT  = 40;
-inline constexpr float RB_SPEED_CAP_CMS        = 12.0f;
+
+// --- Shared speed clamp (all roundabout states) ---
+//   speed = clamp(pid_speed, RB_SPEED_MIN_CMS, RB_SPEED_MAX_CMS)
+//   APPROACH naturally reaches MAX (straight), IN_CIRCLE naturally hits MIN (curved)
+inline constexpr float RB_SPEED_MIN_CMS        = 20.0f;
+inline constexpr float RB_SPEED_MAX_CMS        = 30.0f;
+
 inline constexpr int   RB_COOLDOWN_TICKS       = 20;
 
 // --------------------------------------------------------
