@@ -216,8 +216,12 @@ public:
         if (!file_.is_open()) return false;
 
         file_ << "# AUTO CONTROL & TELEMETRY LOG (UCR2026 LaneFollowerV2.0 + NavigationBrain)\n";
+        // Danh sách 23 cột chuẩn xác, không bị lệch hàng:
         file_ << "# Columns: Frame,Timestamp_ms,FPS,Speed_cms,Servo_Angle,PID_Angle,"
-                 "Near_Error,Far_Error,Active_Sign,Turn_State,Steer_Bias_px,Total_Bias,IsValid\n";
+                 "Near_Error,Mid_Error,Far_Error,Active_Sign,Turn_State,Turn_Direction,"
+                 "Scanline_Dev,Mouth_Reached,Dodge_Side,Dodge_Hold,"
+                 "Countdown,Turn_Elapsed,Nav_Bias,Turn_Bias,Total_Bias,"
+                 "Left_Pts,Right_Pts,IsValid\n";
         file_.flush();
         return true;
     }
@@ -233,6 +237,8 @@ public:
 
         int turnState,
         const std::string& turnDirection,
+        double scanlineDev,
+        bool mouthReached,
         float countdown,
         float turnElapsed,
 
@@ -247,13 +253,10 @@ public:
 
         auto writePoints = [&](const std::vector<cv::Point>& pts) {
             std::ostringstream ss;
-
             for (size_t i = 0; i < pts.size(); ++i) {
                 if (i > 0) ss << ";";
-
                 ss << pts[i].x << ":" << pts[i].y;
             }
-
             return ss.str();
         };
 
@@ -265,10 +268,15 @@ public:
             << finalAngle << ","
             << out.angle << ","
             << out.near_e << ","
+            << out.mid_e << ","              // MỚI: Mid error
             << out.far_e << ","
             << activeSign << ","
             << turnState << ","
             << turnDirection << ","
+            << std::setprecision(2) << scanlineDev << "," // MỚI: dev
+            << (mouthReached ? 1 : 0) << ","              // MỚI: cờ chạm biên miệng cua
+            << out.dodge_side << ","                      // MỚI: hướng né (-1, 0, 1)
+            << out.dodge_frames << ","                    // MỚI: frame giữ khoảng hở
             << countdown << ","
             << turnElapsed << ","
             << navBias << ","
@@ -327,18 +335,18 @@ int main() {
     v20::Config cfg;
     cfg.max_speed = MAX_SPEED_CMS;
     cfg.min_speed = MIN_SPEED_CMS;
-    cfg.curve_scale = 160.0;
+    cfg.curve_scale = 140.0;
     cfg.min_rows = 5;
     cfg.coverage_threshold = 0.05;
 
-    cfg.kp = 0.28;               
-    cfg.kd = 0.45;               
+    cfg.kp = 0.45;               
+    cfg.kd = 0.50;               
     cfg.derivative_alpha = 0.25; 
     cfg.output_limit = 50.0;     
     cfg.emergency_output_limit = 50.0;
-    cfg.rate_limit = 8.0;        
-    cfg.emergency_rate_limit = 12.0; 
-    cfg.deadband = 2.5;
+    cfg.rate_limit = 10.0;        
+    cfg.emergency_rate_limit = 18.0; 
+    cfg.deadband = 0.5;
 
     v20::LaneFollower follower(cfg);
     v20::LaneTurnController turn_controller;
@@ -467,20 +475,15 @@ int main() {
                 handled_turn_sign = "NONE";
             }
 
-            if (turn_controller.state ==
-                v20::LaneTurnController::State::IDLE) {
+            if (turn_controller.state == v20::LaneTurnController::State::IDLE) {
 
-                if (dec.action == NavAction::FORCE_LEFT &&
-                    dec.active_sign != handled_turn_sign) {
-
+                if (dec.action == NavAction::FORCE_LEFT) {
                     turn_controller.start_turn("LEFT");
-                    handled_turn_sign = dec.active_sign;
+                    navBrain.ClearLatchedSign(); // Xóa sạch bộ nhớ latched_sign_ trong NavigationBrain
                 }
-                else if (dec.action == NavAction::FORCE_RIGHT &&
-                        dec.active_sign != handled_turn_sign) {
-
+                else if (dec.action == NavAction::FORCE_RIGHT) {
                     turn_controller.start_turn("RIGHT");
-                    handled_turn_sign = dec.active_sign;
+                    navBrain.ClearLatchedSign(); // Xóa sạch bộ nhớ latched_sign_ trong NavigationBrain
                 }
             }
 
@@ -495,8 +498,9 @@ int main() {
             );
 
             total_bias = dec.steer_bias_px + turn_res.steer_bias_px;
-
-            out = follower.step(mask, total_bias);
+            bool is_turning = (turn_res.state == v20::LaneTurnController::State::EXECUTE ||
+                       turn_res.state == v20::LaneTurnController::State::SETTLE);
+            out = follower.step(mask, total_bias, is_turning);
             previous_out = out;
 
             if (dec.emergency_stop) {
@@ -549,6 +553,8 @@ int main() {
 
                 static_cast<int>(turn_res.state),
                 turn_res.direction,
+                turn_res.dev,                 // Truyền dev
+                turn_res.mouth_reached,        // Truyền mouth_reached
                 turn_controller.get_countdown(),
                 turn_controller.get_turn_elapsed(),
 
@@ -561,7 +567,7 @@ int main() {
             );
             
             // ========================================================
-            // 10. PRINT LOG
+            // 10. PRINT LOG (Đã bổ sung đầy đủ thông số mới)
             // ========================================================
             std::cout << std::string(65, '=') << "\n";
             std::cout << "[FRAME " << totalFrames << "]\n";
@@ -576,13 +582,17 @@ int main() {
             std::cout << std::string(65, '-') << "\n";
             std::cout << "[LANE TURN CONTROLLER]\n";
             std::cout << "State           : " << static_cast<int>(turn_res.state) << "\n";
+            std::cout << "Scanline dev    : " << std::fixed << std::setprecision(2) << turn_res.dev << " px\n";
+            std::cout << "Mouth reached   : " << (turn_res.mouth_reached ? "TRUE" : "FALSE") << "\n";
             std::cout << "Turn bias       : " << std::fixed << std::setprecision(2) << turn_res.steer_bias_px << " px\n";
             
             std::cout << std::string(65, '-') << "\n";
             std::cout << "[LANE FOLLOWER]\n";
             std::cout << "Near error      : " << std::fixed << std::setprecision(2) << out.near_e << " px\n";
+            std::cout << "Mid error       : " << std::fixed << std::setprecision(2) << out.mid_e << " px\n";
             std::cout << "Far error       : " << std::fixed << std::setprecision(2) << out.far_e << " px\n";
-            std::cout << "Navigation bias : " << std::fixed << std::setprecision(2) << dec.steer_bias_px << " px\n";
+            std::cout << "Dodge locked    : " << (out.dodge_side == -1 ? "LEFT" : (out.dodge_side == 1 ? "RIGHT" : "NONE")) 
+                      << " (hold: " << out.dodge_frames << " frames)\n";
             std::cout << "Total bias      : " << std::fixed << std::setprecision(2) << total_bias << " px\n";
             std::cout << "Output angle    : " << std::fixed << std::setprecision(2) << out.angle << "\n";
             
@@ -665,9 +675,33 @@ int main() {
                 cv::polylines(overlay, paths, false, cv::Scalar(255, 0, 255), 2, cv::LINE_AA);
                 cv::circle(overlay, cv::Point(end_x, end_y), 4, cv::Scalar(0, 0, 255), -1);
                 
+                auto action_to_str = [](NavAction a) -> const char* {
+                    switch (a) {
+                        case NavAction::FOLLOW_LANE: return "FOLLOW_LANE";
+                        case NavAction::FORCE_LEFT:  return "FORCE_LEFT";
+                        case NavAction::FORCE_RIGHT: return "FORCE_RIGHT";
+                        case NavAction::STOP:        return "STOP";
+                        default:                     return "UNKNOWN";
+                    }
+                };
+
+                auto state_to_str = [](v20::LaneTurnController::State s) -> const char* {
+                    using S = v20::LaneTurnController::State;
+                    switch (s) {
+                        case S::IDLE:          return "IDLE";
+                        case S::WAIT_CURVE:    return "WAIT_CURVE";
+                        case S::WAIT_STRAIGHT: return "WAIT_STRAIGHT";
+                        case S::COUNTDOWN:     return "COUNTDOWN";
+                        case S::EXECUTE:       return "EXECUTE";
+                        case S::SETTLE:        return "SETTLE";
+                        case S::DONE:          return "DONE";
+                        default:               return "UNKNOWN";
+                    }
+                };
+                
                 // --- THÊM TEXT MỚI BẰNG LAMBDA ---
                 auto draw_text = [](cv::Mat& img, const std::string& text, cv::Point pos, cv::Scalar color) {
-                    cv::putText(img, text, pos, cv::FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv::LINE_AA);
+                    cv::putText(img, text, pos, cv::FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv::LINE_AA);
                 };
 
                 draw_text(overlay, cv::format("Frame: %ld", totalFrames), cv::Point(15, 25), cv::Scalar(255, 255, 255));
