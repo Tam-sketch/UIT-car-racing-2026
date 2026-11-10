@@ -1,6 +1,6 @@
 // ============================================================
-// config/RobotConfig.h — UCR 2026 V6.4
-// (V6.3 + Roundabout bias-based state machine)
+// config/RobotConfig.h — UCR 2026 V6.5
+// (V6.4 + split RB bias left/right)
 // ============================================================
 #pragma once
 
@@ -136,7 +136,7 @@ inline constexpr int OPEN_BASE_WIN    = 50;
 // --------------------------------------------------------
 // Bezier path
 // --------------------------------------------------------
-inline constexpr int BEZIER_CORNER_RADIUS  = 20;
+inline constexpr int BEZIER_CORNER_RADIUS  = 40;
 inline constexpr int BEZIER_MIN_TURN_DIST  = 4;
 inline constexpr int BEZIER_EXTEND_LEN     = 80;
 
@@ -164,18 +164,19 @@ inline constexpr float BEZ_ERR_CLAMP_PX    = 60.0f;
 inline constexpr float BEZ_CTRL_OFFSET_FRAC = 0.40f;
 
 // --------------------------------------------------------
-// Roundabout bias-based state machine (V6.4)
+// Roundabout bias state machine (V6.5 — split L/R)
 //
-//   NONE         bias  0   speed PID  → rb_committed
-//   APPROACH     bias +B   ≤12         → sign missing 5t
-//   IN_CIRCLE    bias -B   ≤12         → timeout OR rb_seen#2
-//   EXIT_PREP    bias +B   ≤12         → sign missing 5t
-//   EXIT_SEARCH  bias -B   ≤12 + force side=+1 (Bezier fires)
-//   EXITING      bias  0   ≤12 (Bezier active) → CENTERLINE
+//   NONE         bias  0
+//   APPROACH     bias  +RB_BIAS_PX      (right, né lề phải)
+//   IN_CIRCLE    bias  -RB_BIAS_PX_LEFT (left,  bám đảo) ← TÁCH RIÊNG
+//   EXIT_PREP    bias  +RB_BIAS_PX      (right, chuẩn bị ra)
+//   EXIT_SEARCH  bias  -RB_BIAS_PX_LEFT (left)  + force side=+1
+//   EXITING      bias  0
 //
-// B = RB_BIAS_PX (default 55px ≈ 2/3 of half-lane)
+// Giảm RB_BIAS_PX_LEFT để xe bớt bám trái → ít va đảo.
 // --------------------------------------------------------
-inline constexpr float RB_BIAS_PX              = 55.0f;
+inline constexpr float RB_BIAS_PX              = 55.0f;   // RIGHT (APPROACH, EXIT_PREP)
+inline constexpr float RB_BIAS_PX_LEFT         = 30.0f;   // LEFT  (IN_CIRCLE, EXIT_SEARCH)
 inline constexpr float RB_BIAS_EMA             = 0.3f;
 inline constexpr int   RB_MISSING_SIGN_TICKS   = 5;
 inline constexpr int   RB_CIRCLE_TIMEOUT       = 100;
