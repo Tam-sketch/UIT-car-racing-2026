@@ -111,6 +111,12 @@ struct Config {
     // 0.20 = aggressive, 0.30 = moderate, 0.45 = conservative.
     double turn_lookahead_y_ratio = 0.30;   // far band  (keep)
     double turn_near_y_ratio      = 0.85;   // near band (add)
+
+    // Blend from V20 near-band error to bezier far-weighted error
+    // over this many control ticks at the start of every turn.
+    int    turn_ramp_ticks    = 8;     // 0.8 s @ 10 Hz
+    // Hard cap on |final_error| during turn mode (px).
+    double turn_error_cap     = 60.0;
 };
 
 // ============================================================
@@ -646,7 +652,18 @@ public:
             const double far_e_path  = pathXAtY(far_y);
             const double lead_path   = 0.5 * (far_e_path - near_e_path);
 
-            final_error = near_e_path + lead_path;
+            const double bezier_error =
+                near_e_path + c_.turn_far_weight * (far_e_path - near_e_path);
+
+            const double ramp = std::min(1.0,
+                static_cast<double>(turn_tick_) / c_.turn_ramp_ticks);
+
+            final_error = (1.0 - ramp) * eff_error_v20 + ramp * bezier_error;
+
+            final_error = std::clamp(final_error,
+                                    -c_.turn_error_cap,
+                                    +c_.turn_error_cap);
+
             speed_ = c_.min_speed + 3.0;
         } else {
             double target_speed = detail::planSpeed(
