@@ -23,7 +23,7 @@ namespace config {
 inline constexpr char ROAD_ENGINE_PATH[] =
     "/home/car4/Downloads/road/kga2.engine";
 inline constexpr char SIGN_ENGINE_PATH[] =
-    "/home/car4/Downloads/sign/huy_sign.engine";
+    "/home/car4/Downloads/sign/signv4.engine";
 
 // --------------------------------------------------------
 // Hardware limits
