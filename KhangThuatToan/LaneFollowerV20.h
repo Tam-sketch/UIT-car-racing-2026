@@ -159,25 +159,51 @@ namespace detail {
         return bs >= 0;
     }
 
-    inline Centerline extractCenterline(const cv::Mat& m, double prevCurveSmooth, const Config& c) {
+    inline Centerline extractCenterline(const cv::Mat& m, double prevCurveSmooth, const Config& c, int preferred_side = 0) {
         Centerline r;
         const int h = m.rows, w = m.cols;
         const double halfW = (w - 1) * 0.5;
         long nz = 0;
+
         for (int y = h - 1; y >= 0; y--) {
             const uchar* row = m.ptr<uchar>(y);
             for (int x = 0; x < w; x++) nz += row[x] > 0;
-            int s, e;
-            if (largestRun(row, w, s, e)) {
-                r.row_centers.push_back({(s + e) / 2, y});
-                r.left_pts.push_back({s, y});
-                r.right_pts.push_back({e, y});
+
+            // Tìm TẤT CẢ các khoảng trống trên hàng ngang thay vì chỉ 1 khoảng lớn nhất
+            int bestLen = -1, bs = -1, be = -1;
+            int s = -1;
+            for (int x = 0; x <= w; x++) {
+                bool on = (x < w) && row[x] > 0;
+                if (on && s < 0) s = x;
+                if (!on && s >= 0) {
+                    int len = (x - 1) - s;
+                    // Nếu đang trong trạng thái né dạt về một bên (preferred_side != 0):
+                    // Ưu tiên dải trống nằm hẳn về bên đó để tránh bị nhảy tâm
+                    bool take_this = false;
+                    if (preferred_side < 0 && (x - 1) < halfW + 30) take_this = true; // Ưu tiên nửa trái
+                    else if (preferred_side > 0 && s > halfW - 30)  take_this = true; // Ưu tiên nửa phải
+                    else if (len > bestLen) take_this = true;
+
+                    if (take_this && len > 20) { // Bỏ qua đốm nhiễu < 20px
+                        bestLen = len; bs = s; be = x - 1;
+                    }
+                    s = -1;
+                }
+            }
+
+            if (bs >= 0) {
+                r.row_centers.push_back({(bs + be) / 2, y});
+                r.left_pts.push_back({bs, y});
+                r.right_pts.push_back({be, y});
             }
         }
+
         r.coverage = (double)nz / ((double)h * (double)w);
         if ((int)r.row_centers.size() < c.min_rows || r.coverage < c.coverage_threshold) {
             r.valid = false; return r;
         }
+
+        // ... [Phần tính toán phân vị yBot, yTop, nearC, midC, farC giữ nguyên] ...
         std::vector<int> ys; ys.reserve(r.row_centers.size());
         for (auto& p : r.row_centers) ys.push_back(p.second);
         std::sort(ys.begin(), ys.end());
@@ -188,22 +214,18 @@ namespace detail {
         int ySplitNear   = yBot - (int)(span * 0.35);
         int ySplitFar    = yTop + (int)(span * 0.30);
 
-        std::vector<int> cornerL, cornerR, nearC, midC, farC;
+        std::vector<int> nearC, midC, farC;
         for (size_t i = 0; i < r.row_centers.size(); ++i) {
             int y  = r.row_centers[i].second;
             int cx = r.row_centers[i].first;
-            if (y >= ySplitCorner) {
-                cornerL.push_back(r.left_pts[i].first);
-                cornerR.push_back(r.right_pts[i].first);
-            }
             if (y >= ySplitNear) nearC.push_back(cx);
             else if (y <= ySplitFar) farC.push_back(cx);
             else midC.push_back(cx);
         }
 
         double nearCx = nearC.empty() ? halfW : medianInts(nearC);
-        double midCx = midC.empty() ? nearCx : medianInts(midC);
-        double farCx = farC.empty() ? midCx  : medianInts(farC);
+        double midCx  = midC.empty()  ? nearCx : medianInts(midC);
+        double farCx  = farC.empty()  ? midCx  : medianInts(farC);
 
         r.near_error = nearCx - halfW;
         r.mid_error  = midCx  - halfW;
@@ -408,7 +430,7 @@ public:
     double settle_start_bias = 0.0;
     double settle_elapsed = 0.0;
     
-    int REQUIRED_ALIGNED_FRAMES = 10;
+    int REQUIRED_ALIGNED_FRAMES = 6;
     int aligned_frames = 0;
 
     // Giảm bias từ từ trong SETTLE
@@ -417,10 +439,10 @@ public:
 
     // Giới hạn thời gian để tránh xe ép cua vô hạn
     double MAX_TURN_TIME = 8.0;
-    double CURVE_THRESHOLD = 4.0;
+    double CURVE_THRESHOLD = 18.0;
     double STRAIGHT_THRESHOLD = 12.0;
     double COUNTDOWN_TIME = 0.0;    
-    double TURN_BIAS_PX = 65.0;
+    double TURN_BIAS_PX = 40.0;
 
     State state = State::IDLE;
     std::string direction = "NONE";
@@ -482,6 +504,8 @@ public:
         State state;
         double steer_bias_px;
         std::string direction;
+        double dev = -1.0;           // <--- THÊM DÒNG NÀY
+        bool mouth_reached = false;  // <--- THÊM DÒNG NÀY
     };
 
     TurnResult update(const std::vector<cv::Point>& left_pts, const std::vector<cv::Point>& right_pts, double dt, bool lane_valid, bool lane_occluded, double near_error, double far_error) {
@@ -490,123 +514,102 @@ public:
 
         auto& pts = (direction == "LEFT") ? left_pts : right_pts;
         double dev = calculate_deviation(pts);
-        std::cout
-        << "[TURN DEBUG]"
-        << " State=" << static_cast<int>(state)
-        << " Direction=" << direction
-        << " Points=" << pts.size()
-        << " Dev=" << dev
-        << " CurveDetected=" << curve_detected
-        << " Countdown=" << countdown
-        << std::endl;
 
-        if (dev < 0) { res.state = state; return res; }
+
+        // Kiểm tra xem mép đường phía trước đã mở rộng ra sát biên ảnh chưa (dấu hiệu đã tới miệng ngã rẽ)
+        bool mouth_reached = false;
+        if (!pts.empty()) {
+            int touch_count = 0;
+            for (const auto& p : pts) {
+                if (p.y <= 220) { // Loại trừ y_bottom (287) không cho kích hoạt sớm
+                    if (direction == "LEFT" && p.x <= 15) touch_count++;
+                    if (direction == "RIGHT" && p.x >= 465) touch_count++;
+                }
+            }
+            if (touch_count >= 1) mouth_reached = true;
+        }
+
+        if (dev < 0 && !mouth_reached) { res.state = state; return res; }
 
         if (state == State::WAIT_CURVE) {
             if (dev >= CURVE_THRESHOLD) {
                 curve_detected = true;
                 state = State::WAIT_STRAIGHT;
-                std::cout << "[TURN] CURVE DETECTED\n";
+                std::cout << "[TURN] CURVE DETECTED (dev: " << dev << ")\n";
             }
         }
         else if (state == State::WAIT_STRAIGHT) {
-            if (dev >= 0 && dev <= STRAIGHT_THRESHOLD) {
-                state = State::COUNTDOWN;
-                countdown = 0.0;
-                std::cout << "[TURN] LANE STRAIGHT - COUNTDOWN\n";
+            // Khi đã phát hiện cua trước đó, chờ dev hạ nhiệt hoặc chóp cua chạm biên ảnh
+            if ((dev >= 0 && dev <= STRAIGHT_THRESHOLD) || mouth_reached) {
+                state = State::EXECUTE;
+                turn_elapsed = 0.0;
+                aligned_frames = 0;
+                turn_bias_current = (direction == "LEFT") ? -TURN_BIAS_PX : TURN_BIAS_PX;
+                res.steer_bias_px = turn_bias_current;
+                std::cout << "[TURN] >> EXECUTING TURN (Smooth 40 deg target)\n";
             }
         }
         else if (state == State::COUNTDOWN) {
-            if (dev < 0 || dev > STRAIGHT_THRESHOLD) {
-                state = State::WAIT_STRAIGHT;
-                countdown = 0.0;
-            } else {
-                countdown += dt;
-
-                if (countdown >= COUNTDOWN_TIME) {
-                    state = State::EXECUTE;
-                    turn_elapsed = 0.0;
-                    aligned_frames = 0;
-
-                    // Bias có dấu theo hướng rẽ.
-                    turn_bias_current =
-                        (direction == "LEFT")
-                        ? -TURN_BIAS_PX
-                        : TURN_BIAS_PX;
-
-                    std::cout << "[TURN] EXECUTING TURN\n";
-                }
+            countdown += dt;
+            if (countdown >= COUNTDOWN_TIME) {
+                state = State::EXECUTE;
+                turn_elapsed = 0.0;
+                aligned_frames = 0;
+                turn_bias_current = (direction == "LEFT") ? -TURN_BIAS_PX : TURN_BIAS_PX;
+                res.steer_bias_px = turn_bias_current; // Áp dụng ngay lập tức không trễ 1 frame
+                std::cout << "[TURN] EXECUTING TURN\n";
             }
         }
         else if (state == State::EXECUTE) {
             turn_elapsed += dt;
 
-            // Kiểm tra xe đã vào hướng đường mới chưa.
-            const double heading_error =
-                std::abs(far_error - near_error);
+            const double heading_error = std::abs(far_error - near_error);
 
+            // Chỉ kiểm tra aligned sau khi đã bẻ lái được tối thiểu 0.6s (tránh nhận nhầm làn cũ lúc mới bắt đầu rẽ)
             const bool lane_aligned =
+                (turn_elapsed > 0.6) &&
                 lane_valid &&
                 !lane_occluded &&
                 std::abs(near_error) < ALIGN_NEAR_THRESHOLD &&
                 std::abs(far_error) < ALIGN_FAR_THRESHOLD &&
                 heading_error < ALIGN_HEADING_THRESHOLD;
 
-            if (lane_aligned) {
-                aligned_frames++;
-            } else {
-                aligned_frames = 0;
-            }
+            if (lane_aligned) aligned_frames++;
+            else aligned_frames = 0;
 
-            // Vẫn ép lái trong khi chưa đủ số frame xác nhận.
             res.steer_bias_px = turn_bias_current;
 
             if (aligned_frames >= REQUIRED_ALIGNED_FRAMES) {
                 state = State::SETTLE;
-
                 settle_start_bias = turn_bias_current;
                 settle_elapsed = 0.0;
-
                 std::cout << "[TURN] NEW LANE ALIGNED - SETTLE\n";
             }
 
-            // Giới hạn an toàn: nếu quá lâu vẫn chưa nhận diện được
-            // làn mới thì không tiếp tục ép lái vô hạn.
-            if (turn_elapsed >= MAX_TURN_TIME &&
-                state == State::EXECUTE) {
+            if (turn_elapsed >= MAX_TURN_TIME && state == State::EXECUTE) {
                 state = State::SETTLE;
-
+                settle_start_bias = turn_bias_current;
+                settle_elapsed = 0.0;
                 std::cout << "[TURN] TIMEOUT - RELEASE TURN BIAS\n";
             }
         }
         else if (state == State::SETTLE) {
-
             settle_elapsed += dt;
-
-            double ratio = 1.0 -
-                settle_elapsed / std::max(SETTLE_TIME, 0.01);
-
-            ratio = std::clamp(ratio, 0.0, 1.0);
-
+            double ratio = std::clamp(1.0 - settle_elapsed / std::max(SETTLE_TIME, 0.01), 0.0, 1.0);
             turn_bias_current = settle_start_bias * ratio;
-
             res.steer_bias_px = turn_bias_current;
 
             if (settle_elapsed >= SETTLE_TIME) {
                 turn_bias_current = 0.0;
                 res.steer_bias_px = 0.0;
-
                 state = State::DONE;
                 completed = true;
-
                 std::cout << "[TURN] TURN BIAS RELEASED\n";
             }
         }
         else if (state == State::DONE) {
-            // Hoàn thành chu trình, cho phép nhận lệnh rẽ tiếp theo.
             state = State::IDLE;
             direction = "NONE";
-
             countdown = 0.0;
             turn_elapsed = 0.0;
             aligned_frames = 0;
@@ -614,10 +617,11 @@ public:
             curve_detected = false;
             settle_start_bias = 0.0;
             settle_elapsed = 0.0;
-
             std::cout << "[TURN] RESET TO IDLE\n";
         }
 
+        res.dev = dev;
+        res.mouth_reached = mouth_reached;
         res.state = state;
         return res;
     }
@@ -631,7 +635,10 @@ public:
     struct Output {
         double angle = 0, speed = 0;
         bool valid = false, occl = false, forced_emer = false, emer_auth = false, losing = false;
-        double near_e = 0, far_e = 0, eff_error = 0, coverage = 0;
+        double near_e = 0, far_e = 0, eff_error = 0, coverage = 0; 
+        double mid_e = 0;         // <--- Bổ sung biến này
+        int dodge_side = 0;       // <--- Bổ sung biến này (lưu hướng né: -1, 0, 1)
+        int dodge_frames = 0;     // <--- Bổ sung biến này (lưu số frame giữ khoảng hở)
         std::vector<std::pair<int, int>> centerline_pts;
         std::vector<std::pair<int, int>> left_line_pts;
         std::vector<std::pair<int, int>> right_line_pts;
@@ -648,96 +655,177 @@ public:
         lastAngle_ = 0; curveSmooth_ = 0; prevValid_ = false;
         asymSmooth_ = 0; emerHold_ = 0;
         invalid_frames_ = 0;
+        dodge_side_locked_ = 0;
+        dodge_hold_frames_ = 0;
     }
     double speed() const { return speed_; }
 
-Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0) {
-        cv::Mat m = detail::preprocessMask(roadMask, c_);
-        Output o;
-        detail::Centerline cl;
-        if (m.empty()) { cl.valid = false; }
-        else cl = detail::extractCenterline(m, curveSmooth_, c_);
-
-        const double nearE = cl.near_error, farE = cl.far_error;
-        curveSmooth_ = cl.curve_smooth;
-        const bool valid = cl.valid;
-
-        // ==========================================
-        // 1 & 2: PHỤC HỒI LOOK-AHEAD VÀ ÔM CUA SỚM
-        // ==========================================
-        // Tỷ lệ tốc độ (0.0 đến 1.0)
-        double speed_factor = std::clamp((speed_ - c_.min_speed) / (c_.max_speed - c_.min_speed + 0.001), 0.0, 1.0);
-        
-        // Chạy càng nhanh, trọng số nhìn xa (far) càng lớn (từ 0.3 lên 0.7)
-        double w_far = 0.4 + 0.35 * speed_factor; 
-        double w_near = 1.0 - w_far;
-
-        // Trích xuất góc cua sớm từ curve_error để bẻ lái gắt trước khi tới góc cua
-        double curve_boost = 0.45 * cl.curve_error; 
-
-        // Phương trình lỗi tổng hợp mới
-        double eff = (w_near * nearE) + (w_far * farE) + curve_boost + totalBiasPx;
-
-        bool occl = gate_.step(eff, cl.coverage, cl.row_centers, valid, farE, nearE);
-        if (occl) emerHold_ = c_.emg_hold_after_occl;
-        else if (emerHold_ > 0) emerHold_--;
-
-        if (!occl && valid && !m.empty()) {
-            double asymRaw = detail::detectAsymmetry(m);
-            asymSmooth_ = c_.asym_ema * asymSmooth_ + (1.0 - c_.asym_ema) * asymRaw;
-            if (std::abs(nearE) < 5.0 && std::abs(asymSmooth_) < c_.asym_cap) asymSmooth_ *= c_.asym_decay;
-            asymSmooth_ = std::clamp(asymSmooth_, -c_.asym_cap, c_.asym_cap);
-        }
-        
-        double asymApplied = (std::abs(asymSmooth_) < c_.asym_threshold) ? 0.0 : c_.asym_strength * asymSmooth_;
-        eff += asymApplied;
-
-        bool forcedEmer = (emerHold_ > 0);
-        pid_.setForcedEmergency(forcedEmer);
-
-        double angle;
-        // ==========================================
-        // 3: XỬ LÝ FAIL-SAFE THỰC TẾ (CHỐNG MÙ)
-        // ==========================================
-        if (valid) {
-            invalid_frames_ = 0; // Reset bộ đếm khi thấy lại đường
-            
-            if (!prevValid_) { pid_.softReset(); gate_.reset(); }
-            angle = pid_.step(eff, c_.kp, c_.rate_limit);
-            double target = detail::planSpeed(curveSmooth_, c_.max_speed, c_.min_speed, c_.curve_scale);
-            double errMult = detail::errorSpeedFactor(eff);
-            double authSpeed = pid_.losing() ? 0.6 : 1.0;
-            target = std::max(target * errMult * authSpeed, c_.min_speed);
-
-            speed_ = 0.65 * speed_ + 0.35 * target;
-            lastAngle_ = angle;
-        } else {
-            invalid_frames_++; // Tăng biến đếm frame lỗi
-            angle = lastAngle_;
-            
-            if (invalid_frames_ > 5) {
-                // Nếu mù liên tiếp quá 5 frames -> Emergency Stop ngay lập tức
-                speed_ = 0.0;
-                forcedEmer = true; 
-            } else {
-                // Mù nhẹ (dưới 5 frames) -> giảm tốc từ từ
-                speed_ = std::max(c_.min_speed, 0.85 * speed_);
-            }
-        }
-        prevValid_ = valid;
-
-        // Cập nhật Output
-        o.angle = angle; o.speed = speed_;
-        o.valid = valid; o.occl = occl; o.forced_emer = forcedEmer;
-        o.emer_auth = pid_.emergencyAuthority(); o.losing = pid_.losing();
-        o.near_e = nearE; o.far_e = farE; o.eff_error = eff; o.coverage = cl.coverage;
-        o.centerline_pts = cl.row_centers;
-        o.left_line_pts  = cl.left_pts;
-        o.right_line_pts = cl.right_pts;
-        o.proc_width = m.cols; o.proc_height = m.rows;
-
-        return o;
+// ==========================================================
+// CẬP NHẬT TRONG LaneFollower::step (LaneFollowerV20.h)
+// ==========================================================
+// ============================================================================
+// HÀM STEP HOÀN CHỈNH CHO CLASS LaneFollower (trong LaneFollowerV20.h)
+// ============================================================================
+Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingTurn = false) {
+    cv::Mat m = detail::preprocessMask(roadMask, c_);
+    Output o;
+    detail::Centerline cl;
+    if (m.empty()) { 
+        cl.valid = false; 
+    } else {
+        cl = detail::extractCenterline(m, curveSmooth_, c_, dodge_side_locked_);    
     }
+
+    const double nearE = cl.near_error;
+    const double midE  = cl.mid_error;
+    const double farE  = cl.far_error;
+    curveSmooth_ = cl.curve_smooth;
+    const bool valid = cl.valid;
+    // -------------------------------------------------------------
+    // PHÁT HIỆN VÀ KHÓA HƯỚNG NÉ VẬT CẢN (OBSTACLE CLEARANCE LOGIC)
+    // -------------------------------------------------------------
+    // Khi một bên làn bị co hẹp bất thường (Near hoặc Mid lệch > 18px)
+    if (std::abs(nearE) > 18.0 || std::abs(midE) > 22.0) {
+        dodge_side_locked_ = (nearE < 0 || midE < 0) ? -1 : 1; // Khóa hẳn hướng né Trái (-1) hoặc Phải (+1)
+        dodge_hold_frames_ = 10; // Giữ trạng thái né thêm 8 frames (~1.3 giây) chống quẹt đuôi
+    } else if (dodge_hold_frames_ > 0) {
+        dodge_hold_frames_--;
+        if (dodge_hold_frames_ == 0) {
+            dodge_side_locked_ = 0; // Đã qua hẳn vật cản, mở khóa
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 1. TÍNH TOÁN SAI SỐ LÀN: STRICT MID-GATED LOOKAHEAD
+    // Triệt tiêu hiện tượng đón cua sớm và tự triệt tiêu sai số khi cua chữ S
+    // ------------------------------------------------------------------------
+    double lane_err = 0.0;
+    
+    // Chỉ coi là ngược chiều (cua chữ S) khi Near THỰC SỰ lệch rõ rệt (|nearE| > 3.0px)
+    // Nếu |nearE| <= 3.0px, xe chỉ đang chạy thẳng ở giữa làn và nhìn thấy cua ở xa
+    const bool is_genuinely_opposite = (nearE * farE < 0.0) && (std::abs(nearE) > 3.0);
+
+    if (is_genuinely_opposite) {
+        // Tình huống chữ S thực sự: Near lệch một bên, Far uốn bên ngược lại
+        if (midE * farE > 0.0 && std::abs(midE) > 6.0) {
+            double capped_far = std::clamp(farE, -20.0, 20.0);
+            lane_err = (0.50 * nearE) + (0.35 * midE) + (0.15 * capped_far);
+        } else {
+            // Khúc cua chưa chạm tới Mid, giữ tâm làn gần
+            lane_err = (0.65 * nearE) + (0.35 * midE);
+        }
+    } else {
+        // Tình huống bình thường hoặc xe đang đi thẳng chuẩn bị vào cua:
+        // Cấp quyền cho Far tham gia kéo lái sớm từ 20% đến 25%
+        double max_far_allowed = std::max(std::abs(midE) * 1.8, 25.0); // Nâng trần cho Far từ 10 lên 25px
+        double safe_far = std::clamp(farE, -max_far_allowed, max_far_allowed);
+        lane_err = (0.45 * nearE) + (0.35 * midE) + (0.20 * safe_far);
+    }
+
+    // ------------------------------------------------------------------------
+    // 2. KHUẾCH ĐẠI PHI TUYẾN (NONLINEAR GAIN)
+    // Giữ xe êm khi ở giữa làn (|err| < 15px), bẻ gắt dứt khoát khi chớm lệch lớn
+    // ------------------------------------------------------------------------
+    const double abs_err = std::abs(lane_err);
+    if (abs_err > 15.0) {
+        // Tăng tuyến tính lực kéo từ 1.0 lên tối đa 1.8 lần khi sai số tăng từ 15px đến 35px
+        double error_scale = std::min(1.0 + (abs_err - 15.0) * 0.04, 1.8);
+        lane_err *= error_scale;
+    }
+
+    // ------------------------------------------------------------------------
+    // 3. KHÓA LỰC KÉO CỦA LÀN ĐI THẲNG CŨ TRONG TRẠNG THÁI RẼ (EXECUTE TURN)
+    // ------------------------------------------------------------------------
+    if (isExecutingTurn) {
+        if (totalBiasPx < -10.0) {
+            // Đang rẽ TRÁI: Không cho phép lực kéo dương (sang phải) của làn thẳng cũ can thiệp
+            lane_err = std::min(lane_err, 0.0);
+        } else if (totalBiasPx > 10.0) {
+            // Đang rẽ PHẢI: Không cho phép lực kéo âm (sang trái) của làn thẳng cũ can thiệp
+            lane_err = std::max(lane_err, 0.0);
+        }
+    }
+
+    double eff = lane_err + totalBiasPx;
+
+    // ------------------------------------------------------------------------
+    // 4. KIỂM SOÁT VẬT CẢN (OCCLUSION GATE) & BẤT ĐỐI XỨNG LÀN (ASYMMETRY)
+    // ------------------------------------------------------------------------
+    bool occl = gate_.step(eff, cl.coverage, cl.row_centers, valid, farE, nearE);
+    if (occl) emerHold_ = c_.emg_hold_after_occl;
+    else if (emerHold_ > 0) emerHold_--;
+
+    if (!occl && valid && !m.empty()) {
+        double asymRaw = detail::detectAsymmetry(m);
+        asymSmooth_ = c_.asym_ema * asymSmooth_ + (1.0 - c_.asym_ema) * asymRaw;
+        if (std::abs(nearE) < 5.0 && std::abs(asymSmooth_) < c_.asym_cap) asymSmooth_ *= c_.asym_decay;
+        asymSmooth_ = std::clamp(asymSmooth_, -c_.asym_cap, c_.asym_cap);
+    }
+    
+    double asymApplied = (std::abs(asymSmooth_) < c_.asym_threshold) ? 0.0 : c_.asym_strength * asymSmooth_;
+    eff += asymApplied;
+
+    bool forcedEmer = (emerHold_ > 0);
+    pid_.setForcedEmergency(forcedEmer);
+
+    // ------------------------------------------------------------------------
+    // 5. ĐIỀU KHIỂN PID VÀ TỰ ĐỘNG GIẢM TỐC THEO ĐỘ GẮT CỦA CUA
+    // ------------------------------------------------------------------------
+    double angle;
+    if (valid) {
+        invalid_frames_ = 0;
+        if (!prevValid_) { pid_.softReset(); gate_.reset(); }
+        
+        angle = pid_.step(eff, c_.kp, c_.rate_limit);
+        
+        double target = detail::planSpeed(curveSmooth_, c_.max_speed, c_.min_speed, c_.curve_scale);
+        
+        // Hãm tốc độ chủ động về mức tối thiểu khi xe đang chịu sai số gần lớn
+        if (std::abs(nearE) > 15.0) {
+            target = std::min(target, c_.min_speed + 1.0);
+        }
+        
+        double errMult = detail::errorSpeedFactor(eff);
+        double authSpeed = pid_.losing() ? 0.6 : 1.0;
+        target = std::max(target * errMult * authSpeed, c_.min_speed);
+
+        speed_ = 0.65 * speed_ + 0.35 * target;
+        lastAngle_ = angle;
+    } else {
+        invalid_frames_++;
+        angle = lastAngle_;
+        if (invalid_frames_ > 5) {
+            speed_ = 0.0;
+            forcedEmer = true; 
+        } else {
+            speed_ = std::max(c_.min_speed, 0.85 * speed_);
+        }
+    }
+    prevValid_ = valid;
+
+    // Đóng gói Output telemetry
+    o.angle = angle;
+    o.speed = speed_;
+    o.valid = valid;
+    o.occl = occl;
+    o.mid_e = midE;                  // <--- Gán giá trị
+    o.dodge_side = dodge_side_locked_;   // <--- Gán giá trị (hoặc biến tương ứng quản lý hướng né trong class)
+    o.dodge_frames = dodge_hold_frames_; // <--- Gán giá trị (hoặc biến đếm frame giữ chỗ)
+    o.forced_emer = forcedEmer;
+    o.emer_auth = pid_.emergencyAuthority();
+    o.losing = pid_.losing();
+    o.near_e = nearE;
+    o.far_e = farE;
+    o.eff_error = eff;
+    o.coverage = cl.coverage;
+    o.centerline_pts = cl.row_centers;
+    o.left_line_pts  = cl.left_pts;
+    o.right_line_pts = cl.right_pts;
+    o.proc_width = m.cols;
+    o.proc_height = m.rows;
+
+    return o;
+}
 
 private:
     Config c_;
@@ -747,6 +835,9 @@ private:
     bool prevValid_;
     int emerHold_;
     int invalid_frames_ = 0;
+    // BỔ SUNG 2 BIẾN NÀY ĐỂ TRÁNH LỖI BIÊN DỊCH:
+    int dodge_side_locked_ = 0;
+    int dodge_hold_frames_ = 0;
 };
 
 }  // namespace v20

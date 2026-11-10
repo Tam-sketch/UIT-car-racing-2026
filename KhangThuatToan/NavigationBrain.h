@@ -27,6 +27,11 @@ struct NavDecision {
 class NavigationBrain {
 public:
     NavigationBrain() = default;
+    void ClearLatchedSign() {
+        latched_sign_ = "NONE";
+        latch_cooldown_frames_ = 0;
+        latched_avoid_bias_ = 0.0f;
+    }
 
     void UpdateSign(const std::vector<SignObject>& signs) {
         for (const auto& s : signs) {
@@ -43,9 +48,18 @@ public:
         }
     }
 
-    std::string GetTurnDirection() {
-        if (latched_sign_ == "turn_left" || latched_sign_ == "construction_ahead") return "LEFT";
-        if (latched_sign_ == "turn_right") return "RIGHT";
+    std::string GetTurnDirection() const {
+        // Nhóm rẽ trái
+        if (latched_sign_ == "turn_left" || 
+            latched_sign_ == "construction_ahead" || 
+            latched_sign_ == "no_right") {
+            return "LEFT";
+        }
+        // Nhóm rẽ phải
+        if (latched_sign_ == "turn_right" || 
+            latched_sign_ == "no_left") {
+            return "RIGHT";
+        }
         return "NONE";
     }
 
