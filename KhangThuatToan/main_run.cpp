@@ -215,13 +215,13 @@ public:
         file_.open(filename_, std::ios::out | std::ios::trunc);
         if (!file_.is_open()) return false;
 
-        file_ << "# AUTO CONTROL & TELEMETRY LOG (UCR2026 LaneFollowerV2.0 + NavigationBrain)\n";
-        // Danh sách 23 cột chuẩn xác, không bị lệch hàng:
+        file_ << "# AUTO CONTROL & TELEMETRY LOG (UCR2026 Enhanced Debug)\n";
+        // Bổ sung các cột: Junction_Opened, Straight_Frames, Barrier_Active, P0, P1, P2
         file_ << "# Columns: Frame,Timestamp_ms,FPS,Speed_cms,Servo_Angle,PID_Angle,"
                  "Near_Error,Mid_Error,Far_Error,Active_Sign,Turn_State,Turn_Direction,"
-                 "Scanline_Dev,Mouth_Reached,Dodge_Side,Dodge_Hold,"
-                 "Countdown,Turn_Elapsed,Nav_Bias,Turn_Bias,Total_Bias,"
-                 "Left_Pts,Right_Pts,IsValid\n";
+                 "Scanline_Dev,Mouth_Reached,Junction_Opened,Straight_Frames,Barrier_Active,"
+                 "Dodge_Side,Dodge_Hold,Countdown,Turn_Elapsed,Nav_Bias,Turn_Bias,Total_Bias,"
+                 "P0,P1,P2,Left_Pts,Right_Pts,IsValid\n";
         file_.flush();
         return true;
     }
@@ -239,12 +239,19 @@ public:
         const std::string& turnDirection,
         double scanlineDev,
         bool mouthReached,
+        bool junctionOpened,
+        int straightFrames,
+        int barrierActive,
         float countdown,
         float turnElapsed,
 
         float navBias,
         float turnBias,
         float totalBias,
+
+        const cv::Point& p0,
+        const cv::Point& p1,
+        const cv::Point& p2,
 
         const std::vector<cv::Point>& leftPts,
         const std::vector<cv::Point>& rightPts
@@ -260,6 +267,10 @@ public:
             return ss.str();
         };
 
+        auto formatPoint = [](const cv::Point& p) {
+            return std::to_string(p.x) + ":" + std::to_string(p.y);
+        };
+
         file_
             << frameIdx << ","
             << std::fixed << std::setprecision(1) << elapsedMs << ","
@@ -268,20 +279,26 @@ public:
             << finalAngle << ","
             << out.angle << ","
             << out.near_e << ","
-            << out.mid_e << ","              // MỚI: Mid error
+            << out.mid_e << ","
             << out.far_e << ","
             << activeSign << ","
             << turnState << ","
             << turnDirection << ","
-            << std::setprecision(2) << scanlineDev << "," // MỚI: dev
-            << (mouthReached ? 1 : 0) << ","              // MỚI: cờ chạm biên miệng cua
-            << out.dodge_side << ","                      // MỚI: hướng né (-1, 0, 1)
-            << out.dodge_frames << ","                    // MỚI: frame giữ khoảng hở
+            << std::setprecision(2) << scanlineDev << ","
+            << (mouthReached ? 1 : 0) << ","
+            << (junctionOpened ? 1 : 0) << ","
+            << straightFrames << ","
+            << barrierActive << ","
+            << out.dodge_side << ","
+            << out.dodge_frames << ","
             << countdown << ","
             << turnElapsed << ","
             << navBias << ","
             << turnBias << ","
             << totalBias << ","
+            << formatPoint(p0) << ","
+            << formatPoint(p1) << ","
+            << formatPoint(p2) << ","
             << "\"" << writePoints(leftPts) << "\","
             << "\"" << writePoints(rightPts) << "\","
             << (out.valid ? 1 : 0)
@@ -553,8 +570,11 @@ int main() {
 
                 static_cast<int>(turn_res.state),
                 turn_res.direction,
-                turn_res.dev,                 // Truyền dev
-                turn_res.mouth_reached,        // Truyền mouth_reached
+                turn_res.dev,
+                turn_res.mouth_reached,
+                turn_res.junction_opened,
+                turn_res.straight_frames,
+                (out.dodge_side != 0 ? 1 : 0),
                 turn_controller.get_countdown(),
                 turn_controller.get_turn_elapsed(),
 
@@ -562,45 +582,23 @@ int main() {
                 turn_res.steer_bias_px,
                 total_bias,
 
+                turn_res.p0,
+                turn_res.p1,
+                turn_res.p2,
+
                 ui_left_pts,
                 ui_right_pts
             );
             
-            // ========================================================
-            // 10. PRINT LOG (Đã bổ sung đầy đủ thông số mới)
-            // ========================================================
-            std::cout << std::string(65, '=') << "\n";
-            std::cout << "[FRAME " << totalFrames << "]\n";
-            std::cout << std::string(65, '-') << "\n";
-            
-            std::cout << "[NAVIGATION]\n";
-            std::cout << "Action          : " << static_cast<int>(dec.action) << "\n";
-            std::cout << "Active sign     : " << dec.active_sign << "\n";
-            std::cout << "Target speed    : " << std::fixed << std::setprecision(2) << speed << "\n";
-            std::cout << "Emergency stop  : " << (dec.emergency_stop ? "True" : "False") << "\n";
-            
-            std::cout << std::string(65, '-') << "\n";
-            std::cout << "[LANE TURN CONTROLLER]\n";
-            std::cout << "State           : " << static_cast<int>(turn_res.state) << "\n";
-            std::cout << "Scanline dev    : " << std::fixed << std::setprecision(2) << turn_res.dev << " px\n";
-            std::cout << "Mouth reached   : " << (turn_res.mouth_reached ? "TRUE" : "FALSE") << "\n";
-            std::cout << "Turn bias       : " << std::fixed << std::setprecision(2) << turn_res.steer_bias_px << " px\n";
-            
-            std::cout << std::string(65, '-') << "\n";
-            std::cout << "[LANE FOLLOWER]\n";
-            std::cout << "Near error      : " << std::fixed << std::setprecision(2) << out.near_e << " px\n";
-            std::cout << "Mid error       : " << std::fixed << std::setprecision(2) << out.mid_e << " px\n";
-            std::cout << "Far error       : " << std::fixed << std::setprecision(2) << out.far_e << " px\n";
-            std::cout << "Dodge locked    : " << (out.dodge_side == -1 ? "LEFT" : (out.dodge_side == 1 ? "RIGHT" : "NONE")) 
-                      << " (hold: " << out.dodge_frames << " frames)\n";
-            std::cout << "Total bias      : " << std::fixed << std::setprecision(2) << total_bias << " px\n";
-            std::cout << "Output angle    : " << std::fixed << std::setprecision(2) << out.angle << "\n";
-            
-            std::cout << std::string(65, '-') << "\n";
-            std::cout << "[SCANLINE]\n";
-            std::cout << "Left points     : " << ui_left_pts.size() << " detected\n";
-            std::cout << "Right points    : " << ui_right_pts.size() << " detected\n";
-            std::cout << std::string(65, '=') << "\n";
+            // In terminal debug ngắn gọn
+            std::cout << "[F " << totalFrames << "] "
+                      << "Dev: " << std::fixed << std::setprecision(1) << turn_res.dev << "px | "
+                      << "Junc: " << (turn_res.junction_opened ? "OPEN" : "WAIT") << " | "
+                      << "StrFrames: " << turn_res.straight_frames << "/3 | "
+                      << "Barrier: " << (out.dodge_side == -1 ? "LEFT" : (out.dodge_side == 1 ? "RIGHT" : "OFF")) << " | "
+                      << "P0(" << turn_res.p0.x << "," << turn_res.p0.y << ") "
+                      << "P1(" << turn_res.p1.x << "," << turn_res.p1.y << ") "
+                      << "P2(" << turn_res.p2.x << "," << turn_res.p2.y << ")\n";
         }
 
         if (SHOW_UI) {
@@ -610,6 +608,49 @@ int main() {
                 cv::Mat blended;
                 cv::addWeighted(frame, 0.65, green, 0.35, 0, blended);
                 blended.copyTo(overlay, mask);
+
+                // ============================================================
+                // A. VẼ BỨC TƯỜNG ẢO (VIRTUAL BARRIER) KHI NÉ VẬT CẢN (ĐỎ MỜ)
+                // ============================================================
+                if (out.dodge_side != 0) {
+                    cv::Mat barrier_layer = overlay.clone();
+                    cv::Rect barrier_rect;
+                    int b_y = static_cast<int>(frame.rows * 0.40);
+                    int b_h = frame.rows - b_y;
+
+                    if (out.dodge_side == -1) {
+                        // Vật cản bên trái: Hộp đỏ che kín gầm xe tải bên trái
+                        barrier_rect = cv::Rect(0, b_y, static_cast<int>(frame.cols * 0.42), b_h);
+                        cv::rectangle(barrier_layer, barrier_rect, cv::Scalar(0, 0, 255), -1);
+                        cv::addWeighted(barrier_layer, 0.45, overlay, 0.55, 0, overlay);
+                        cv::rectangle(overlay, barrier_rect, cv::Scalar(0, 0, 255), 2);
+                        cv::putText(overlay, "[BARRIER LEFT ACTIVE]", cv::Point(10, b_y + 30),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2);
+                    } else if (out.dodge_side == 1) {
+                        // Vật cản bên phải: Hộp đỏ che kín gầm vật cản bên phải
+                        int b_x = static_cast<int>(frame.cols * 0.58);
+                        barrier_rect = cv::Rect(b_x, b_y, frame.cols - b_x, b_h);
+                        cv::rectangle(barrier_layer, barrier_rect, cv::Scalar(0, 0, 255), -1);
+                        cv::addWeighted(barrier_layer, 0.45, overlay, 0.55, 0, overlay);
+                        cv::rectangle(overlay, barrier_rect, cv::Scalar(0, 0, 255), 2);
+                        cv::putText(overlay, "[BARRIER RIGHT ACTIVE]", cv::Point(b_x + 10, b_y + 30),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 255), 2);
+                    }
+                }
+
+                // ============================================================
+                // B. VẼ DẢI KIỂM TRA ĐỘ MỞ NGÃ RẼ (JUNCTION GATE)
+                // ============================================================
+                // 2 đường ngang vàng tầng y = 160 và y = 210
+                cv::line(overlay, cv::Point(0, 160), cv::Point(frame.cols - 1, 160), cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+                cv::line(overlay, cv::Point(0, 210), cv::Point(frame.cols - 1, 210), cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+                
+                // Khi miệng ngã rẽ thực sự mở ra
+                if (turn_res.junction_opened) {
+                    std::string junc_text = (turn_res.direction == "LEFT") ? ">> LEFT JUNCTION OPENED <<" : ">> RIGHT JUNCTION OPENED <<";
+                    cv::putText(overlay, junc_text, cv::Point(static_cast<int>(frame.cols * 0.22), 190),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+                }
 
                 // 1. DRAW HORIZONTAL SCANLINES (Red)
                 if (ui_y1 > 0 && ui_y2 > 0) {
