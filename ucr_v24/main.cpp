@@ -1,6 +1,6 @@
 // ============================================================
-// main.cpp — UCR 2026 V6.5
-// (V6.4 + split RB bias left/right)
+// main.cpp — UCR 2026 V6.4
+// (Roundabout bias split RIGHT/LEFT, UI bias removed)
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -201,13 +201,14 @@ int main() {
     int      rb_exit_search_tick = 0;
     int      rb_cooldown_ticks   = 0;
 
-    std::cout << "\n=== UCR2026 V6.5 (turns="
+    std::cout << "\n=== UCR2026 V6.4 (turns="
               << (signReady ? "yes" : "no") << ") ===\n"
               << "Road: " << ucr::config::ROAD_ENGINE_PATH << "\n";
     if (signReady)
         std::cout << "Sign: " << ucr::config::SIGN_ENGINE_PATH << "\n";
     std::cout << "Control: " << ucr::config::CONTROL_PERIOD_MS << " ms\n"
-              << "Roundabout: bias R=" << ucr::config::RB_BIAS_PX
+              << "Roundabout: bias R="
+              << ucr::config::RB_BIAS_PX_RIGHT
               << " L=" << ucr::config::RB_BIAS_PX_LEFT << "\n"
               << "Press 'q' to quit\n\n";
 
@@ -341,7 +342,6 @@ int main() {
 
             // =================================================
             // 3. Compute bias + force sign by state
-            //    V6.5: split L/R bias — LEFT dùng RB_BIAS_PX_LEFT
             // =================================================
             v21::SignState signState = MakeSignState(voter.GetCommitted());
             float rb_bias_px = 0.0f;
@@ -349,21 +349,21 @@ int main() {
             switch (rb_state) {
                 case RbState::APPROACH:
                     signState.active = false; signState.side = 0;
-                    rb_bias_px = +ucr::config::RB_BIAS_PX;         // RIGHT
+                    rb_bias_px = +ucr::config::RB_BIAS_PX_RIGHT;
                     break;
                 case RbState::IN_CIRCLE:
                     signState.active = false; signState.side = 0;
-                    rb_bias_px = -ucr::config::RB_BIAS_PX_LEFT;    // LEFT (giảm)
+                    rb_bias_px = -ucr::config::RB_BIAS_PX_LEFT;
                     break;
                 case RbState::EXIT_PREP:
                     signState.active = false; signState.side = 0;
-                    rb_bias_px = +ucr::config::RB_BIAS_PX;         // RIGHT
+                    rb_bias_px = +ucr::config::RB_BIAS_PX_RIGHT;
                     break;
                 case RbState::EXIT_SEARCH:
                     signState.active   = true;
                     signState.side     = +1;
                     signState.class_id = 7;   // fake turn_right → Bezier
-                    rb_bias_px = -ucr::config::RB_BIAS_PX_LEFT;    // LEFT (giảm)
+                    rb_bias_px = -ucr::config::RB_BIAS_PX_LEFT;
                     break;
                 case RbState::EXITING:
                     signState.active = false; signState.side = 0;
@@ -414,10 +414,12 @@ int main() {
             if (!out.valid && out.coverage > 0.02)
                 speed = ucr::config::MIN_SPEED_CMS;
 
+            // Roundabout speed cap
             if (rb_state != RbState::NONE) {
                 speed = std::min(speed, ucr::config::RB_SPEED_CAP_CMS);
             }
 
+            // Stop overrides (person priority > red light)
             const bool stopForPerson =
                 (lastPersonSeenTick >= 0) &&
                 ((int)tickIdx - lastPersonSeenTick
@@ -428,6 +430,7 @@ int main() {
                  <= ucr::config::RED_LIGHT_HANGOVER_TICKS);
             if (stopForPerson || stopForRedLight) speed = 0.0f;
 
+            // Soft-start ramp
             const float max_delta = ucr::config::MAX_ACCEL_CMS2 *
                                     (ucr::config::CONTROL_PERIOD_MS / 1000.0f);
             if (speed > applied_speed)
@@ -475,7 +478,7 @@ int main() {
         if (dt > 0.5) { fps = frameCount / dt; frameCount = 0; tPrev = tNow; }
 
         // =====================================================
-        // UI
+        // UI  (bias line removed)
         // =====================================================
         if (ucr::config::SHOW_UI) {
             cv::Mat overlay = frame.clone();
@@ -520,7 +523,7 @@ int main() {
                             cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
             }
 
-            char text1[192], text2[192], text3[128];
+            char text1[192], text2[192];
             std::snprintf(text1, sizeof(text1),
                 "FPS %.1f | spd %.1f/%.1f | PID %.1f | out %d | kf %.2f%s",
                 fps, applied_speed, out.speed, out.angle_pre_gain,
@@ -531,17 +534,10 @@ int main() {
                 ucr::config::SignClassName(voter.GetCommitted()),
                 out.state_str.c_str(),
                 out.near_e, out.far_e, out.coverage);
-            // UI shows actual bias for current tick
-            std::snprintf(text3, sizeof(text3),
-                "rb %s | bias %+.1f px",
-                RbStateName(rb_state),
-                rb_bias_px);
             cv::putText(overlay, text1, {10, 30}, cv::FONT_HERSHEY_SIMPLEX, 0.55,
                         cv::Scalar(0, 255, 0), 2);
             cv::putText(overlay, text2, {10, 55}, cv::FONT_HERSHEY_SIMPLEX, 0.55,
                         cv::Scalar(0, 255, 0), 2);
-            cv::putText(overlay, text3, {10, 80}, cv::FONT_HERSHEY_SIMPLEX, 0.55,
-                        cv::Scalar(0, 165, 255), 2);
 
             cv::imshow("Lane Follower", overlay);
             const int key = cv::waitKey(1) & 0xFF;
