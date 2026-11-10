@@ -89,7 +89,7 @@ struct Config {
     int smooth_win     = 5;
     int base_win       = 50;
     int pull_back      = 3;
-    int corner_radius  = 20;
+    int corner_radius  = 40;
     int min_turn_dist  = 4;
     int extend_len     = 80;
 
@@ -101,10 +101,6 @@ struct Config {
     int   turn_straight_far_px  = 20;
     int   turn_straight_ticks   = 5;
     int   turn_synth_width_px   = 60;
-
-    // Heading-based primary (only referenced if you pasted the heading version)
-    float turn_complete_deg     = 60.0f;
-    float turn_overshoot_deg    = 130.0f;
 
     // --- Turn completion ---
     float turn_complete_deg     = 60.0f;   // release when |Δheading| >= this
