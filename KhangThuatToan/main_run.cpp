@@ -680,7 +680,7 @@ int main() {
                         case NavAction::FOLLOW_LANE: return "FOLLOW_LANE";
                         case NavAction::FORCE_LEFT:  return "FORCE_LEFT";
                         case NavAction::FORCE_RIGHT: return "FORCE_RIGHT";
-                        case NavAction::STOP:        return "STOP";
+                        case NavAction::STOP_PARKING:        return "STOP";
                         default:                     return "UNKNOWN";
                     }
                 };
