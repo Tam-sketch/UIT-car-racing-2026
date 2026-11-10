@@ -1,5 +1,6 @@
 // ============================================================
-// main.cpp — UCR 2026 V6.3 (V6.2 + Roundabout Option 1)
+// main.cpp — UCR 2026 V6.4
+// (V6.3 + Roundabout bias-based state machine)
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -29,9 +30,6 @@ static void SignalHandler(int) { g_stopSignal = 1; }
 
 // ============================================================
 // Sign class → v21::SignState
-//
-// NOTE: ROUNDABOUT returns active=false → no Bezier.
-//       PID follows centerline naturally (đúng cho roundabout).
 // ============================================================
 static v21::SignState MakeSignState(int committed) {
     v21::SignState s;
@@ -44,10 +42,27 @@ static v21::SignState MakeSignState(int committed) {
         case TURN_RIGHT: s.active = true; s.side = +1; break;
         case NO_LEFT:    s.active = true; s.side = +1; break;
         case NO_RIGHT:   s.active = true; s.side = -1; break;
-        // ROUNDABOUT / PARKING / TRAFFIC_LIGHT / WALKING_PERSON: fall through → active=false
         default:         s.active = false; s.side = 0; break;
     }
     return s;
+}
+
+// ============================================================
+// Roundabout state
+// ============================================================
+enum class RbState {
+    NONE, APPROACH, IN_CIRCLE, EXIT_PREP, EXIT_SEARCH, EXITING
+};
+
+static const char* RbStateName(RbState s) {
+    switch (s) {
+        case RbState::APPROACH:    return "APPROACH";
+        case RbState::IN_CIRCLE:   return "IN_CIRCLE";
+        case RbState::EXIT_PREP:   return "EXIT_PREP";
+        case RbState::EXIT_SEARCH: return "EXIT_SEARCH";
+        case RbState::EXITING:     return "EXITING";
+        default:                   return "NONE";
+    }
 }
 
 // ============================================================
@@ -93,25 +108,6 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect2f& bbo
     if (nYel >= MIN_LIT_PIXELS && nYel > nRed && nYel > nGrn) return LightColor::YELLOW;
     if (nGrn >= MIN_LIT_PIXELS && nGrn > nRed && nGrn > nYel) return LightColor::GREEN;
     return LightColor::NONE;
-}
-
-// ============================================================
-// Roundabout state
-// ============================================================
-enum class RbState {
-    NONE,        // bình thường
-    APPROACH,    // thấy sign roundabout, chờ curve cao
-    IN_CIRCLE,   // đang trong vòng, theo dõi exit
-    EXITING      // ép lái phải để vào lane mới
-};
-
-static const char* RbStateName(RbState s) {
-    switch (s) {
-        case RbState::APPROACH:  return "RB APPROACH";
-        case RbState::IN_CIRCLE: return "RB IN CIRCLE";
-        case RbState::EXITING:   return "RB EXITING";
-        default:                 return nullptr;
-    }
 }
 
 // ============================================================
@@ -179,6 +175,8 @@ int main() {
     cfg.bez_look_dist_base     = ucr::config::BEZ_LOOK_DIST_BASE;
     cfg.bez_look_dist_scale    = ucr::config::BEZ_LOOK_DIST_SCALE;
     cfg.bez_err_clamp_px       = ucr::config::BEZ_ERR_CLAMP_PX;
+    cfg.bez_ctrl_offset_frac   = ucr::config::BEZ_CTRL_OFFSET_FRAC;
+    cfg.rb_bias_ema            = ucr::config::RB_BIAS_EMA;
     v21::LaneFollower follower(cfg);
 
     cv::Mat frame, small_mask;
@@ -196,22 +194,21 @@ int main() {
     int lastPersonSeenTick = -1;
     int lastRedSeenTick    = -1;
 
-    // --- Roundabout state machine variables ---
-    RbState rb_state           = RbState::NONE;
-    int     rb_approach_tick   = 0;
-    int     rb_in_circle_tick  = 0;
-    int     rb_exit_tick       = 0;
-    int     rb_curve_high_streak = 0;
-    int     rb_curve_low_streak  = 0;
-    int     rb_cooldown_ticks  = 0;
+    // --- Roundabout state ---
+    RbState  rb_state            = RbState::NONE;
+    uint32_t rb_enter_tick       = 0;
+    int      rb_missing_sign     = 0;
+    int      rb_exit_search_tick = 0;
+    int      rb_cooldown_ticks   = 0;
 
-    std::cout << "\n=== UCR2026 V6.3 (turns="
+    std::cout << "\n=== UCR2026 V6.4 (turns="
               << (signReady ? "yes" : "no") << ") ===\n"
               << "Road: " << ucr::config::ROAD_ENGINE_PATH << "\n";
     if (signReady)
         std::cout << "Sign: " << ucr::config::SIGN_ENGINE_PATH << "\n";
     std::cout << "Control: " << ucr::config::CONTROL_PERIOD_MS << " ms\n"
-              << "Roundabout: Option 1 (curve-based exit)\n"
+              << "Roundabout: bias-based state machine (RB_BIAS_PX="
+              << ucr::config::RB_BIAS_PX << ")\n"
               << "Press 'q' to quit\n\n";
 
     while (!g_stopSignal) {
@@ -237,7 +234,7 @@ int main() {
         else if (now >= next_control) {
 
             // =================================================
-            // 1. Sign detection + voter
+            // 1. Sign detection (throttled)
             // =================================================
             if (signReady && (tickIdx % ucr::config::SIGN_DETECT_EVERY) == 0) {
                 sign.Detect(frame, lastDets);
@@ -264,7 +261,6 @@ int main() {
                     }
 
                     int cls = (d.class_id == CONSTRUCTION_AHEAD) ? TURN_LEFT : d.class_id;
-                    // Feed voter with turn + roundabout (roundabout used for RB state)
                     if (cls == TURN_LEFT || cls == TURN_RIGHT ||
                         cls == NO_LEFT   || cls == NO_RIGHT ||
                         cls == ROUNDABOUT) {
@@ -275,97 +271,132 @@ int main() {
             }
 
             // =================================================
-            // 2. PID step (Bezier only fires for turn signs)
+            // 2. Roundabout state machine
             // =================================================
-            v21::SignState signState = MakeSignState(voter.GetCommitted());
-            out = follower.step(small_mask, signState);
-
-            // =================================================
-            // 3. Roundabout state machine
-            //    Detects entry (curve high) and exit (curve low)
-            // =================================================
-            const bool rb_sign_committed =
-                (voter.GetCommitted() == ucr::config::sign_class::ROUNDABOUT);
-
-            // Curve proxy: far_e - near_e ≈ curve_error
-            const double curve_proxy = out.valid
-                ? (out.far_e - out.near_e)
-                : 0.0;
-
-            if (rb_state == RbState::EXITING) {
-                // Always count ticks (timeout fires even if mask invalid)
-                ++rb_exit_tick;
-                const bool timeout   = rb_exit_tick >= ucr::config::RB_EXIT_TIMEOUT_TICKS;
-                const bool found_lane = (rb_exit_tick >= 8)
-                                     && out.valid
-                                     && (std::abs(out.near_e) < 10.0);
-                if (timeout || found_lane) {
-                    rb_state = RbState::NONE;
-                    voter.Reset();
-                    rb_cooldown_ticks = ucr::config::RB_COOLDOWN_TICKS;
-                }
-            } else if (out.valid) {
-                switch (rb_state) {
-                    case RbState::NONE:
-                        if (rb_sign_committed && rb_cooldown_ticks <= 0) {
-                            rb_state           = RbState::APPROACH;
-                            rb_approach_tick   = 0;
-                            rb_curve_high_streak = 0;
-                        }
-                        break;
-
-                    case RbState::APPROACH:
-                        ++rb_approach_tick;
-                        if (std::abs(curve_proxy) > ucr::config::RB_CURVE_ENTER_THRESH) {
-                            if (++rb_curve_high_streak >= ucr::config::RB_CURVE_ENTER_TICKS) {
-                                rb_state            = RbState::IN_CIRCLE;
-                                rb_in_circle_tick   = 0;
-                                rb_curve_high_streak = 0;
-                                rb_curve_low_streak  = 0;
-                            }
-                        } else {
-                            rb_curve_high_streak = 0;
-                        }
-                        if (rb_approach_tick >= ucr::config::RB_APPROACH_TIMEOUT) {
-                            rb_state = RbState::NONE;
-                            voter.Reset();
-                            rb_cooldown_ticks = ucr::config::RB_COOLDOWN_TICKS;
-                        }
-                        break;
-
-                    case RbState::IN_CIRCLE:
-                        ++rb_in_circle_tick;
-                        if (rb_in_circle_tick >= ucr::config::RB_MIN_CIRCLE_TICKS &&
-                            std::abs(curve_proxy) < ucr::config::RB_CURVE_EXIT_THRESH) {
-                            if (++rb_curve_low_streak >= ucr::config::RB_CURVE_EXIT_TICKS) {
-                                rb_state            = RbState::EXITING;
-                                rb_exit_tick        = 0;
-                                rb_curve_low_streak = 0;
-                            }
-                        } else {
-                            rb_curve_low_streak = 0;
-                        }
-                        break;
-
-                    case RbState::EXITING:
-                        // handled above
-                        break;
+            bool rb_visible_now = false;
+            for (const auto& d : lastDets) {
+                if (d.class_id == ucr::config::sign_class::ROUNDABOUT &&
+                    d.confidence >= ucr::config::SIGN_CONF_THRESH) {
+                    rb_visible_now = true;
+                    break;
                 }
             }
+
+            const bool rb_committed =
+                (voter.GetCommitted() == ucr::config::sign_class::ROUNDABOUT);
 
             if (rb_cooldown_ticks > 0) --rb_cooldown_ticks;
 
+            // Track "missing sign" for APPROACH & EXIT_PREP
+            if (rb_state == RbState::APPROACH ||
+                rb_state == RbState::EXIT_PREP) {
+                if (rb_visible_now) rb_missing_sign = 0;
+                else                ++rb_missing_sign;
+            }
+
+            switch (rb_state) {
+                case RbState::NONE:
+                    if (rb_committed && rb_cooldown_ticks <= 0) {
+                        rb_state = RbState::APPROACH;
+                        rb_missing_sign = 0;
+                    }
+                    break;
+
+                case RbState::APPROACH:
+                    if (rb_missing_sign >= ucr::config::RB_MISSING_SIGN_TICKS) {
+                        rb_state = RbState::IN_CIRCLE;
+                        rb_enter_tick = tickIdx;
+                    }
+                    break;
+
+                case RbState::IN_CIRCLE: {
+                    const bool timeout =
+                        (int)(tickIdx - rb_enter_tick) >= ucr::config::RB_CIRCLE_TIMEOUT;
+                    const bool rb_seen_again = rb_committed && rb_visible_now;
+                    if (timeout || rb_seen_again) {
+                        rb_state = RbState::EXIT_PREP;
+                        rb_missing_sign = 0;
+                    }
+                    break;
+                }
+
+                case RbState::EXIT_PREP:
+                    if (rb_missing_sign >= ucr::config::RB_MISSING_SIGN_TICKS) {
+                        rb_state = RbState::EXIT_SEARCH;
+                        rb_exit_search_tick = 0;
+                    }
+                    break;
+
+                case RbState::EXIT_SEARCH:
+                    ++rb_exit_search_tick;
+                    if (rb_exit_search_tick >= ucr::config::RB_EXIT_SEARCH_TIMEOUT) {
+                        rb_state = RbState::EXITING;
+                    }
+                    break;
+
+                case RbState::EXITING:
+                    // Post-step handles transition to NONE
+                    break;
+            }
+
             // =================================================
-            // 4. Steering
+            // 3. Compute bias + force sign by state
+            // =================================================
+            v21::SignState signState = MakeSignState(voter.GetCommitted());
+            float rb_bias_px = 0.0f;
+
+            switch (rb_state) {
+                case RbState::APPROACH:
+                    signState.active = false; signState.side = 0;
+                    rb_bias_px = +ucr::config::RB_BIAS_PX;
+                    break;
+                case RbState::IN_CIRCLE:
+                    signState.active = false; signState.side = 0;
+                    rb_bias_px = -ucr::config::RB_BIAS_PX;
+                    break;
+                case RbState::EXIT_PREP:
+                    signState.active = false; signState.side = 0;
+                    rb_bias_px = +ucr::config::RB_BIAS_PX;
+                    break;
+                case RbState::EXIT_SEARCH:
+                    signState.active   = true;
+                    signState.side     = +1;
+                    signState.class_id = 7;   // fake turn_right → Bezier
+                    rb_bias_px = -ucr::config::RB_BIAS_PX;
+                    break;
+                case RbState::EXITING:
+                    signState.active = false; signState.side = 0;
+                    rb_bias_px = 0.0f;
+                    break;
+                default:
+                    rb_bias_px = 0.0f;
+                    break;
+            }
+
+            // =================================================
+            // 4. PID step with roundabout bias
+            // =================================================
+            out = follower.step(small_mask, signState, NAN, rb_bias_px);
+
+            // =================================================
+            // 5. Post-step transitions
+            // =================================================
+            if (rb_state == RbState::EXIT_SEARCH &&
+                out.state_str.find("TURN") != std::string::npos) {
+                rb_state = RbState::EXITING;
+            }
+            if (rb_state == RbState::EXITING &&
+                out.state_str == "CENTERLINE" &&
+                !out.turn_modified) {
+                rb_state = RbState::NONE;
+                rb_cooldown_ticks = ucr::config::RB_COOLDOWN_TICKS;
+                voter.Reset();
+            }
+
+            // =================================================
+            // 6. Steering
             // =================================================
             float desired_real_left = -static_cast<float>(out.angle);
-
-            // Override during EXITING: force right steer for first N ticks
-            if (rb_state == RbState::EXITING
-                && rb_exit_tick >= 1
-                && rb_exit_tick <= ucr::config::RB_EXIT_STEER_TICKS) {
-                desired_real_left = -ucr::config::RB_EXIT_STEER_DEG;   // negative = right
-            }
 
             desired_real_left = std::clamp(desired_real_left,
                                            -ucr::config::MAX_REAL_ANGLE_DEG,
@@ -377,7 +408,7 @@ int main() {
             const int final_angle = static_cast<int>(std::lround(servo_cmd));
 
             // =================================================
-            // 5. Speed
+            // 7. Speed
             // =================================================
             float speed = static_cast<float>(out.speed);
             if (!out.valid && out.coverage > 0.02)
@@ -411,7 +442,7 @@ int main() {
             servo.SetAngle(final_angle);
 
             // =================================================
-            // 6. Advance tick + log
+            // 8. Advance tick + log
             // =================================================
             ++tickIdx;
             next_control += std::chrono::milliseconds(ucr::config::CONTROL_PERIOD_MS);
@@ -420,21 +451,21 @@ int main() {
 
             static auto lastLog = std::chrono::steady_clock::now();
             if (now - lastLog >= std::chrono::seconds(1)) {
-                const char* rb_str = RbStateName(rb_state);
                 const char* stop_str = stopForPerson   ? "STOP:person"
                                      : stopForRedLight ? "STOP:red"
                                      :                   "-";
                 std::printf(
-                    "[t=%u] sign=%-11s(%d) state=%-15s rb=%-13s %-11s "
-                    "near=%6.1f far=%6.1f curve=%6.1f "
+                    "[t=%u] sign=%-11s(%d) state=%-15s rb=%-11s "
+                    "bias=%+5.1f near=%6.1f far=%6.1f %-11s "
                     "spd=%.1f pid=%.1f out=%.1f\n",
                     tickIdx,
                     ucr::config::SignClassName(voter.GetCommitted()),
                     voter.GetCommitted(),
                     out.state_str.c_str(),
-                    rb_str ? rb_str : "-",
+                    RbStateName(rb_state),
+                    rb_bias_px,
+                    out.near_e, out.far_e,
                     stop_str,
-                    out.near_e, out.far_e, curve_proxy,
                     applied_speed, out.angle_pre_gain, out.angle);
                 lastLog = now;
             }
@@ -471,7 +502,7 @@ int main() {
                     cv::Scalar color(0, 0, 255);
                     if (out.state_str.find("TURN")  != std::string::npos) color = cv::Scalar(255, 0, 255);
                     if (out.state_str.find("GHOST") != std::string::npos) color = cv::Scalar(0, 255, 255);
-                    if (rb_state == RbState::EXITING)                     color = cv::Scalar(0, 200, 255);
+                    if (rb_state != RbState::NONE)                        color = cv::Scalar(0, 165, 255);
 
                     for (size_t i = 0; i + 1 < pts.size(); ++i)
                         cv::line(overlay, pts[i], pts[i + 1], color, 2);
@@ -492,23 +523,27 @@ int main() {
                             cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
             }
 
-            char text1[192], text2[192];
-            const char* rb_str = RbStateName(rb_state);
+            char text1[192], text2[192], text3[128];
             std::snprintf(text1, sizeof(text1),
                 "FPS %.1f | spd %.1f/%.1f | PID %.1f | out %d | kf %.2f%s",
                 fps, applied_speed, out.speed, out.angle_pre_gain,
                 (int)std::lround(out.angle), out.kept_frac,
                 (!out.valid && inferOK) ? " INV" : "");
             std::snprintf(text2, sizeof(text2),
-                "sign %s | %s | %s | curve %.1f",
+                "sign %s | %s | near %.1f far %.1f cov %.3f",
                 ucr::config::SignClassName(voter.GetCommitted()),
                 out.state_str.c_str(),
-                rb_str ? rb_str : "-",
-                out.far_e - out.near_e);
+                out.near_e, out.far_e, out.coverage);
+            std::snprintf(text3, sizeof(text3),
+                "rb %s | bias %+.1f px",
+                RbStateName(rb_state),
+                (rb_state == RbState::NONE) ? 0.0f : ucr::config::RB_BIAS_PX);
             cv::putText(overlay, text1, {10, 30}, cv::FONT_HERSHEY_SIMPLEX, 0.55,
                         cv::Scalar(0, 255, 0), 2);
             cv::putText(overlay, text2, {10, 55}, cv::FONT_HERSHEY_SIMPLEX, 0.55,
                         cv::Scalar(0, 255, 0), 2);
+            cv::putText(overlay, text3, {10, 80}, cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                        cv::Scalar(0, 165, 255), 2);
 
             cv::imshow("Lane Follower", overlay);
             const int key = cv::waitKey(1) & 0xFF;

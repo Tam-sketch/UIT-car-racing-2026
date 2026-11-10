@@ -1,11 +1,6 @@
 // ============================================================
-// control/LaneFollowerV21.h — V6.2 (A + B applied)
-//
-// V6.1 patches: 5 fixes (multi-branch, tangent, mask-release,
-//               heading-release, max-ticks fallback)
-// V6.2 patches:
-//   [A] turn_commit_proximity = 0.30 (in RobotConfig.h)
-//   [B] Pure Pursuit lookahead (replaces 2/3 * path.size())
+// control/LaneFollowerV21.h — V6.4
+// (V6.2 Pure Pursuit + Bezier shape + Roundabout bias input)
 // ============================================================
 #pragma once
 
@@ -93,13 +88,19 @@ struct Config {
     int   turn_synth_width_px    = 60;
     float turn_release_road_frac = 0.65f;
     int   turn_release_window_px = 12;
-    float turn_commit_proximity  = 0.30f;   // [A] default updated
+    float turn_commit_proximity  = 0.30f;
     float turn_complete_deg      = 60.0f;
 
-    // [B] Pure Pursuit
+    // Pure Pursuit
     float bez_look_dist_base  = 40.0f;
     float bez_look_dist_scale = 30.0f;
     float bez_err_clamp_px    = 60.0f;
+
+    // Bezier shape
+    float bez_ctrl_offset_frac = 0.40f;
+
+    // Roundabout bias EMA
+    float rb_bias_ema = 0.3f;
 };
 
 // ============================================================
@@ -285,16 +286,6 @@ inline bool branchLooksCorrect(const std::vector<Point>& cl, int turn_side) {
     return true;
 }
 
-// ============================================================
-// [B] Pure Pursuit lookahead on a path
-//
-// Cho trước:
-//   - path: vector of points, front() = gần car nhất, back() = xa nhất
-//   - car_pt: vị trí car trong mask coords (thường = (cols/2, rows))
-//   - look_dist: khoảng cách lookahead (px)
-// Trả về: điểm đầu tiên trên path có Euclidean distance >= look_dist
-//         (hoặc path.back() nếu không có điểm nào đủ xa)
-// ============================================================
 inline Point purePursuitLookahead(const std::vector<Point>& path,
                                    Point car_pt,
                                    double look_dist) {
@@ -464,7 +455,7 @@ private:
 };
 
 // ============================================================
-// V21 LANE FOLLOWER (V6.2)
+// V21 LANE FOLLOWER
 // ============================================================
 class LaneFollower {
 public:
@@ -489,6 +480,7 @@ public:
         pid_.reset(); gate_.reset();
         lastAngle_ = 0; curveSmooth_ = 0; prevValid_ = false;
         prevFarE_ = 0; dFarFilt_ = 0; asymSmooth_ = 0; emerHold_ = 0;
+        bias_smoothed_ = 0.0f;
         turn_memory_ = TurnMemory();
         turn_committed_ = false;
         turn_committed_side_ = 0;
@@ -501,7 +493,8 @@ public:
     void softReset() { pid_.softReset(); }
 
     Output step(const cv::Mat& rawMask, const SignState& sign,
-                float heading_deg = NAN) {
+                float heading_deg = NAN,
+                float bias_px = 0.0f) {
         Output o;
 
         double kept_frac = 1.0;
@@ -676,29 +669,26 @@ public:
         }
 
         // ============================================================
-        // 6. Error into PID
-        //    [B] Pure Pursuit lookahead replaces 2/3 * path.size()
+        // Error into PID with roundabout bias
         // ============================================================
-        double final_error = eff_error_v20;
+        bias_smoothed_ = (1.0f - c_.rb_bias_ema) * bias_smoothed_
+                       + c_.rb_bias_ema * bias_px;
+
+        const double eff_error_with_bias = eff_error_v20 + bias_smoothed_;
+
+        double final_error = eff_error_with_bias;
         if (should_turn && final_path.size() > 5) {
-            // Car position = bottom-center of image (camera origin)
             const Point car_pt = { cleanMask.cols / 2, cleanMask.rows };
 
-            // Speed-dependent lookahead distance
-            // At min+3 (13 cm/s): look ≈ 40 + 30*0.65 ≈ 59 px
-            // At max (20 cm/s):   look ≈ 40 + 30*1.00 = 70 px
             const double speed_ratio =
                 std::min(1.0, std::max(0.0, speed_ / std::max(c_.max_speed, 1.0)));
             const double look_dist =
                 c_.bez_look_dist_base + c_.bez_look_dist_scale * speed_ratio;
 
-            // Find first point on path at distance >= look_dist
             const Point target = detail::purePursuitLookahead(
                 final_path, car_pt, look_dist);
 
             final_error = target.x - (cleanMask.cols / 2.0);
-
-            // Clamp to prevent PID saturation if mask jumps
             final_error = std::clamp(final_error,
                                      -(double)c_.bez_err_clamp_px,
                                       (double)c_.bez_err_clamp_px);
@@ -707,7 +697,7 @@ public:
         } else {
             double target_speed = detail::planSpeed(
                 curveSmooth_, c_.max_speed, c_.min_speed, c_.curve_scale);
-            double errMult   = detail::errorSpeedFactor(eff_error_v20);
+            double errMult   = detail::errorSpeedFactor(eff_error_with_bias);
             double authSpeed = pid_.losing() ? 0.6 : 1.0;
             target_speed = std::max(target_speed * errMult * authSpeed, 0.0);
             speed_ = 0.7 * speed_ + 0.3 * target_speed;
@@ -753,6 +743,7 @@ private:
     double speed_, lastAngle_, curveSmooth_, prevFarE_, dFarFilt_, asymSmooth_;
     bool prevValid_;
     int emerHold_;
+    float bias_smoothed_ = 0.0f;
 
     bool  turn_committed_       = false;
     int   turn_committed_side_  = 0;
@@ -938,9 +929,12 @@ private:
         int A_y = y_c + d_bez, A_idx = idx;
         for (int i = idx; i >= 0; --i)
             if (centerline[i].y >= A_y) { A_idx = i; break; }
-        Point A    = centerline[A_idx];
-        Point B    = {x_c + sign * d_bez, y_c};
-        Point ctrl = {x_c, y_c};
+        Point A = centerline[A_idx];
+        Point B = {x_c + sign * d_bez, y_c};
+
+        const int ctrl_offset = sign * static_cast<int>(d_bez * c_.bez_ctrl_offset_frac);
+        Point ctrl = {x_c + ctrl_offset, y_c};
+
         auto bez = detail::quadraticBezier(A, ctrl, B, 10);
         std::vector<Point> path(centerline.begin(),
                                 centerline.begin() + A_idx + 1);

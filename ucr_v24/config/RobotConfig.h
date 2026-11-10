@@ -1,15 +1,11 @@
 // ============================================================
-// config/RobotConfig.h — UCR 2026 V6.3
-// (V6.2 A+B Pure Pursuit + Roundabout Option 1)
+// config/RobotConfig.h — UCR 2026 V6.4
+// (V6.3 + Roundabout bias-based state machine)
 // ============================================================
 #pragma once
 
 namespace ucr {
 namespace config {
-
-// ============================================================
-// SECTION A — Active in current build
-// ============================================================
 
 // --------------------------------------------------------
 // Model paths
@@ -24,10 +20,7 @@ inline constexpr float MAX_SPEED_CMS = 20.0f;
 inline constexpr float MIN_SPEED_CMS = 10.0f;
 
 // --------------------------------------------------------
-// Servo calibration (measured empirically)
-//
-//   servo_cmd > 0 (left):   real =  0.96 * servo_cmd − 6.2
-//   servo_cmd < 0 (right):  real =  0.71 * servo_cmd + 2.5
+// Servo calibration
 // --------------------------------------------------------
 inline constexpr float SERVO_LEFT_SLOPE    = 0.96f;
 inline constexpr float SERVO_LEFT_OFFSET   = -6.2f;
@@ -37,25 +30,21 @@ inline constexpr float MAX_REAL_ANGLE_DEG  = 30.0f;
 inline constexpr int   MAX_SERVO_CMD       = 55;
 
 inline float RealAngleToServo(float real_deg) {
-    if (real_deg > 0.0f)
-        return (real_deg - SERVO_LEFT_OFFSET) / SERVO_LEFT_SLOPE;
-    if (real_deg < 0.0f)
-        return (real_deg - SERVO_RIGHT_OFFSET) / SERVO_RIGHT_SLOPE;
+    if (real_deg > 0.0f) return (real_deg - SERVO_LEFT_OFFSET) / SERVO_LEFT_SLOPE;
+    if (real_deg < 0.0f) return (real_deg - SERVO_RIGHT_OFFSET) / SERVO_RIGHT_SLOPE;
     return 0.0f;
 }
 
 inline float ServoToRealAngle(float servo_cmd) {
-    if (servo_cmd > 0.0f)
-        return SERVO_LEFT_SLOPE * servo_cmd + SERVO_LEFT_OFFSET;
-    if (servo_cmd < 0.0f)
-        return SERVO_RIGHT_SLOPE * servo_cmd + SERVO_RIGHT_OFFSET;
+    if (servo_cmd > 0.0f) return SERVO_LEFT_SLOPE * servo_cmd + SERVO_LEFT_OFFSET;
+    if (servo_cmd < 0.0f) return SERVO_RIGHT_SLOPE * servo_cmd + SERVO_RIGHT_OFFSET;
     return 0.0f;
 }
 
 // --------------------------------------------------------
 // Control loop
 // --------------------------------------------------------
-inline constexpr int   CONTROL_PERIOD_MS = 100;   // 10 Hz
+inline constexpr int   CONTROL_PERIOD_MS = 100;
 inline constexpr float MAX_ACCEL_CMS2    = 20.0f;
 
 // --------------------------------------------------------
@@ -73,10 +62,6 @@ inline constexpr int    MIN_ROWS           = 5;
 inline constexpr double COVERAGE_THRESHOLD = 0.05;
 
 inline constexpr bool SHOW_UI = true;
-
-// ============================================================
-// SECTION B — Sign / Turn / Roundabout
-// ============================================================
 
 // --------------------------------------------------------
 // Sign model
@@ -113,7 +98,7 @@ inline constexpr const char* SignClassName(int id) {
 }
 
 // --------------------------------------------------------
-// Traffic light HSV classifier (OpenCV H:0-180, S/V:0-255)
+// Traffic light HSV
 // --------------------------------------------------------
 namespace tl {
     inline constexpr int RED_H1_LO = 0;
@@ -130,19 +115,18 @@ namespace tl {
     inline constexpr float ROI_EXPAND   = 1.20f;
 }
 
-// Stop hangover after last sighting
-inline constexpr int PERSON_STOP_HANGOVER_TICKS = 20;   // ~2 s
-inline constexpr int RED_LIGHT_HANGOVER_TICKS   = 10;   // ~1 s
+inline constexpr int PERSON_STOP_HANGOVER_TICKS = 20;
+inline constexpr int RED_LIGHT_HANGOVER_TICKS   = 10;
 
 // --------------------------------------------------------
-// Sign detect + voter timers
+// Sign detect + voter
 // --------------------------------------------------------
 inline constexpr int SIGN_DETECT_EVERY             = 2;
 inline constexpr int SIGN_VOTER_ACTIVATE_FRAMES    = 2;
 inline constexpr int SIGN_VOTER_TIMEOUT_FRAMES     = 30;
 
 // --------------------------------------------------------
-// Opening detection (V21)
+// Opening detection
 // --------------------------------------------------------
 inline constexpr int OPEN_THRESH      = 15;
 inline constexpr int OPEN_MIN_HEIGHT  = 10;
@@ -157,46 +141,50 @@ inline constexpr int BEZIER_MIN_TURN_DIST  = 4;
 inline constexpr int BEZIER_EXTEND_LEN     = 80;
 
 // --------------------------------------------------------
-// Turn completion (V6.1)
+// Turn completion
 // --------------------------------------------------------
 inline constexpr int   TURN_MIN_TICKS         = 8;
 inline constexpr int   TURN_MAX_TICKS         = 30;
 inline constexpr int   TURN_SYNTH_WIDTH_PX    = 60;
 inline constexpr float TURN_RELEASE_ROAD_FRAC = 0.65f;
 inline constexpr int   TURN_RELEASE_WINDOW_PX = 12;
-inline constexpr float TURN_COMMIT_PROXIMITY  = 0.30f;   // [A] fixed
+inline constexpr float TURN_COMMIT_PROXIMITY  = 0.30f;
 inline constexpr float TURN_COMPLETE_DEG      = 60.0f;
 
 // --------------------------------------------------------
-// [B] Pure Pursuit lookahead (V6.2)
+// Pure Pursuit lookahead
 // --------------------------------------------------------
-inline constexpr float BEZ_LOOK_DIST_BASE  = 40.0f;   // px
-inline constexpr float BEZ_LOOK_DIST_SCALE = 30.0f;   // px per speed_ratio
-inline constexpr float BEZ_ERR_CLAMP_PX    = 60.0f;   // max |final_error| during turn
+inline constexpr float BEZ_LOOK_DIST_BASE  = 40.0f;
+inline constexpr float BEZ_LOOK_DIST_SCALE = 30.0f;
+inline constexpr float BEZ_ERR_CLAMP_PX    = 60.0f;
 
 // --------------------------------------------------------
-// Roundabout state machine (Option 1 — V6.3)
+// Bezier shape
+// --------------------------------------------------------
+inline constexpr float BEZ_CTRL_OFFSET_FRAC = 0.40f;
+
+// --------------------------------------------------------
+// Roundabout bias-based state machine (V6.4)
 //
-// Flow:
-//   1. sign "roundabout" → APPROACH  (speed cap 12)
-//   2. curve tăng cao    → IN_CIRCLE (PID tự chạy vòng)
-//   3. curve sụt thấp    → EXITING   (ép lái phải 10°)
-//   4. sau 6-15 ticks    → NONE      (cooldown 20 tick)
+//   NONE         bias  0   speed PID  → rb_committed
+//   APPROACH     bias +B   ≤12         → sign missing 5t
+//   IN_CIRCLE    bias -B   ≤12         → timeout OR rb_seen#2
+//   EXIT_PREP    bias +B   ≤12         → sign missing 5t
+//   EXIT_SEARCH  bias -B   ≤12 + force side=+1 (Bezier fires)
+//   EXITING      bias  0   ≤12 (Bezier active) → CENTERLINE
+//
+// B = RB_BIAS_PX (default 55px ≈ 2/3 of half-lane)
 // --------------------------------------------------------
-inline constexpr float RB_CURVE_ENTER_THRESH  = 30.0f;   // |far_e-near_e| > → enter circle
-inline constexpr float RB_CURVE_EXIT_THRESH   = 12.0f;   // < → exit candidate
-inline constexpr int   RB_CURVE_ENTER_TICKS   = 3;       // streak to confirm enter
-inline constexpr int   RB_CURVE_EXIT_TICKS    = 3;       // streak to confirm exit
-inline constexpr int   RB_MIN_CIRCLE_TICKS    = 5;       // min time in circle
-inline constexpr float RB_EXIT_STEER_DEG      = 10.0f;   // right steer magnitude
-inline constexpr int   RB_EXIT_STEER_TICKS    = 6;       // force steer duration
-inline constexpr int   RB_EXIT_TIMEOUT_TICKS  = 15;      // hard exit
-inline constexpr int   RB_APPROACH_TIMEOUT    = 100;     // 10s give up if no curve
-inline constexpr int   RB_COOLDOWN_TICKS      = 20;      // 2s after exit
-inline constexpr float RB_SPEED_CAP_CMS       = 12.0f;   // speed cap during roundabout
+inline constexpr float RB_BIAS_PX              = 55.0f;
+inline constexpr float RB_BIAS_EMA             = 0.3f;
+inline constexpr int   RB_MISSING_SIGN_TICKS   = 5;
+inline constexpr int   RB_CIRCLE_TIMEOUT       = 100;
+inline constexpr int   RB_EXIT_SEARCH_TIMEOUT  = 40;
+inline constexpr float RB_SPEED_CAP_CMS        = 12.0f;
+inline constexpr int   RB_COOLDOWN_TICKS       = 20;
 
 // --------------------------------------------------------
-// Heading (BNO055) — optional, unused in current build
+// Heading
 // --------------------------------------------------------
 inline constexpr float HEADING_SIGN       = 1.0f;
 inline constexpr float HEADING_OFFSET_DEG = 0.0f;
