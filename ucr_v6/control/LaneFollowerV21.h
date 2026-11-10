@@ -105,6 +105,11 @@ struct Config {
     // --- Turn completion ---
     float turn_complete_deg     = 60.0f;   // release when |Δheading| >= this
     float turn_overshoot_deg    = 130.0f;  // hard safety cap regardless of min_ticks
+
+    // Lookahead for the bezier turn. 0.30 = 30% down from top of mask
+    // (upper-middle). Lower = further ahead / more aggressive turn.
+    // 0.20 = aggressive, 0.30 = moderate, 0.45 = conservative.
+    double turn_lookahead_y_ratio = 0.30;
 };
 
 // ============================================================
@@ -619,7 +624,19 @@ public:
         // 6. Error into PID
         double final_error = eff_error_v20;
         if (should_turn && final_path.size() > 5) {
-            int look_idx = (int)final_path.size() * 2 / 3;
+            // Fixed y-band lookahead. Path points run bottom → top, so find
+            // the point closest to a target row high in the mask (near the far
+            // part of the turn). 0.30 → roughly V20's far-band centre.
+            const int target_y =
+                (int)(cleanMask.rows * c_.turn_lookahead_y_ratio);
+
+            int look_idx = 0;
+            int best_dy  = std::abs(final_path[0].y - target_y);
+            for (size_t i = 1; i < final_path.size(); ++i) {
+                int dy = std::abs(final_path[i].y - target_y);
+                if (dy < best_dy) { best_dy = dy; look_idx = (int)i; }
+            }
+
             final_error = final_path[look_idx].x - (cleanMask.cols / 2.0);
             speed_ = c_.min_speed + 3.0;
         } else {
