@@ -27,8 +27,8 @@ struct Config {
     double max_speed = 100.0;
     double min_speed = 75.0;
 
-    double asym_strength = 0.55, asym_threshold = 6.0, asym_ema = 0.85;
-    double asym_cap = 26.0, asym_decay = 0.92;
+    double asym_strength = 0.20, asym_threshold = 6.0, asym_ema = 0.85;
+    double asym_cap = 10.0, asym_decay = 0.92;
 
     double hard_step_px = 30.0, err_step_px = 18.0, cov_drop = 0.22, jagged_px = 15.0;
     int    occl_hangover = 4;
@@ -157,21 +157,36 @@ namespace detail {
 
             // Tìm TẤT CẢ các khoảng trống trên hàng ngang thay vì chỉ 1 khoảng lớn nhất
             int bestLen = -1, bs = -1, be = -1;
+            bool hasPref = false;
             int s = -1;
             for (int x = 0; x <= w; x++) {
                 bool on = (x < w) && row[x] > 0;
                 if (on && s < 0) s = x;
                 if (!on && s >= 0) {
-                    int len = (x - 1) - s;
-                    // Nếu đang trong trạng thái né dạt về một bên (preferred_side != 0):
-                    // Ưu tiên dải trống nằm hẳn về bên đó để tránh bị nhảy tâm
-                    bool take_this = false;
-                    if (preferred_side < 0 && (x - 1) < halfW + 30) take_this = true; // Ưu tiên nửa trái
-                    else if (preferred_side > 0 && s > halfW - 30)  take_this = true; // Ưu tiên nửa phải
-                    else if (len > bestLen) take_this = true;
+                    int e = x - 1;
+                    int len = e - s;
+                    if (len > 20) { // Bỏ qua đốm nhiễu < 20px
+                        // Nếu đang trong trạng thái né dạt về một bên (preferred_side != 0):
+                        // Ưu tiên tuyệt đối nhánh đường nằm về bên đó khi mặt đường bị đảo chia đôi
+                        bool isPref = (preferred_side < 0 && s < halfW - 10) ||
+                                      (preferred_side > 0 && e > halfW + 10);
+                        bool take_this = false;
+                        if (preferred_side != 0) {
+                            if (isPref && !hasPref) take_this = true;
+                            else if (isPref && hasPref) {
+                                if (preferred_side < 0 && s < bs) take_this = true;
+                                if (preferred_side > 0 && e > be) take_this = true;
+                            } else if (!hasPref && len > bestLen) {
+                                take_this = true;
+                            }
+                        } else if (len > bestLen) {
+                            take_this = true;
+                        }
 
-                    if (take_this && len > 20) { // Bỏ qua đốm nhiễu < 20px
-                        bestLen = len; bs = s; be = x - 1;
+                        if (take_this) {
+                            bestLen = len; bs = s; be = e;
+                            if (isPref) hasPref = true;
+                        }
                     }
                     s = -1;
                 }
@@ -408,29 +423,30 @@ public:
     enum class RoundaboutPhase { NONE = 0, WAIT_ENTRY, ENTER_RIGHT, CIRCLE_LEFT, EXIT_RIGHT };
 
     // ---------------- GÓC QUÀNH T-JUNCTION / NGÃ RẼ THƯỜNG ----------------
-    double TURN_STEER_DEG      = 35.0;   // Góc sàn khi quành T-junction / ngã rẽ (đủ gắt cho cả đường lớn)
-    double TURN_RAMP_DEG_PER_S = 95.0;
+    double TURN_STEER_DEG      = 33.0;   // Góc sàn khi quành theo biển / T-junction (33 độ theo yêu cầu)
+    double TURN_INIT_DEG       = 18.0;   // Khởi điểm góc sàn ngay frame bắt đầu EXECUTE để lên 33 độ nhanh hơn
+    double TURN_RAMP_DEG_PER_S = 115.0;  // Tăng tốc độ quay góc nhanh hơn (~19 độ/frame ở 6 FPS)
     double MIN_TURN_TIME       = 0.8;
     double TURN_BIAS_PX        = 38.0;
     double turn_floor_current  = 0.0;
 
-    // ---------------- THÔNG SỐ RIÊNG CHO ROUNDABOUT (Đồng bộ theo hình học đảo thực tế) ----------------
-    double ROUNDABOUT_ENTER_DEG       = 28.0;  // Góc sàn ôm phải vòng qua mũi đảo khi bắt đầu nhập xuyến
-    double ROUNDABOUT_MAX_ENTER_DEG   = 0.0;   // Không khóa trần lúc ôm mũi đảo (mũi đảo cần 35-45 độ)
-    double ROUNDABOUT_CIRCLE_DEG      = 6.0;   // Góc giữ nhẹ bên trái khi đi dọc thân đảo để lướt qua nhánh phụ
-    double ROUNDABOUT_EXIT_DEG        = 20.0;  // Góc sàn ôm phải theo đường cong thoát vòng xuyến
+    // ---------------- THÔNG SỐ STATE MACHINE CHO ROUNDABOUT ----------------
+    double ROUNDABOUT_ENTER_DEG       = 28.0;  // Pha ENTER_RIGHT: Góc sàn ôm phải qua mũi đảo
+    double ROUNDABOUT_MAX_ENTER_DEG   = 35.0;  // Pha ENTER_RIGHT: Khóa trần 35 độ để không quay lố cắm thẳng vào nhánh 1
+    double ROUNDABOUT_CIRCLE_DEG      = 25.0;  // Pha CIRCLE_LEFT: Góc sàn ôm TRÁI (-25 độ) vòng quanh đảo để bỏ qua nhánh 1
+    double ROUNDABOUT_EXIT_DEG        = 24.0;  // Pha EXIT_RIGHT: Góc sàn ôm PHẢI ra nhánh thứ 2
     double ROUNDABOUT_ENTER_BIAS_PX   = 24.0;
-    double ROUNDABOUT_CIRCLE_BIAS_PX  = 8.0;
-    double ROUNDABOUT_EXIT_BIAS_PX    = 20.0;
-    double RB_ENTER_MIN_TIME          = 1.20;  // Thời gian tối thiểu ôm qua mũi đảo (s)
-    double RB_ENTER_MAX_TIME          = 3.60;  // Thời gian tối đa ôm mũi đảo (s)
-    double RB_CIRCLE_MIN_TIME         = 0.85;  // Thời gian tối thiểu đi dọc thân đảo qua nhánh phụ (s)
-    double RB_CIRCLE_MAX_TIME         = 2.60;  // Thời gian tối đa đi dọc thân đảo trước khi ôm ra lối thoát (s)
-    double RB_EXIT_MAX_TIME           = 3.00;  // Thời gian tối đa ôm theo lối thoát vòng xuyến (s)
+    double ROUNDABOUT_CIRCLE_BIAS_PX  = 28.0;  // Bias âm (-28px) kéo tâm bám sát đảo bên trái khi ở CIRCLE_LEFT
+    double ROUNDABOUT_EXIT_BIAS_PX    = 26.0;
+    double RB_ENTER_MIN_TIME          = 0.80;  // Thời gian tối thiểu ôm phải qua mũi đảo (s)
+    double RB_ENTER_MAX_TIME          = 1.30;  // Thời gian tối đa pha ENTER_RIGHT trước khi chuyển sang ôm trái quanh đảo (s)
+    double RB_CIRCLE_MIN_TIME         = 1.25;  // Thời gian tối thiểu ôm trái quanh đảo để vượt qua hoàn toàn nhánh 1 (s)
+    double RB_CIRCLE_MAX_TIME         = 1.95;  // Thời gian tối đa ôm trái quanh đảo trước khi rẽ phải ra nhánh 2 (s)
+    double RB_EXIT_MAX_TIME           = 2.15;  // Thời gian tối đa ôm phải thoát vòng xuyến (s)
     int    RB_BRANCH_OPEN_WIDTH_PX    = 380;
     int    RB_BRANCH_CLOSE_WIDTH_PX   = 340;
 
-    int    RB_ENTRY_STABLE_FRAMES     = 2;     // Số frame xe phải đi thẳng ổn định trên đường dẫn trước khi bắt mũi đảo
+    int    RB_ENTRY_STABLE_FRAMES     = 2;     // Số frame xe đi ổn định trên đường dẫn trước khi bắt mũi đảo
     int    RB_ONROAD_MARGIN_PX        = 110;
     int    RB_OFFROAD_MARGIN_PX       = 20;
     int    rb_entry_stable_frames     = 0;
@@ -447,7 +463,7 @@ public:
     // ---------------- MIỆNG NGÃ RẼ & T-JUNCTION KHÔNG BIỂN ----------------
     int    JUNCTION_FAR_Y           = 150;
     int    TJUNCTION_OPEN_WIDTH_PX  = 410;     // Độ rộng tầng giữa khi gặp T-junction lớn
-    double TJUNCTION_COOLDOWN_S     = 0.6;     // Nghỉ ngắn sau khi thoát hẳn vòng xuyến để bắt kịp T-junction kế tiếp
+    double TJUNCTION_COOLDOWN_S     = 1.5;     // Nghỉ sau khi thoát vòng xuyến để không bắt nhầm khúc cua ngay cửa ra
 
     double settle_start_bias  = 0.0;
     double settle_start_floor = 0.0;
@@ -458,7 +474,7 @@ public:
     double MAX_TURN_TIME            = 4.0;
     double CURVE_THRESHOLD          = 25.0;
     double STRAIGHT_THRESHOLD       = 12.0;
-    int    REQUIRED_STRAIGHT_FRAMES = 2;       // Giảm từ 3 xuống 2 frame để quành T-junction sớm hơn, không sát mép trên
+    int    REQUIRED_STRAIGHT_FRAMES = 3;       // Giữ đúng 3 frame cho các khúc cua có biển báo để không cua sớm ở đường nhỏ
     int    straight_frames          = 0;
 
     // --- CÁC BIẾN TRẠNG THÁI ROUNDABOUT & T-JUNCTION ---
@@ -469,9 +485,11 @@ public:
     int             rb_phase_Confirm_frames = 0;
 
     bool            waiting_for_tjunction   = false; // Bật sau khi hoàn thành mỗi roundabout
+    bool            is_unmarked_tjunction   = false; // Đánh dấu đang trong chế độ chờ/rẽ T-junction không biển báo
     double          tjunction_cooldown      = 0.0;
-    int             t_junction_count        = 0;     // 1 -> rẽ TRÁI, 2 -> rẽ PHẢI
+    int             t_junction_count        = 0;     // 0 -> T-junction #1 rẽ TRÁI, 1 -> T-junction #2 rẽ PHẢI
     int             tjunction_detect_frames = 0;
+    int             rb_exit_straight_frames = 0;
 
     State       state          = State::IDLE;
     std::string direction      = "NONE";
@@ -501,11 +519,19 @@ public:
         return std::abs(dx * (p[1].y - p[0].y) - dy * (p[1].x - p[0].x)) / length;
     }
 
-    void start_turn(const std::string& dir, bool is_roundabout = false) {
+    int get_preferred_side() const {
+        if (!is_roundabout_mode) return 0;
+        if (rb_phase == RoundaboutPhase::WAIT_ENTRY) return rb_approach_straight ? 1 : 0;
+        if (rb_phase == RoundaboutPhase::ENTER_RIGHT || rb_phase == RoundaboutPhase::EXIT_RIGHT) return 1;
+        if (rb_phase == RoundaboutPhase::CIRCLE_LEFT) return -1;
+        return 0;
+    }
+
+    void start_turn(const std::string& dir, bool is_roundabout = false, bool unmarked_tjunction = false) {
         if (state != State::IDLE && state != State::WAIT_CURVE && state != State::WAIT_STRAIGHT) return;
         // Nếu đang chờ ngã rẽ mà biển xác nhận lại đúng hướng cũ thì giữ nguyên tiến trình
         if ((state == State::WAIT_CURVE || state == State::WAIT_STRAIGHT) &&
-            direction == dir && is_roundabout_mode == is_roundabout) return;
+            direction == dir && is_roundabout_mode == is_roundabout && is_unmarked_tjunction == unmarked_tjunction) return;
 
         direction          = dir;
         state              = State::WAIT_CURVE;
@@ -520,6 +546,7 @@ public:
         completed          = false;
 
         is_roundabout_mode      = is_roundabout;
+        is_unmarked_tjunction   = unmarked_tjunction;
         roundabout_exits_passed = 0;
         branch1_cleared         = false;
         rb_phase_Confirm_frames = 0;
@@ -529,6 +556,10 @@ public:
         if (is_roundabout_mode) {
             rb_phase = RoundaboutPhase::WAIT_ENTRY;
             std::cout << "[ROUNDABOUT] Mode Active -> Waiting for roundabout entry...\n";
+        } else if (is_unmarked_tjunction) {
+            rb_phase = RoundaboutPhase::NONE;
+            std::cout << "[T-JUNCTION] Armed Unmarked T-Junction #" << (t_junction_count + 1)
+                      << " -> Waiting for junction (" << dir << ")...\n";
         } else {
             rb_phase = RoundaboutPhase::NONE;
             std::cout << "[TURN] Requested: " << dir << " -> Waiting for junction...\n";
@@ -544,6 +575,7 @@ public:
         int    straight_frames  = 0;
         int    roundabout_exit  = 0;
         int    t_junction_count = 0;
+        int    preferred_side   = 0;    // 0: bình thường, +1: bám nhánh phải đảo, -1: bám nhánh trái đảo
         double steer_floor_deg  = 0.0;  // Góc sàn tối thiểu theo hướng quành (0 = không ép)
         double steer_cap_deg    = 0.0;  // Trần góc tối đa khi nhập xuyến (>0 = khóa trần góc phải)
         bool   lock_opposite_err = false;
@@ -567,69 +599,44 @@ public:
         const int mid_width = (mid_lx >= 0 && mid_rx >= 0) ? (mid_rx - mid_lx) : 0;
 
         // -----------------------------------------------------------------
-        // TỰ ĐỘNG PHÁT HIỆN & ĐẾM T-JUNCTION KHÔNG BIỂN BÁO SAU ROUNDABOUT
+        // STATE MACHINE T-JUNCTION KHÔNG BIỂN BÁO SAU MỖI ROUNDABOUT:
+        // Ngay khi thoát vòng xuyến hết cooldown và xe đã thẳng lại trên đường dẫn (2 frame),
+        // chuyển ngay sang WAIT_CURVE theo hướng (T-junction #1 -> LEFT, T-junction #2 -> RIGHT)
+        // để khóa CornerAssist (không cho CornerAssist bẻ nhầm sang trái ở T-junction #2)
+        // và hiển thị trạng thái chờ T-junction trực tiếp trên UI.
         // -----------------------------------------------------------------
         if (state == State::IDLE) {
             if (tjunction_cooldown > 0.0) {
                 tjunction_cooldown = std::max(0.0, tjunction_cooldown - dt);
             }
             if (waiting_for_tjunction && tjunction_cooldown <= 0.0 && !has_active_sign && t_junction_count < 2) {
-                // T-junction 1 -> rẽ TRÁI ; T-junction 2 -> rẽ PHẢI
-                const std::string target_dir = (t_junction_count == 0) ? "LEFT" : "RIGHT";
-                const auto& t_pts = (target_dir == "LEFT") ? left_pts : right_pts;
-
-                bool open_near = false, open_far = false;
-                for (const auto& p : t_pts) {
-                    bool touch = (target_dir == "LEFT") ? (p.x <= 5) : (p.x >= img_w - 10);
-                    if (!touch) continue;
-                    if (p.y >= 160 && p.y <= 210) open_near = true;
-                    if (p.y <= JUNCTION_FAR_Y)    open_far  = true;
-                }
-                // Nhận biết sớm miệng T-junction khi tầng xa đã chạm mép và tầng giữa đã thu sát mép (<= 35px)
-                if (target_dir == "LEFT" && far_lx >= 0 && far_lx <= 5 && mid_lx >= 0 && mid_lx <= 35) {
-                    open_near = true;
-                    open_far  = true;
-                } else if (target_dir == "RIGHT" && far_rx >= img_w - 10 && mid_rx >= img_w - 36) {
-                    open_near = true;
-                    open_far  = true;
-                }
-                const bool wide_t_mouth = (mid_width >= TJUNCTION_OPEN_WIDTH_PX) &&
-                                          ((target_dir == "LEFT") ? (far_lx >= 0 && far_lx <= 10)
-                                                                  : (far_rx >= img_w - 15));
-
-                if ((open_near && open_far) || wide_t_mouth) {
-                    tjunction_detect_frames++;
+                if (lane_valid && std::abs(near_e) <= 6.5 && std::abs(mid_e) <= 14.0) {
+                    rb_exit_straight_frames++;
                 } else {
-                    tjunction_detect_frames = 0;
+                    rb_exit_straight_frames = 0;
                 }
 
-                if (tjunction_detect_frames >= 2) {
-                    t_junction_count++;
+                if (rb_exit_straight_frames >= 2) {
+                    const std::string target_dir = (t_junction_count == 0) ? "LEFT" : "RIGHT";
                     waiting_for_tjunction   = false;
-                    tjunction_detect_frames = 0;
-                    std::cout << "[T-JUNCTION] >> UNMARKED T-JUNCTION #" << t_junction_count
-                              << " DETECTED -> AUTO TURN " << target_dir << "\n";
-                    start_turn(target_dir, false);
-                    // Đã xác nhận 2 frame mở miệng T-junction -> nhảy thẳng vào WAIT_STRAIGHT với 1 frame tích lũy để quành sớm
-                    state           = State::WAIT_STRAIGHT;
-                    curve_detected  = true;
-                    straight_frames = 1;
-                    res.t_junction_count = t_junction_count;
+                    rb_exit_straight_frames = 0;
+                    start_turn(target_dir, false, true);
+                    res.state     = state;
+                    res.direction = direction;
                 }
             }
             if (state == State::IDLE) return res;
         }
 
         // -----------------------------------------------------------------
-        // XỬ LÝ CHUYÊN BIỆT CHO ROUNDABOUT (ĐỒNG BỘ THEO MŨI ĐẢO & LỐI THOÁT THỰC TẾ)
+        // STATE MACHINE 4 PHA CHO ROUNDABOUT (WAIT_ENTRY -> ENTER_RIGHT -> CIRCLE_LEFT -> EXIT_RIGHT)
         // -----------------------------------------------------------------
         if (is_roundabout_mode) {
             turn_elapsed += dt;
 
-            //PHA 1: Chờ trên đường dẫn cho tới khi xe thực sự gặp mũi đảo vòng xuyến
-            // (Không bẻ sớm lúc vừa chốt biển từ xa trên đường dẫn!)
+            // PHA 1 (WAIT_ENTRY): Đi thẳng trên đường dẫn cho tới khi gặp mũi đảo vòng xuyến
             if (rb_phase == RoundaboutPhase::WAIT_ENTRY) {
-                const bool straight_now = lane_valid && (std::abs(near_e) <= 6.0) && (std::abs(mid_e) <= 15.0);
+                const bool straight_now = lane_valid && (std::abs(near_e) <= 9.0) && (std::abs(mid_e) <= 18.0);
                 if (straight_now) {
                     rb_entry_stable_frames++;
                     if (rb_entry_stable_frames >= RB_ENTRY_STABLE_FRAMES) {
@@ -639,24 +646,30 @@ public:
                     rb_entry_stable_frames = 0;
                 }
 
-                // Khi tiến sát mũi đảo vòng xuyến:
-                // Đường uốn gắt sang phải quanh đảo làm far_lx vọt cao (>= 220px), biên phải mở sát rìa (far_rx, mid_rx >= img_w - 10)
-                // và sai số tầng giữa mid_e tăng mạnh sang phải (>= 25px) hoặc mid_lx đã dạt sang phải (>= 60px).
-                const bool island_nose_reached = rb_approach_straight &&
-                                                 (far_rx >= img_w - 10) && (mid_rx >= img_w - 10) &&
-                                                 (far_lx >= 220) &&
-                                                 (mid_e >= 25.0 || mid_lx >= 60);
+                res.preferred_side = rb_approach_straight ? 1 : 0;
 
-                if (island_nose_reached) {
+                // Phát hiện mũi đảo vòng xuyến ở cả 2 trường hợp:
+                // 1) Mép trái tầng xa dạt mạnh sang phải quanh đảo (far_lx >= 175, far_rx & mid_rx chạm biên phải)
+                // 2) Hoặc đảo giữa cắt đôi tầng xa y1 (far_rx thu hẹp < img_w - 80 trong khi tầng giữa mid_rx vẫn mở sát biên phải >= img_w - 10)
+                // 3) Hoặc cổ vòng xuyến phình rộng toàn màn hình (mid_width >= 435) và tâm xa kéo mạnh sang phải (far_e >= 35)
+                const bool island_nose_right = (far_rx >= img_w - 10) && (mid_rx >= img_w - 10) &&
+                                               (far_lx >= 175) &&
+                                               (mid_e >= 12.0 || far_e >= 38.0 || mid_lx >= 40);
+                const bool island_split_far  = (mid_rx >= img_w - 10) &&
+                                               (far_lx >= 35) && (far_rx >= 0 && far_rx < img_w - 80) &&
+                                               ((mid_rx - far_rx) >= 110);
+                const bool island_wide_flare = (far_rx >= img_w - 10) && (mid_rx >= img_w - 10) &&
+                                               (mid_width >= 435) && (far_e >= 35.0) && (mid_e >= 10.0);
+
+                if (rb_approach_straight && (island_nose_right || island_split_far || island_wide_flare)) {
                     rb_phase                = RoundaboutPhase::ENTER_RIGHT;
                     state                   = State::EXECUTE;
                     turn_elapsed            = 0.0;
                     branch1_cleared         = false;
                     rb_phase_Confirm_frames = 0;
-                    std::cout << "[ROUNDABOUT] >> Phase 1 -> 2: ENTER_RIGHT (Island nose reached: far_lx="
-                              << far_lx << ", mid_e=" << mid_e << ")\n";
+                    std::cout << "[ROUNDABOUT] >> Phase 1 -> 2: ENTER_RIGHT (far_lx="
+                              << far_lx << ", far_rx=" << far_rx << ", mid_e=" << mid_e << ")\n";
                 } else {
-                    // Đang trên đường dẫn vào vòng xuyến: giữ nguyên bám làn tự nhiên, tuyệt đối không bẻ trái/phải sớm
                     res.state             = State::WAIT_CURVE;
                     res.steer_bias_px     = 0.0;
                     res.steer_floor_deg   = 0.0;
@@ -665,50 +678,47 @@ public:
                 }
             }
 
-            // PHA 2: Ôm phải vòng qua mũi đảo để nhập vào hành lang vòng xuyến (log frame 613-632 & 1326-1343)
+            // PHA 2 (ENTER_RIGHT): Đánh lái PHẢI vừa đủ (28..35 độ) để né mũi đảo tiến vào lòng xuyến,
+            // tuyệt đối không giữ +50 độ quá lâu khiến xe lao thẳng vào nhánh phải thứ nhất!
             if (rb_phase == RoundaboutPhase::ENTER_RIGHT) {
                 res.direction         = "RIGHT";
+                res.preferred_side    = 1;
                 res.steer_bias_px     = ROUNDABOUT_ENTER_BIAS_PX;
                 res.steer_floor_deg   = ROUNDABOUT_ENTER_DEG;
-                res.steer_cap_deg     = 0.0; // Không khóa trần để PID thoải mái đánh 35-50 độ qua mũi đảo
+                res.steer_cap_deg     = ROUNDABOUT_MAX_ENTER_DEG;
                 res.lock_opposite_err = true;
 
-                // Ghi nhận mũi đảo đã đi qua tầng giữa (mid_lx dâng cao hoặc mid_e vọt lớn)
-                if (mid_lx >= 70 || mid_e >= 35.0) {
-                    branch1_cleared = true;
-                }
+                // Khi đầu xe đã nghiêng vào hành lang bên phải đảo (sau 0.80s..1.30s),
+                // chuyển ngay sang CIRCLE_LEFT để ôm vòng quanh đảo bên trái
+                const bool entered_ring = (turn_elapsed >= RB_ENTER_MIN_TIME) &&
+                                          ((mid_lx >= 0 && mid_lx <= 90) || (mid_e <= 22.0));
 
-                // Đã vòng qua mũi đảo khi tầng giữa bên trái mở rộng trở lại (mid_lx <= 50) và mid_e hạ xuống <= 15
-                const bool nose_cleared = (turn_elapsed >= RB_ENTER_MIN_TIME) &&
-                                          (branch1_cleared || turn_elapsed >= 1.8) &&
-                                          (mid_lx >= 0 && mid_lx <= 50) &&
-                                          (mid_e <= 15.0);
-
-                if (nose_cleared || turn_elapsed >= RB_ENTER_MAX_TIME) {
+                if (entered_ring || turn_elapsed >= RB_ENTER_MAX_TIME) {
                     rb_phase                = RoundaboutPhase::CIRCLE_LEFT;
                     turn_elapsed            = 0.0;
                     roundabout_exits_passed = 1;
                     rb_phase_Confirm_frames = 0;
-                    std::cout << "[ROUNDABOUT] >> Phase 2 -> 3: CIRCLE_LEFT (Nose cleared, gliding past side opening)\n";
+                    std::cout << "[ROUNDABOUT] >> Phase 2 -> 3: CIRCLE_LEFT (Curving left around central island, skipping Branch 1)\n";
                 }
             }
-            // PHA 3: Đi dọc thân đảo (giữ nhẹ bên trái / thẳng để không rẽ nhầm vào nhánh phụ bên phải),
-            // chờ tới khi khúc cua lối thoát vòng xuyến xuất hiện (log frame 633-651 & 1344-1360)
+            // PHA 3 (CIRCLE_LEFT): Chủ động ôm TRÁI (-25 độ, bias -28px, ưu tiên nửa trái mask)
+            // bám quanh đảo trung tâm để bỏ qua hoàn toàn nhánh phải thứ nhất (Branch 1)
             else if (rb_phase == RoundaboutPhase::CIRCLE_LEFT) {
                 res.direction         = "LEFT";
+                res.preferred_side    = -1;
                 res.steer_bias_px     = -ROUNDABOUT_CIRCLE_BIAS_PX;
                 res.steer_floor_deg   = -ROUNDABOUT_CIRCLE_DEG;
-                // Trong 1.0s đầu khi lướt ngang miệng nhánh phụ, khóa trần góc phải ở 10 độ để không bị hút vào nhánh phụ
-                res.steer_cap_deg     = (turn_elapsed < 1.0) ? 10.0 : 0.0;
-                res.lock_opposite_err = false;
+                res.steer_cap_deg     = 0.0;
+                res.lock_opposite_err = true;
 
-                // Khúc cua lối thoát bắt đầu khi đã đi dọc đảo >= RB_CIRCLE_MIN_TIME
-                // và mép trái tầng xa + tầng giữa lại uốn sang phải (far_lx >= 200, mid_lx >= 25 hoặc mid_e >= 20)
-                const bool exit_curve_reached = (turn_elapsed >= RB_CIRCLE_MIN_TIME) &&
-                                                (far_lx >= 200) &&
-                                                (mid_lx >= 25 || mid_e >= 20.0);
+                // Sau khi đã ôm trái vòng qua nhánh 1 (>= RB_CIRCLE_MIN_TIME = 1.25s),
+                // khi thấy lối ra thứ 2 mở bên phải (far_lx >= 150 hoặc mid_lx >= 60 hoặc mid_e >= 20) thì chuyển sang EXIT_RIGHT
+                const bool exit2_reached = (turn_elapsed >= RB_CIRCLE_MIN_TIME) &&
+                                           ((far_lx >= 150 && far_rx >= img_w - 15) ||
+                                            (mid_lx >= 60 && mid_rx >= img_w - 15) ||
+                                            (mid_e >= 20.0));
 
-                rb_phase_Confirm_frames = exit_curve_reached ? (rb_phase_Confirm_frames + 1) : 0;
+                rb_phase_Confirm_frames = exit2_reached ? (rb_phase_Confirm_frames + 1) : 0;
                 if (rb_phase_Confirm_frames >= 2 || turn_elapsed >= RB_CIRCLE_MAX_TIME) {
                     roundabout_exits_passed = 2;
                     rb_phase                = RoundaboutPhase::EXIT_RIGHT;
@@ -717,14 +727,16 @@ public:
                     far_swept               = false;
                     turn_bias_current       = ROUNDABOUT_EXIT_BIAS_PX;
                     turn_floor_current      = ROUNDABOUT_EXIT_DEG;
-                    std::cout << "[ROUNDABOUT] >>> Phase 3 -> 4: EXIT_RIGHT (Following exit curve out of roundabout)\n";
+                    std::cout << "[ROUNDABOUT] >>> Phase 3 -> 4: EXIT_RIGHT (Taking 2nd exit out of roundabout)\n";
                 }
             }
-            // PHA 4: Ôm phải theo đường cong lối thoát cho tới khi xe thẳng lại trên đường ra (log frame 652-680)
+            // PHA 4 (EXIT_RIGHT): Đánh lái PHẢI thoát ra nhánh thứ 2 cho tới khi xe thẳng lại trên đường ra
             else if (rb_phase == RoundaboutPhase::EXIT_RIGHT) {
                 res.direction         = "RIGHT";
+                res.preferred_side    = 1;
                 res.steer_bias_px     = ROUNDABOUT_EXIT_BIAS_PX;
                 res.steer_floor_deg   = ROUNDABOUT_EXIT_DEG;
+                res.steer_cap_deg     = 38.0;
                 res.lock_opposite_err = true;
 
                 const bool far_bounded = (far_lx > ALIGN_EDGE_MARGIN) && (far_rx >= 0) &&
@@ -737,19 +749,17 @@ public:
                                           (far_center_off <  ALIGN_FAR_CENTER_PX) &&
                                           (far_center_off > -ALIGN_FAR_OPPOSITE_PX);
 
-                // Khi thoát ra đường thẳng dẫn tới T-junction: far_lx hạ xuống < 110 và mid_e, far_e đều giảm nhỏ
-                const bool exit_road_straight = (turn_elapsed >= 1.0) && lane_valid &&
-                                                (far_lx >= 0 && far_lx <= 110) &&
-                                                (mid_e <= 28.0) && (far_e <= 20.0);
+                const bool exit_road_straight = (turn_elapsed >= 0.85) && lane_valid &&
+                                                (far_lx >= 0 && far_lx <= 115) &&
+                                                (std::abs(mid_e) <= 24.0) && (std::abs(far_e) <= 25.0);
 
-                if ((turn_elapsed >= 0.8 && lane_valid && far_swept && far_centered) || exit_road_straight) {
+                if ((turn_elapsed >= 0.80 && lane_valid && far_swept && far_centered) || exit_road_straight) {
                     aligned_frames++;
                 } else {
                     aligned_frames = 0;
                 }
 
                 if (aligned_frames >= REQUIRED_ALIGNED_FRAMES || turn_elapsed >= RB_EXIT_MAX_TIME) {
-                    // Reset cờ và biến đếm Roundabout, chuyển sang SETTLE rồi bật dò T-junction
                     is_roundabout_mode      = false;
                     rb_phase                = RoundaboutPhase::NONE;
                     roundabout_exits_passed = 0;
@@ -759,6 +769,7 @@ public:
 
                     waiting_for_tjunction   = true;
                     tjunction_cooldown      = TJUNCTION_COOLDOWN_S;
+                    rb_exit_straight_frames = 0;
 
                     state              = State::SETTLE;
                     direction          = "RIGHT";
@@ -775,7 +786,8 @@ public:
         }
 
         // -----------------------------------------------------------------
-        // XỬ LÝ RẼ THƯỜNG / T-JUNCTION (WAIT_CURVE -> WAIT_STRAIGHT -> EXECUTE -> SETTLE)
+        // XỬ LÝ RẼ THEO BIỂN BÁO & T-JUNCTION KHÔNG BIỂN BÁO
+        // (WAIT_CURVE -> WAIT_STRAIGHT -> EXECUTE -> SETTLE)
         // -----------------------------------------------------------------
         auto& pts = (direction == "LEFT") ? left_pts : right_pts;
         auto selected_pts = select_three_points(pts);
@@ -788,6 +800,7 @@ public:
         }
 
         // Miệng ngã rẽ mở ở cả tầng gần (160-210) và tầng xa (<= JUNCTION_FAR_Y)
+        // Với các khúc cua có biển báo: giữ chuẩn quét biên nghiêm ngặt để không cua quá sớm ở đường nhỏ!
         bool side_open_near = false, side_open_far = false;
         for (const auto& p : pts) {
             bool touch = (direction == "LEFT") ? (p.x <= 5) : (p.x >= img_w - 10);
@@ -795,13 +808,25 @@ public:
             if (p.y >= 160 && p.y <= 210) side_open_near = true;
             if (p.y <= JUNCTION_FAR_Y)    side_open_far  = true;
         }
-        // Bổ sung: nếu tầng xa đã chạm biên và tầng giữa (y2=187) đã thu sát biên (<= 35px) thì miệng ngã rẽ đã mở vào vùng quét
-        if (direction == "LEFT" && far_lx >= 0 && far_lx <= 5 && mid_lx >= 0 && mid_lx <= 35) {
-            side_open_near = true;
-            side_open_far  = true;
-        } else if (direction == "RIGHT" && far_rx >= img_w - 10 && mid_rx >= img_w - 36) {
-            side_open_near = true;
-            side_open_far  = true;
+
+        // Riêng với T-junction không biển báo (is_unmarked_tjunction == true):
+        // Đặc trưng hình học bất biến của T-junction là CẢ HAI NHÁNH TRÁI & PHẢI đều mở rộng ở tầng giữa
+        // (mid_lx <= 15 và mid_rx >= img_w - 15), khác hoàn toàn với khúc cua 90 độ đơn thuần (chỉ mở 1 bên).
+        bool tjunction_wall_ahead = false;
+        if (is_unmarked_tjunction) {
+            const bool both_mid_open = (mid_lx >= 0 && mid_lx <= 15) && (mid_rx >= img_w - 15);
+            const bool far_t_signature = (far_lx >= 0 && far_lx <= 15) ||
+                                         (far_rx >= img_w - 15) ||
+                                         (far_rx >= 0 && far_rx <= 360);
+            if (both_mid_open && far_t_signature) {
+                side_open_near       = true;
+                side_open_far        = true;
+                tjunction_wall_ahead = true;
+            } else {
+                // Không cho phép khúc cua 1 bên (như cua trái thường) kích nhầm T-junction
+                side_open_near = false;
+                side_open_far  = false;
+            }
         }
         bool junction_opened = side_open_near && side_open_far;
 
@@ -824,31 +849,48 @@ public:
 
         if (state == State::WAIT_CURVE) {
             straight_frames = 0;
-            if (dev >= CURVE_THRESHOLD || junction_opened) {
-                curve_detected = true;
-                state = State::WAIT_STRAIGHT;
+            const bool trigger_wait_straight = is_unmarked_tjunction
+                ? junction_opened
+                : (dev >= CURVE_THRESHOLD || junction_opened);
+            if (trigger_wait_straight) {
+                curve_detected  = true;
+                state           = State::WAIT_STRAIGHT;
+                straight_frames = is_unmarked_tjunction ? 1 : 0;
+                res.straight_frames = straight_frames;
                 std::cout << "[TURN] >> JUNCTION DETECTED (dev: " << dev << ", opened: " << junction_opened << ")\n";
             }
         }
         else if (state == State::WAIT_STRAIGHT) {
-            if (dev >= 0.0 && dev <= STRAIGHT_THRESHOLD && junction_opened && (!pts_stuck_on_border || mid_width >= 360)) {
+            const bool valid_straight_dev = (dev >= 0.0 && dev <= STRAIGHT_THRESHOLD) ||
+                                            (is_unmarked_tjunction && tjunction_wall_ahead);
+            if (valid_straight_dev && junction_opened && (!pts_stuck_on_border || mid_width >= 360 || tjunction_wall_ahead)) {
                 straight_frames++;
             } else {
                 straight_frames = 0;
             }
 
-            if (straight_frames >= REQUIRED_STRAIGHT_FRAMES) {
+            // Các khúc cua có biển báo giữ nguyên 3 frame (REQUIRED_STRAIGHT_FRAMES = 3);
+            // riêng T-junction không biển báo dùng 2 frame để bẻ kịp trước bức tường chữ T
+            const int req_straight = is_unmarked_tjunction ? 2 : REQUIRED_STRAIGHT_FRAMES;
+
+            if (straight_frames >= req_straight) {
+                if (is_unmarked_tjunction) {
+                    t_junction_count++;
+                    res.t_junction_count = t_junction_count;
+                    std::cout << "[T-JUNCTION] >>> EXECUTING UNMARKED T-JUNCTION #" << t_junction_count
+                              << " (" << direction << ")\n";
+                }
                 state          = State::EXECUTE;
                 turn_elapsed   = 0.0;
                 aligned_frames = 0;
                 far_swept      = false;
                 const double dir_sign = (direction == "LEFT") ? -1.0 : 1.0;
                 turn_bias_current     = dir_sign * TURN_BIAS_PX;
-                turn_floor_current    = dir_sign * std::min(TURN_STEER_DEG, TURN_RAMP_DEG_PER_S * dt);
+                turn_floor_current    = dir_sign * std::min(TURN_STEER_DEG, std::max(TURN_INIT_DEG, TURN_RAMP_DEG_PER_S * dt));
                 res.steer_bias_px     = turn_bias_current;
                 res.steer_floor_deg   = turn_floor_current;
                 res.lock_opposite_err = true;
-                std::cout << "[TURN] >>> EXECUTING TURN (Verified straight 3 frames)\n";
+                std::cout << "[TURN] >>> EXECUTING TURN (Verified straight " << req_straight << " frames)\n";
             }
         }
         else if (state == State::EXECUTE) {
@@ -926,18 +968,19 @@ public:
             }
         }
         else if (state == State::DONE) {
-            state              = State::IDLE;
-            direction          = "NONE";
-            turn_elapsed       = 0.0;
-            aligned_frames     = 0;
-            straight_frames    = 0;
-            turn_bias_current  = 0.0;
-            turn_floor_current = 0.0;
-            curve_detected     = false;
-            far_swept          = false;
-            settle_start_bias  = 0.0;
-            settle_start_floor = 0.0;
-            settle_elapsed     = 0.0;
+            state                 = State::IDLE;
+            direction             = "NONE";
+            is_unmarked_tjunction = false;
+            turn_elapsed          = 0.0;
+            aligned_frames        = 0;
+            straight_frames       = 0;
+            turn_bias_current     = 0.0;
+            turn_floor_current    = 0.0;
+            curve_detected        = false;
+            far_swept             = false;
+            settle_start_bias     = 0.0;
+            settle_start_floor    = 0.0;
+            settle_elapsed        = 0.0;
             std::cout << "[TURN] RESET TO IDLE\n";
         }
 
@@ -1106,13 +1149,14 @@ public:
 // ============================================================================
 // HÀM STEP HOÀN CHỈNH CHO CLASS LaneFollower (trong LaneFollowerV20.h)
 // ============================================================================
-Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingTurn = false, double turnFloorDeg = 0.0, double turnCapDeg = 0.0) {    cv::Mat m = detail::preprocessMask(roadMask, c_);
+Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingTurn = false, double turnFloorDeg = 0.0, double turnCapDeg = 0.0, int preferredSide = 0) {
+    cv::Mat m = detail::preprocessMask(roadMask, c_);
     Output o;
     detail::Centerline cl;
     if (m.empty()) { 
         cl.valid = false; 
     } else {
-        cl = detail::extractCenterline(m, curveSmooth_, c_);
+        cl = detail::extractCenterline(m, curveSmooth_, c_, preferredSide);
     }
 
     const double nearE = cl.near_error;
@@ -1170,11 +1214,11 @@ Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingT
     }
 
     // ------------------------------------------------------------------------
-    // 2. KHUẾCH ĐẠI PHI TUYẾN (NONLINEAR GAIN) - giảm nhẹ 3-4 độ ở cua thoai thoải
+    // 2. KHUẾCH ĐẠI PHI TUYẾN (NONLINEAR GAIN) - giảm nhẹ ~2-2.5 độ ở khúc cua thoai thoải đầu bài
     // ------------------------------------------------------------------------
     const double abs_err = std::abs(lane_err);
-    if (abs_err > 14.0) {
-        double error_scale = std::min(1.0 + (abs_err - 14.0) * 0.024, 1.42);
+    if (abs_err > 13.0) {
+        double error_scale = std::min(1.0 + (abs_err - 13.0) * 0.027, 1.50);
         lane_err *= error_scale;
     }
 
