@@ -41,7 +41,7 @@ public:
 
         for (const auto& s : signs) {
             if (s.confidence >= 0.70f && s.box.area() >= 280) {
-                if (s.name == "traffic_light" || s.name == "pedestrian") continue;
+                if (s.name == "traffic_light" || s.name == "walking_person") continue;
                 if (block_frames_ > 0 && s.name == blocked_sign_) continue; // biển vừa xử lý xong -> bỏ qua
                 if (s.confidence > best_conf) {
                     best_conf = s.confidence;
