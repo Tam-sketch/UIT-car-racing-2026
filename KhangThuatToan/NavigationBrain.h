@@ -18,8 +18,7 @@ enum class NavAction {
 
 struct NavDecision {
     NavAction action = NavAction::FOLLOW_LANE;
-    float steer_bias_px = 0.0f;
-    float target_speed = 14.0f;
+    float target_speed = 22.0f;
     bool emergency_stop = false;
     std::string active_sign = "NONE";
 };
@@ -30,23 +29,27 @@ public:
     void ClearLatchedSign() {
         latched_sign_ = "NONE";
         latch_cooldown_frames_ = 0;
-        latched_avoid_bias_ = 0.0f;
     }
 
     void UpdateSign(const std::vector<SignObject>& signs) {
         for (const auto& s : signs) {
             if (s.confidence >= 0.70f && s.box.area() >= 200) {
                 if (s.name == "traffic_light") continue;
-                if (latched_sign_ != s.name) {
-                    latched_avoid_bias_ = 0.0f;
-                }
+                if (block_frames_ > 0 && s.name == blocked_sign_) continue; // biển vừa xử lý xong -> bỏ qua
                 latched_sign_ = s.name;
                 latch_cooldown_frames_ = LATCH_DURATION_FRAMES;
                 std::cout << "[NAV BRAIN] >> DETECTED & LATCHED SIGN: " << s.name << "\n";
                 break;
-            }
+            }   
         }
     }
+
+    void BlockSign(const std::string& name, int frames) {
+        blocked_sign_ = name;
+        block_frames_ = frames;
+        if (latched_sign_ == name) ClearLatchedSign();
+    }
+
 
     std::string GetTurnDirection() const {
         // Nhóm rẽ trái
@@ -63,7 +66,8 @@ public:
         return "NONE";
     }
 
-    NavDecision Process(const cv::Mat& roadMask, float currentSpeed) {
+    NavDecision Process(float currentSpeed) {
+        if (block_frames_ > 0) block_frames_--; 
         NavDecision dec;
         dec.target_speed = currentSpeed;
         dec.active_sign = latched_sign_;
@@ -92,15 +96,20 @@ public:
             dec.target_speed = 10.0f;
         } else {
             dec.action = NavAction::FOLLOW_LANE;
-            dec.steer_bias_px = 0.0f;
         }
 
         return dec;
     }
 
+    // Overload nhận thêm cv::Mat roadMask nếu file cpp nào đó truyền 2 tham số
+    NavDecision Process(const cv::Mat& /*roadMask*/, float currentSpeed) {
+        return Process(currentSpeed);
+    }
+
 private:
     std::string latched_sign_ = "NONE";
-    float latched_avoid_bias_ = 0.0f;
     int latch_cooldown_frames_ = 0;
     static constexpr int LATCH_DURATION_FRAMES = 50; 
+    std::string blocked_sign_ = "NONE";
+    int block_frames_ = 0;
 };
