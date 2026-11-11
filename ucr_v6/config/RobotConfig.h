@@ -140,9 +140,9 @@ namespace tl {
     inline constexpr int YEL_H_HI  = 35;
     inline constexpr int GRN_H_LO  = 40;
     inline constexpr int GRN_H_HI  = 90;
-    inline constexpr int S_MIN     = 100;
+    inline constexpr int S_MIN     = 50;
     inline constexpr int V_MIN     = 100;
-    inline constexpr int MIN_LIT_PIXELS = 20;   // winner needs this many bright px
+    inline constexpr int MIN_LIT_PIXELS = 2;   // winner needs this many bright px
     inline constexpr float ROI_EXPAND   = 1.20f;
 }
 
