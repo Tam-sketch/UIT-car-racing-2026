@@ -415,22 +415,23 @@ public:
     double turn_floor_current  = 0.0;
 
     // ---------------- THÔNG SỐ RIÊNG CHO ROUNDABOUT (ôm dịu hơn T-junction) ----------------
-    double ROUNDABOUT_ENTER_DEG       = 16.0;  // Góc sàn ôm phải nhập xuyến
-    double ROUNDABOUT_MAX_ENTER_DEG   = 22.0;  // Trần góc phải tối đa lúc nhập xuyến (chống lao vào nhánh 1)
-    double ROUNDABOUT_CIRCLE_DEG      = 22.0;  // Góc sàn ép quành trái ôm đảo (thắng lực kéo của nhánh 1)
-    double ROUNDABOUT_EXIT_DEG        = 20.0;  // Góc sàn ôm phải thoát ra nhánh 2 (đối diện)
+    double ROUNDABOUT_ENTER_DEG       = 15.0;  // Góc sàn ôm phải nhập xuyến
+    double ROUNDABOUT_MAX_ENTER_DEG   = 20.0;  // Trần góc phải tối đa lúc nhập xuyến (chống lao vào nhánh 1)
+    double ROUNDABOUT_CIRCLE_DEG      = 26.0;  // Góc sàn ép quành trái ôm đảo (thắng lực kéo của nhánh 1)
+    double ROUNDABOUT_EXIT_DEG        = 22.0;  // Góc sàn ôm phải thoát ra nhánh 2 (đối diện)
     double ROUNDABOUT_ENTER_BIAS_PX   = 18.0;
-    double ROUNDABOUT_CIRCLE_BIAS_PX  = 28.0;  // Bias âm (-28px) để kích hoạt khóa lane_err > 0
+    double ROUNDABOUT_CIRCLE_BIAS_PX  = 32.0;  // Bias âm (-32px) để kích hoạt khóa lane_err > 0
     double ROUNDABOUT_EXIT_BIAS_PX    = 28.0;
-    double RB_ENTER_MIN_TIME          = 0.55;  // Thời gian tối thiểu ôm phải nhập xuyến (s)
-    double RB_ENTER_MAX_TIME          = 0.85;  // Thời gian tối đa ôm phải trước khi bắt buộc bẻ trái (s)
-    double RB_CIRCLE_MIN_TIME         = 0.80;  // Thời gian tối thiểu ôm trái trước khi xét qua nhánh 1 (s)
-    double RB_EXIT_MAX_TIME           = 2.40;  // Thời gian tối đa ôm thoát nhánh 2 (s)
+    double RB_ENTER_MIN_TIME          = 0.40;  // Thời gian tối thiểu ôm phải nhập xuyến (s)
+    double RB_ENTER_MAX_TIME          = 0.65;  // Thời gian tối đa ôm phải trước khi bắt buộc bẻ trái (s)
+    double RB_CIRCLE_MIN_TIME         = 1.00;  // Thời gian tối thiểu ôm trái qua miệng nhánh 1 trước khi xét tường giữa 2 nhánh (s)
+    double RB_CIRCLE_MAX_TIME         = 3.20;  // Thời gian tối đa ôm trái quanh đảo (an toàn nếu nhánh 2 mở hẹp)
+    double RB_EXIT_MAX_TIME           = 1.85;  // Thời gian tối đa ôm thoát nhánh 2 (s)
     int    RB_BRANCH_OPEN_WIDTH_PX    = 380;   // Độ rộng mask (rx2 - lx2) khi miệng nhánh mở
     int    RB_BRANCH_CLOSE_WIDTH_PX   = 340;   // Độ rộng mask khi đã qua miệng nhánh 1
 
     int    RB_ENTRY_STABLE_FRAMES     = 2;     // Số frame xe phải nằm ổn trên đường trước khi nhập xuyến
-    int    RB_ONROAD_MARGIN_PX        = 40;    // Tâm xe phải cách 2 mép đường ở đáy ảnh > 40px
+    int    RB_ONROAD_MARGIN_PX        = 110;   // Mép trái ở đáy & tầng giữa phải nằm bên trái (< 130px) để chắc chắn xe đã thẳng sau cua 90°
     int    RB_OFFROAD_MARGIN_PX       = 20;    // Mép trái ở đáy vượt (tâm - 20px) -> đường nằm hẳn bên phải xe
     int    rb_entry_stable_frames     = 0;
     // ---------------- ĐIỀU KIỆN ĐÃ VÀO LÀN MỚI (đo ở tầng xa y1) ----------------
@@ -500,7 +501,9 @@ public:
     }
 
     void start_turn(const std::string& dir, bool is_roundabout = false) {
-        if (state != State::IDLE) return;
+        if (state != State::IDLE && state != State::WAIT_CURVE) return;
+        // Nếu đang ở WAIT_CURVE (chưa tới ngã rẽ) mà biển xác nhận lại đúng hướng cũ thì giữ nguyên tiến trình
+        if (state == State::WAIT_CURVE && direction == dir && is_roundabout_mode == is_roundabout) return;
 
         direction          = dir;
         state              = State::WAIT_CURVE;
@@ -602,18 +605,27 @@ public:
         }
 
         // -----------------------------------------------------------------
-        // XỬ LÝ CHUYÊN BIỆT CHO ROUNDABOUT (4 PHA)
+        // XỬ LÝ CHUYÊN BIỆT CHO ROUNDABOUT (4 PHA CHUẨN THEO SCANLINE LOG)
         // -----------------------------------------------------------------
         if (is_roundabout_mode) {
             turn_elapsed += dt;
 
-            // Kiểm tra biên phải mở (nhìn thấy nhánh rẽ bên phải) hay đóng (đang ôm thân vòng xuyến)
+            // Miệng nhánh mở: biên phải ở tầng giữa và tầng xa vươn sát mép phải ảnh
             const bool right_open = ((mid_rx >= img_w - 10) && (far_rx >= img_w - 15 || far_rx == -1)) ||
-                                    (mid_width >= RB_BRANCH_OPEN_WIDTH_PX);
-            const bool right_closed = (far_rx > 0 && far_rx < img_w - 25) &&
-                                      (mid_width > 0 && mid_width < RB_BRANCH_CLOSE_WIDTH_PX);
+                                    (mid_width >= RB_BRANCH_OPEN_WIDTH_PX && far_rx >= img_w - 40);
 
-            // [MỚI] Xe còn nằm trên mặt đường không? (đo ở hàng đáy ảnh)
+            // Tường bao giữa Nhánh 1 và Nhánh 2: khi xe đã lướt qua miệng Nhánh 1 và đang uốn trái quanh đảo,
+            // biên phải ở tầng xa y1 (far_rx) bị tường vòng xuyến cắt cụt lùi sâu vào trong (log thực tế: far_rx tụt từ 479 về 251 -> 120)
+            // dù mid_rx ở y2 vẫn có thể chạm 479!
+            const bool wall_between_branches = (far_rx > 0 && far_rx <= img_w - 110) ||
+                                               ((far_rx > 0 && far_rx < img_w - 25) && (mid_width > 0 && mid_width < RB_BRANCH_CLOSE_WIDTH_PX));
+
+            // Miệng Nhánh 2 (nhánh đối diện) mở ra sau khi đã đi qua tường bao giữa 2 nhánh:
+            // biên phải tầng xa y1 (far_rx) phóng rộng trở lại về phía mép phải (>= img_w - 85)
+            const bool branch2_open = (far_rx >= img_w - 85) ||
+                                      (far_rx == -1 && mid_rx >= img_w - 10 && mid_lx >= 50);
+
+            // Kiểm tra xe đã nằm ngay ngắn trên mặt đường chưa (sau khi vừa thoát cua 90° trước vòng xuyến)
             auto bottom_x = [](const std::vector<cv::Point>& pts) {
                 int by = -1, bx = -1;
                 for (const auto& p : pts) if (p.y > by) { by = p.y; bx = p.x; }
@@ -621,13 +633,14 @@ public:
             };
             const int  bot_lx = bottom_x(left_pts);
             const int  bot_rx = bottom_x(right_pts);
-            // Mép TRÁI ở đáy đã vượt qua tâm xe -> toàn bộ đường nằm bên PHẢI (xe dạt ra ngoài, VD frame 598-640)
+            // Mép TRÁI ở đáy đã vượt qua tâm xe -> toàn bộ đường nằm bên PHẢI (xe dạt ra ngoài)
             const bool road_all_right = (bot_lx >= 0) && (bot_lx > img_w / 2 - RB_OFFROAD_MARGIN_PX);
             const bool car_on_road    = lane_valid && bot_lx >= 0 && bot_rx >= 0 &&
                                         (bot_lx < img_w / 2 - RB_ONROAD_MARGIN_PX) &&
-                                        (bot_rx > img_w / 2 + RB_ONROAD_MARGIN_PX);
+                                        (bot_rx > img_w / 2 + RB_ONROAD_MARGIN_PX) &&
+                                        (mid_lx >= 0 && mid_lx < img_w / 2 - 110);
 
-            // PHA 1: Chờ tới miệng vòng xuyến - CHỈ khi xe đã nằm ổn định trên đường
+            // PHA 1: Chờ tới miệng vòng xuyến - CHỈ khi xe đã trả lái thẳng sau cua 90°
             if (rb_phase == RoundaboutPhase::WAIT_ENTRY) {
                 rb_entry_stable_frames = car_on_road ? rb_entry_stable_frames + 1 : 0;
                 double r_dev = calculate_deviation(right_pts);
@@ -639,17 +652,17 @@ public:
                 }
             }
 
-            // PHA 2: Ôm phải nhập xuyến
+            // PHA 2: Ôm phải nhẹ nhập vào đầu vòng xuyến
             if (rb_phase == RoundaboutPhase::ENTER_RIGHT) {
                 res.direction         = "RIGHT";
                 res.steer_bias_px     = ROUNDABOUT_ENTER_BIAS_PX;
                 res.steer_floor_deg   = ROUNDABOUT_ENTER_DEG;
-                // Xe đang dạt ra ngoài -> BỎ trần 22° để PID được bẻ tới 50° kéo xe về
+                // Xe đang dạt ra ngoài -> BỎ trần để PID kéo xe về
                 res.steer_cap_deg     = road_all_right ? 0.0 : ROUNDABOUT_MAX_ENTER_DEG;
                 res.lock_opposite_err = true;
 
                 const bool entered_enough = (turn_elapsed >= RB_ENTER_MIN_TIME) &&
-                                            (right_open || (mid_lx > 100));
+                                            (right_open || (mid_lx > 75));
                 // Không bao giờ chuyển sang ôm TRÁI khi đường còn nằm hẳn bên phải
                 if (!road_all_right && (entered_enough || turn_elapsed >= RB_ENTER_MAX_TIME)) {
                     rb_phase                = RoundaboutPhase::CIRCLE_LEFT;
@@ -660,7 +673,7 @@ public:
                     std::cout << "[ROUNDABOUT] >> Phase 2 -> 3: CIRCLE_LEFT (Skipping Branch 1, hugging island left)\n";
                 }
             }
-            // PHA 3: Ôm trái quanh đảo, bỏ qua Nhánh 1, chờ Nhánh 2
+            // PHA 3: Ôm trái quanh đảo, bỏ qua Nhánh 1, chờ thấy tường giữa 2 nhánh rồi chờ Nhánh 2 mở ra
             else if (rb_phase == RoundaboutPhase::CIRCLE_LEFT) {
                 if (road_all_right) {
                     // An toàn: đường nằm hẳn bên phải -> KHÔNG ép trái, để PID kéo xe về; đóng băng đồng hồ pha
@@ -677,19 +690,23 @@ public:
                     res.lock_opposite_err = true;
 
                     if (!branch1_cleared) {
-                        if (turn_elapsed >= RB_CIRCLE_MIN_TIME && (right_closed || (far_lx >= 0 && far_lx < img_w / 2))) {
+                        // Chỉ xác nhận đã bỏ qua Nhánh 1 khi đã chạy tối thiểu RB_CIRCLE_MIN_TIME (1.0s)
+                        // VÀ biên phải tầng xa y1 thu hẹp vào trong (nhìn thấy tường bao giữa Nhánh 1 và Nhánh 2)
+                        if (turn_elapsed >= RB_CIRCLE_MIN_TIME && wall_between_branches) {
                             rb_phase_Confirm_frames++;
                             if (rb_phase_Confirm_frames >= 2) {
                                 branch1_cleared         = true;
                                 rb_phase_Confirm_frames = 0;
-                                std::cout << "[ROUNDABOUT] >>> BRANCH 1 CLEARED! Continuing left toward Branch 2...\n";
+                                std::cout << "[ROUNDABOUT] >>> BRANCH 1 CLEARED (far_rx=" << far_rx
+                                          << ")! Continuing left toward Branch 2...\n";
                             }
                         } else {
                             rb_phase_Confirm_frames = 0;
                         }
                     } else {
-                        rb_phase_Confirm_frames = right_open ? rb_phase_Confirm_frames + 1 : 0;
-                        if (rb_phase_Confirm_frames >= 2) {
+                        // Đã qua tường bao giữa 2 nhánh -> chờ biên phải mở rộng trở lại tại miệng Nhánh 2 (hoặc hết thời gian an toàn)
+                        rb_phase_Confirm_frames = branch2_open ? rb_phase_Confirm_frames + 1 : 0;
+                        if (rb_phase_Confirm_frames >= 2 || turn_elapsed >= RB_CIRCLE_MAX_TIME) {
                             roundabout_exits_passed = 2;
                             rb_phase                = RoundaboutPhase::EXIT_RIGHT;
                             turn_elapsed            = 0.0;
@@ -719,7 +736,7 @@ public:
                                           (far_center_off <  ALIGN_FAR_CENTER_PX) &&
                                           (far_center_off > -ALIGN_FAR_OPPOSITE_PX);
 
-                if (turn_elapsed >= 0.6 && lane_valid && far_swept && far_centered) {
+                if (turn_elapsed >= 0.55 && lane_valid && far_swept && far_centered) {
                     aligned_frames++;
                 } else {
                     aligned_frames = 0;
@@ -915,12 +932,14 @@ public:
     enum class Phase { IDLE, ACTIVE, RELEASE };
 
     double CORNER_STEER_DEG      = 45.0;  // Góc sàn khi ôm cua 90° (PID vẫn được lên tới 50°)
-    double CORNER_RAMP_DEG_PER_S = 60.0;  // ~10°/frame ở 6 FPS
-    double CORNER_RELEASE_TIME   = 0.4;   // Thời gian trả góc sàn về 0 (s)
-    double CORNER_MIN_TIME       = 0.6;   // Tối thiểu trước khi xét đã vào đường mới (s)
-    double CORNER_MAX_TIME       = 3.0;   // Lưới an toàn (s)
+    double CORNER_INIT_DEG       = 16.0;  // Góc sàn khởi điểm ngay frame chốt cua 90° để bẻ sớm, không bị trễ
+    double CORNER_RAMP_DEG_PER_S = 85.0;  // ~14°/frame ở 6 FPS để lên góc 45° nhanh hơn
+    double CORNER_RELEASE_TIME   = 0.35;  // Thời gian trả góc sàn về 0 (s)
+    double CORNER_MIN_TIME       = 0.55;  // Tối thiểu trước khi xét đã vào đường mới (s)
+    double CORNER_MAX_TIME       = 2.6;   // Lưới an toàn (s)
     double CORNER_COOLDOWN_S     = 1.0;   // Nghỉ sau khi nhả để không kích lại ngay
-    int    CORNER_BEND_PX        = 180;   // Mép ngoài lệch giữa tầng giữa (y2) và tầng xa (y1)
+    int    CORNER_BEND_PX        = 145;   // Mép trong lệch giữa tầng giữa (y2) và tầng xa (y1) - hạ từ 180 xuống 145 để bắt cua sớm hơn
+    int    CORNER_EARLY_FAR_PX   = 330;   // Khi góc cua 90° chưa chạm xuống y2 (lx2=0 hoặc rx2=479) nhưng ở y1 đã quét sâu >= 330px
     int    CORNER_CONFIRM_FRAMES = 2;
     int    EDGE_TOUCH_PX         = 3;
     int    ALIGN_CENTER_PX       = 70;
@@ -936,16 +955,39 @@ public:
     double floor()     const { return floor_; }
 
     // lx1/rx1: tầng xa (45%), lx2/rx2: tầng giữa (65%), lx_bot/rx_bot: hàng đáy. Toạ độ ảnh mask gốc.
-    double update(int lx1, int rx1, int lx2, int rx2, int lx_bot, int rx_bot, int w, double dt) {
+    double update(int lx1, int rx1, int lx2, int rx2, int lx_bot, int rx_bot, int w, double dt,
+                  bool has_active_sign = false,
+                  double near_e = 0.0, double mid_e = 0.0, double far_e = 0.0) {
         const int  edgeR    = w - 1 - EDGE_TOUCH_PX;
         const bool far_none = (lx1 < 0 || rx1 < 0);
 
-        const bool right_sig = (rx2 >= edgeR) && (rx_bot >= edgeR) &&
-                               (lx2 > EDGE_TOUCH_PX + 2) &&
-                               (far_none || (rx1 >= edgeR && (lx1 - lx2) >= CORNER_BEND_PX));
-        const bool left_sig  = (lx2 >= 0 && lx2 <= EDGE_TOUCH_PX) && (lx_bot >= 0 && lx_bot <= EDGE_TOUCH_PX) &&
-                               (rx2 >= 0 && rx2 < edgeR - 2) &&
-                               (far_none || (lx1 >= 0 && lx1 <= EDGE_TOUCH_PX && (rx2 - rx1) >= CORNER_BEND_PX));
+        // Chặn nhiễu trên đỉnh cầu (auto_2.txt frame 325-353): xe đang ở giữa làn gần (|near_e| <= 3.5),
+        // nhưng thành cầu cắt chéo làm |mid_e| >= 18 và |far_e| >= 95
+        const bool on_bridge_crest = (std::abs(near_e) <= 3.5) && (std::abs(mid_e) >= 18.0) && (std::abs(far_e) >= 95.0);
+
+        // 1. Trường hợp còn thấy tầng xa (!far_none):
+        //    Cho phép bắt cua 90° SỚM ngay cả khi góc trong chưa chạm xuống y2 (lx2 == 0 hoặc rx2 == edgeR)
+        //    miễn là biên trong ở tầng xa y1 đã quét rất sâu qua tâm (>= CORNER_EARLY_FAR_PX = 330px).
+        // 2. Trường hợp mất tầng xa (far_none == true):
+        //    Chặn hoàn toàn nhiễu lúc leo dốc cầu (frame 552-605: far_none=true nhưng lx2 chỉ 48..65, mid_e=-0.5..7.5, far_e=20..39.5)
+        //    bằng cách đòi hỏi biên trong ở y2 phải khép sâu >= 140px VÀ |mid_e| >= 20, |far_e| >= 60.
+        const bool right_far_ok = !far_none
+            ? ((rx1 >= edgeR) && ((lx1 - lx2) >= CORNER_BEND_PX) &&
+               (lx2 > EDGE_TOUCH_PX + 12 || lx1 >= CORNER_EARLY_FAR_PX) && (far_e >= 45.0))
+            : (!has_active_sign && (lx2 >= 140) && (mid_e >= 20.0) && (far_e >= 60.0));
+
+        const bool left_far_ok = !far_none
+            ? ((lx1 >= 0 && lx1 <= EDGE_TOUCH_PX) && ((rx2 - rx1) >= CORNER_BEND_PX) &&
+               (rx2 < edgeR - 12 || rx1 <= w - 1 - CORNER_EARLY_FAR_PX) && (far_e <= -45.0))
+            : (!has_active_sign && (rx2 >= 0 && rx2 <= w - 1 - 140) && (mid_e <= -20.0) && (far_e <= -60.0));
+
+        const bool right_sig = !on_bridge_crest &&
+                               (rx2 >= edgeR) && (rx_bot >= edgeR) &&
+                               (lx2 >= 0) && right_far_ok;
+
+        const bool left_sig  = !on_bridge_crest &&
+                               (lx2 >= 0 && lx2 <= EDGE_TOUCH_PX) && (lx_bot >= 0 && lx_bot <= EDGE_TOUCH_PX) &&
+                               (rx2 >= 0) && left_far_ok;
 
         if (cooldown_ > 0.0) cooldown_ = std::max(0.0, cooldown_ - dt);
 
@@ -958,7 +1000,8 @@ public:
 
             if (confirm_ >= CORNER_CONFIRM_FRAMES) {
                 phase_ = Phase::ACTIVE; dir_ = pending_dir_;
-                elapsed_ = 0.0; aligned_ = 0; floor_ = 0.0;
+                elapsed_ = 0.0; aligned_ = 0;
+                floor_ = dir_ * CORNER_INIT_DEG; // Bắt đầu ngay ở 16° thay vì 0° để xe quành sớm tức thì
                 std::cout << "[CORNER] >> SHARP " << (dir_ > 0 ? "RIGHT" : "LEFT") << " CORNER -> ASSIST ON\n";
             }
         }
@@ -976,10 +1019,14 @@ public:
             const bool overturn = (dir_ > 0) ? (rx_bot >= 0 && rx_bot < w / 2 + OVERTURN_PX)
                                              : (lx_bot >= 0 && lx_bot > w / 2 - OVERTURN_PX);
 
-            if (aligned_ >= 2 || overturn || elapsed_ >= CORNER_MAX_TIME) {
+            // Nhả ngay nếu mép phía cua ở tầng giữa (y2) đã tách khỏi rìa ảnh (hết cua hoặc kích nhầm)
+            const bool edge_detached = (dir_ > 0) ? (rx2 >= 0 && rx2 < edgeR - 20)
+                                                  : (lx2 >= 0 && lx2 > EDGE_TOUCH_PX + 20);
+
+            if (aligned_ >= 2 || overturn || edge_detached || elapsed_ >= CORNER_MAX_TIME) {
                 phase_ = Phase::RELEASE; release_start_ = floor_; release_t_ = 0.0;
                 std::cout << "[CORNER] RELEASE ("
-                          << (aligned_ >= 2 ? "aligned" : (overturn ? "overturn" : "timeout")) << ")\n";
+                          << (aligned_ >= 2 ? "aligned" : (overturn ? "overturn" : (edge_detached ? "edge_detached" : "timeout"))) << ")\n";
             }
         }
         else { // RELEASE
@@ -1052,15 +1099,21 @@ Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingT
     const bool valid = cl.valid;
     // ------------------------------------------------------------------------
     // 1. TÍNH TOÁN SAI SỐ LÀN: STRICT MID-GATED LOOKAHEAD
-    // Triệt tiêu hiện tượng đón cua sớm và tự triệt tiêu sai số khi cua chữ S
+    // Triệt tiêu hiện tượng đón cua sớm, lọc nhiễu đỉnh cầu và hỗ trợ vào cua 90° sớm
     // ------------------------------------------------------------------------
     double lane_err = 0.0;
     
+    // Nhiễu mặt đường dưới chân cầu khi xe đang ở đỉnh cầu (auto_2.txt frame 325-353):
+    // Đầu xe hoàn toàn ở giữa làn (|nearE| <= 3.5), nhưng thành cầu cắt chéo làm |midE| >= 18 và |farE| >= 95
+    const bool bridge_far_artefact = (std::abs(nearE) <= 3.5) && (std::abs(midE) >= 18.0) && (std::abs(farE) >= 95.0);
+
     // Chỉ coi là ngược chiều (cua chữ S) khi Near THỰC SỰ lệch rõ rệt (|nearE| > 3.0px)
-    // Nếu |nearE| <= 3.0px, xe chỉ đang chạy thẳng ở giữa làn và nhìn thấy cua ở xa
     const bool is_genuinely_opposite = (nearE * farE < 0.0) && (std::abs(nearE) > 3.0);
 
-    if (is_genuinely_opposite) {
+    if (bridge_far_artefact && !isExecutingTurn) {
+        // Trên đỉnh cầu: bỏ qua Far bị cắt bởi thành cầu, giữ xe đi thẳng theo tâm gần
+        lane_err = (0.85 * nearE) + (0.15 * std::clamp(midE, -12.0, 12.0));
+    } else if (is_genuinely_opposite) {
         // Tình huống chữ S thực sự: Near lệch một bên, Far uốn bên ngược lại
         if (midE * farE > 0.0 && std::abs(midE) > 6.0) {
             double capped_far = std::clamp(farE, -25.0, 25.0);
@@ -1070,9 +1123,11 @@ Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingT
             lane_err = (0.65 * nearE) + (0.35 * midE);
         }
     } else {
-        // Bình thường: Far chỉ được kéo tối đa 1.5 lần Mid (tối thiểu 30px), trọng số Far 0.25
-        // -> không bẻ gắt khi xe vẫn đang ở giữa làn mà chỉ thấy đường uốn ở xa
-        double max_far_allowed = std::max(std::abs(midE) * 1.5, 30.0);
+        // Bình thường: Far chỉ được kéo tối đa 1.5 lần Mid (tối thiểu 30px).
+        // Riêng khi sắp vào cua 90° (Mid còn nhỏ < 15px nhưng Far đã vọt >= 50px và không phải nhiễu đỉnh cầu),
+        // mở trần Far lên 60px để PID bắt đầu nghiêng lái đón cua 90° sớm hơn 3-5 frame trước khi CornerAssist khóa góc sàn.
+        double base_far_cap = (!isExecutingTurn && std::abs(midE) < 15.0 && std::abs(farE) >= 50.0) ? 60.0 : 30.0;
+        double max_far_allowed = std::max(std::abs(midE) * 1.5, base_far_cap);
         double safe_far = std::clamp(farE, -max_far_allowed, max_far_allowed);
         lane_err = (0.40 * nearE) + (0.35 * midE) + (0.25 * safe_far);
     }
