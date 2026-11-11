@@ -416,17 +416,40 @@ int main() {
             int y2 = static_cast<int>(h * 0.65);
             int y_bottom = h - 1;
 
+            const int pref_side = turn_controller.get_preferred_side();
             auto get_mask_boundaries = [&](int y_row, int& lx, int& rx) {
                 lx = -1; rx = -1;
                 if (y_row < 0 || y_row >= h) return;
                 const uchar* row = mask.ptr<uchar>(y_row);
                 int start = -1; int best_len = -1;
+                bool has_pref = false;
+                const int half_w = w / 2;
                 for (int x = 0; x <= w; x++) {
                     bool on = (x < w) && (row[x] > 0);
                     if (on && start < 0) start = x;
                     if (!on && start >= 0) {
+                        int end_x = x - 1;
                         int len = x - start;
-                        if (len > best_len) { best_len = len; lx = start; rx = x - 1; }
+                        if (len > 15) {
+                            bool is_pref = (pref_side < 0 && start < half_w - 15) ||
+                                           (pref_side > 0 && end_x > half_w + 15);
+                            bool take = false;
+                            if (pref_side != 0) {
+                                if (is_pref && !has_pref) take = true;
+                                else if (is_pref && has_pref) {
+                                    if (pref_side < 0 && start < lx) take = true;
+                                    if (pref_side > 0 && end_x > rx) take = true;
+                                } else if (!has_pref && len > best_len) {
+                                    take = true;
+                                }
+                            } else if (len > best_len) {
+                                take = true;
+                            }
+                            if (take) {
+                                best_len = len; lx = start; rx = end_x;
+                                if (is_pref) has_pref = true;
+                            }
+                        }
                         start = -1;
                     }
                 }
@@ -507,9 +530,15 @@ int main() {
                 (dec.active_sign != "NONE"),
                 previous_out.near_e, previous_out.mid_e, previous_out.far_e
             );
-            // Góc sàn: ưu tiên TurnController; khi IDLE thì CornerAssist lo cua 90° không biển
+            // Góc sàn: ưu tiên TurnController; khi IDLE (hoặc đang đi trên đường dẫn chờ tới T-junction không biển) thì CornerAssist vẫn hỗ trợ cua 90° đơn thuần
             applied_floor = turn_res.steer_floor_deg;
-            if (turn_controller.state == v20::LaneTurnController::State::IDLE) {
+            const bool allow_corner_assist =
+                (turn_controller.state == v20::LaneTurnController::State::IDLE) ||
+                (turn_controller.is_unmarked_tjunction &&
+                 turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE &&
+                 !turn_res.junction_opened &&
+                 !(lx2 >= 0 && lx2 <= 15 && rx2 >= w - 15));
+            if (allow_corner_assist) {
                 const double cf = corner_assist.update(
                     lx1, rx1, lx2, rx2, lx_bot, rx_bot, w, dt_loop,
                     (dec.active_sign != "NONE"),
@@ -524,7 +553,8 @@ int main() {
                 turn_res.steer_bias_px,
                 turn_res.lock_opposite_err,
                 applied_floor,
-                turn_res.steer_cap_deg
+                turn_res.steer_cap_deg,
+                turn_res.preferred_side
             );
             previous_out = out;
             if (turn_res.state == v20::LaneTurnController::State::DONE) {
