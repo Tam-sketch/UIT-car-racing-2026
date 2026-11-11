@@ -39,7 +39,7 @@ struct Config {
     int emergency_streak_req = 2;
     int emg_hold_after_occl  = 5;
 
-    double kp = 0.45, ki = 0.0, kd = 0.70; 
+    double kp = 0.45, ki = 0.0, kd = 0.70;
     double integral_limit = 2.0, derivative_alpha = 0.30;
     double output_limit = 45.0, rate_limit = 24.0, deadband = 1.0;
     double emergency_output_limit = 25.0, emergency_rate_limit = 25.0, emergency_error_px = 26.0;
@@ -51,6 +51,15 @@ struct Config {
     int    min_rows = 5;
     double coverage_threshold = 0.05;
     double curve_scale = 140.0;
+
+    // --- Bridge / mask-expansion detection ---
+    // Bridge rails and deck often get absorbed into the road mask, widening the
+    // mid band well beyond normal perspective receding. Trigger near-only error
+    // when this happens (prevents phantom left turn on bridge).
+    double bridge_far_artefact_farE_px  = 55.0;   // loosened from hardcoded 95.0
+    double bridge_far_artefact_midE_px  = 14.0;   // loosened from hardcoded 18.0
+    double bridge_mid_width_ratio       = 0.80;   // mid_band_width / near_band_width
+    double bridge_near_e_max            = 8.0;    // car must be near-centred
 };
 
 // ... [Giữ nguyên namespace detail với medianInts, percentileInt, sgn, preprocessMask, Centerline, extractCenterline, detectAsymmetry, planSpeed, errorSpeedFactor] ...
@@ -1056,8 +1065,10 @@ public:
     struct Output {
         double angle = 0, speed = 0;
         bool valid = false, occl = false, forced_emer = false, emer_auth = false, losing = false;
-        double near_e = 0, far_e = 0, eff_error = 0, coverage = 0; 
-        double mid_e = 0;         // <--- Bổ sung biến này
+        double near_e = 0, far_e = 0, eff_error = 0, coverage = 0;
+        double mid_e = 0;
+        double mid_near_ratio = 0.0;   // mid_band_width / near_band_width (for tuning)
+        bool   bridge_suspect = false; // true when bridge/expansion path taken
         std::vector<std::pair<int, int>> centerline_pts;
         std::vector<std::pair<int, int>> left_line_pts;
         std::vector<std::pair<int, int>> right_line_pts;
@@ -1077,17 +1088,14 @@ public:
     }
     double speed() const { return speed_; }
 
-// ==========================================================
-// CẬP NHẬT TRONG LaneFollower::step (LaneFollowerV20.h)
-// ==========================================================
 // ============================================================================
 // HÀM STEP HOÀN CHỈNH CHO CLASS LaneFollower (trong LaneFollowerV20.h)
 // ============================================================================
 Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingTurn = false, double turnFloorDeg = 0.0, double turnCapDeg = 0.0) {    cv::Mat m = detail::preprocessMask(roadMask, c_);
     Output o;
     detail::Centerline cl;
-    if (m.empty()) { 
-        cl.valid = false; 
+    if (m.empty()) {
+        cl.valid = false;
     } else {
         cl = detail::extractCenterline(m, curveSmooth_, c_);
     }
@@ -1102,17 +1110,56 @@ Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingT
     // Triệt tiêu hiện tượng đón cua sớm, lọc nhiễu đỉnh cầu và hỗ trợ vào cua 90° sớm
     // ------------------------------------------------------------------------
     double lane_err = 0.0;
-    
-    // Nhiễu mặt đường dưới chân cầu khi xe đang ở đỉnh cầu (auto_2.txt frame 325-353):
-    // Đầu xe hoàn toàn ở giữa làn (|nearE| <= 3.5), nhưng thành cầu cắt chéo làm |midE| >= 18 và |farE| >= 95
-    const bool bridge_far_artefact = (std::abs(nearE) <= 3.5) && (std::abs(midE) >= 18.0) && (std::abs(farE) >= 95.0);
+
+    // --- Compute per-band mask width from row boundaries (mask width) ---
+    // Uses same y splits as extractCenterline so it stays consistent.
+    double near_band_width = 0.0; int near_band_n = 0;
+    double mid_band_width  = 0.0; int mid_band_n  = 0;
+    if (!cl.row_centers.empty() &&
+        cl.row_centers.size() == cl.left_pts.size() &&
+        cl.row_centers.size() == cl.right_pts.size()) {
+        std::vector<int> ys; ys.reserve(cl.row_centers.size());
+        for (auto& p : cl.row_centers) ys.push_back(p.second);
+        std::sort(ys.begin(), ys.end());
+        int yBot  = detail::percentileInt(ys, 0.98);
+        int yTop  = detail::percentileInt(ys, 0.02);
+        int span  = std::max(yBot - yTop, 1);
+        int ySplitNear = yBot - (int)(span * 0.35);
+        int ySplitFar  = yTop + (int)(span * 0.30);
+        for (size_t i = 0; i < cl.row_centers.size(); ++i) {
+            int y   = cl.row_centers[i].second;
+            int wpx = cl.right_pts[i].first - cl.left_pts[i].first;
+            if (wpx <= 0) continue;
+            if (y >= ySplitNear)          { near_band_width += wpx; near_band_n++; }
+            else if (y >= ySplitFar)      { mid_band_width  += wpx; mid_band_n++;  }
+        }
+        if (near_band_n > 0) near_band_width /= near_band_n;
+        if (mid_band_n  > 0) mid_band_width  /= mid_band_n;
+    }
+    const double mid_near_ratio = (near_band_width > 40.0)
+                                ? (mid_band_width / near_band_width) : 0.0;
+
+    // --- Detector 1: far-band crest artefact (loosened from hardcoded 95/18/3.5) ---
+    const bool bridge_far_artefact =
+        (std::abs(nearE) <= 5.0) &&
+        (std::abs(midE) >= c_.bridge_far_artefact_midE_px) &&
+        (std::abs(farE) >= c_.bridge_far_artefact_farE_px);
+
+    // --- Detector 2: mask expansion (mid band unusually wide vs near) ---
+    const bool bridge_expansion =
+        (near_band_width > 60.0) &&
+        (mid_near_ratio >= c_.bridge_mid_width_ratio) &&
+        (std::abs(nearE) <= c_.bridge_near_e_max);
+
+    const bool bridge_like = (bridge_far_artefact || bridge_expansion) && !isExecutingTurn;
 
     // Chỉ coi là ngược chiều (cua chữ S) khi Near THỰC SỰ lệch rõ rệt (|nearE| > 3.0px)
     const bool is_genuinely_opposite = (nearE * farE < 0.0) && (std::abs(nearE) > 3.0);
 
-    if (bridge_far_artefact && !isExecutingTurn) {
-        // Trên đỉnh cầu: bỏ qua Far bị cắt bởi thành cầu, giữ xe đi thẳng theo tâm gần
-        lane_err = (0.85 * nearE) + (0.15 * std::clamp(midE, -12.0, 12.0));
+    if (bridge_like) {
+        // Trên đỉnh cầu / mask expansion: bỏ qua Far bị cắt bởi thành cầu,
+        // giữ xe đi thẳng theo tâm gần (nearE dominant).
+        lane_err = (0.90 * nearE) + (0.10 * std::clamp(midE, -10.0, 10.0));
     } else if (is_genuinely_opposite) {
         // Tình huống chữ S thực sự: Near lệch một bên, Far uốn bên ngược lại
         if (midE * farE > 0.0 && std::abs(midE) > 6.0) {
@@ -1169,7 +1216,7 @@ Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingT
         if (std::abs(nearE) < 5.0 && std::abs(asymSmooth_) < c_.asym_cap) asymSmooth_ *= c_.asym_decay;
         asymSmooth_ = std::clamp(asymSmooth_, -c_.asym_cap, c_.asym_cap);
     }
-    
+
     double asymApplied = (std::abs(asymSmooth_) < c_.asym_threshold) ? 0.0 : c_.asym_strength * asymSmooth_;
     eff += asymApplied;
 
@@ -1183,16 +1230,16 @@ Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingT
     if (valid) {
         invalid_frames_ = 0;
         if (!prevValid_) { pid_.softReset(); gate_.reset(); }
-        
+
         angle = pid_.step(eff, c_.kp, c_.rate_limit);
-        
+
         double target = detail::planSpeed(curveSmooth_, c_.max_speed, c_.min_speed, c_.curve_scale);
-        
+
         // Hãm tốc độ chủ động về mức tối thiểu khi xe đang chịu sai số gần lớn
         if (std::abs(nearE) > 15.0) {
             target = std::min(target, c_.min_speed + 1.0);
         }
-        
+
         double errMult = detail::errorSpeedFactor(eff);
         double authSpeed = pid_.losing() ? 0.6 : 1.0;
         target = std::max(target * errMult * authSpeed, c_.min_speed);
@@ -1202,7 +1249,7 @@ Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingT
         angle = lastAngle_;
         if (invalid_frames_ > 5) {
             speed_ = 0.0;
-            forcedEmer = true; 
+            forcedEmer = true;
         } else {
             speed_ = std::max(c_.min_speed, 0.85 * speed_);
         }
@@ -1230,7 +1277,9 @@ Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingT
     o.speed = speed_;
     o.valid = valid;
     o.occl = occl;
-    o.mid_e = midE;                  // <--- Gán giá trị
+    o.mid_e = midE;
+    o.mid_near_ratio = mid_near_ratio;
+    o.bridge_suspect = bridge_like;
     o.forced_emer = forcedEmer;
     o.emer_auth = pid_.emergencyAuthority();
     o.losing = pid_.losing();
