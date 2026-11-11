@@ -95,10 +95,10 @@ namespace tl {
     inline constexpr int RED_H2_LO = 170, RED_H2_HI = 180;
     inline constexpr int YEL_H_LO  = 15,  YEL_H_HI  = 35;
     inline constexpr int GRN_H_LO  = 40,  GRN_H_HI  = 90;
-    inline constexpr int S_MIN     = 100;
-    inline constexpr int V_MIN     = 100;
-    inline constexpr int MIN_LIT_PIXELS = 20;
-    inline constexpr float ROI_EXPAND   = 1.20f;
+    inline constexpr int S_MIN     = 160;
+    inline constexpr int V_MIN     = 230;
+    inline constexpr int MIN_LIT_PIXELS = 10;
+    inline constexpr float ROI_EXPAND   = 1.05f;
 }
 
 // Stop hangovers (seconds)
@@ -514,7 +514,7 @@ int main() {
                     continue;
                 }
                 // traffic_light
-                if (d.name == "traffic_light" || d.class_id == TRAFFIC_LIGHT) {
+                if (d.name == "traffic_light" || d.class_id == sign_class::TRAFFIC_LIGHT) {
                     if (ClassifyTrafficLight(frame, d.box) == LightColor::RED)
                         last_red_seen_time = elapsed_total;
                     else
@@ -635,8 +635,7 @@ int main() {
                     voter.Reset();
                     // Arm T-junction auto-detection after roundabout (V20 feature)
                     turn_controller.waiting_for_tjunction = true;
-                    turn_controller.tjunction_cooldown =
-                        v20::LaneTurnController::TJUNCTION_COOLDOWN_S;
+                    turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
                 }
                 break;
             }
