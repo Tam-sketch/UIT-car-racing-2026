@@ -1,6 +1,6 @@
 // ============================================================
-// main.cpp — UCR 2026 V6.5
-// (Roundabout: bias split + min-ticks + shared speed clamp)
+// main.cpp — UCR 2026 V6.6
+// (Speed 30/20, Roundabout sign-based transitions)
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -28,13 +28,9 @@
 volatile std::sig_atomic_t g_stopSignal = 0;
 static void SignalHandler(int) { g_stopSignal = 1; }
 
-// ============================================================
-// Sign class → v21::SignState
-// ============================================================
 static v21::SignState MakeSignState(int committed) {
     v21::SignState s;
     if (committed < 0) return s;
-
     using namespace ucr::config::sign_class;
     s.class_id = committed;
     switch (committed) {
@@ -47,9 +43,6 @@ static v21::SignState MakeSignState(int committed) {
     return s;
 }
 
-// ============================================================
-// Roundabout state
-// ============================================================
 enum class RbState {
     NONE, APPROACH, IN_CIRCLE, EXIT_PREP, EXIT_SEARCH, EXITING
 };
@@ -65,14 +58,10 @@ static const char* RbStateName(RbState s) {
     }
 }
 
-// ============================================================
-// Traffic light classifier
-// ============================================================
 enum class LightColor { NONE, RED, YELLOW, GREEN };
 
 static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect2f& bbox) {
     using namespace ucr::config::tl;
-
     const float cx = bbox.x + bbox.width  * 0.5f;
     const float cy = bbox.y + bbox.height * 0.5f;
     const float w  = bbox.width  * ROI_EXPAND;
@@ -110,9 +99,6 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect2f& bbo
     return LightColor::NONE;
 }
 
-// ============================================================
-// MAIN
-// ============================================================
 int main() {
     std::signal(SIGINT,  SignalHandler);
     std::signal(SIGTERM, SignalHandler);
@@ -194,27 +180,29 @@ int main() {
     int lastPersonSeenTick = -1;
     int lastRedSeenTick    = -1;
 
-    // --- Roundabout state ---
     RbState  rb_state            = RbState::NONE;
     uint32_t rb_enter_tick       = 0;
-    uint32_t rb_state_enter_tick = 0;
     int      rb_missing_sign     = 0;
     int      rb_exit_search_tick = 0;
     int      rb_cooldown_ticks   = 0;
 
-    std::cout << "\n=== UCR2026 V6.5 (turns="
+    std::cout << "\n=== UCR2026 V6.6 (turns="
               << (signReady ? "yes" : "no") << ") ===\n"
               << "Road: " << ucr::config::ROAD_ENGINE_PATH << "\n";
     if (signReady)
         std::cout << "Sign: " << ucr::config::SIGN_ENGINE_PATH << "\n";
     std::cout << "Control: " << ucr::config::CONTROL_PERIOD_MS << " ms\n"
+              << "Speed: [" << ucr::config::MIN_SPEED_CMS
+              << ", " << ucr::config::MAX_SPEED_CMS << "] cm/s\n"
               << "Roundabout: bias R=" << ucr::config::RB_BIAS_PX_RIGHT
               << " L=" << ucr::config::RB_BIAS_PX_LEFT
               << " | speed [" << ucr::config::RB_SPEED_MIN_CMS
               << ", " << ucr::config::RB_SPEED_MAX_CMS << "]\n"
-              << "  min_ticks AP=" << ucr::config::RB_APPROACH_MIN_TICKS
-              << " IC=" << ucr::config::RB_IN_CIRCLE_MIN_TICKS
-              << " EP=" << ucr::config::RB_EXIT_PREP_MIN_TICKS << "\n"
+              << "  missing_sign_ticks=" << ucr::config::RB_MISSING_SIGN_TICKS
+              << " ("
+              << (ucr::config::RB_MISSING_SIGN_TICKS *
+                  ucr::config::CONTROL_PERIOD_MS / 1000.0f)
+              << "s)\n"
               << "Press 'q' to quit\n\n";
 
     while (!g_stopSignal) {
@@ -239,9 +227,6 @@ int main() {
         }
         else if (now >= next_control) {
 
-            // =================================================
-            // 1. Sign detection (throttled)
-            // =================================================
             if (signReady && (tickIdx % ucr::config::SIGN_DETECT_EVERY) == 0) {
                 sign.Detect(frame, lastDets);
 
@@ -276,9 +261,6 @@ int main() {
                 voter.Update(classIds, tickIdx);
             }
 
-            // =================================================
-            // 2. Roundabout state machine
-            // =================================================
             bool rb_visible_now = false;
             for (const auto& d : lastDets) {
                 if (d.class_id == ucr::config::sign_class::ROUNDABOUT &&
@@ -293,7 +275,6 @@ int main() {
 
             if (rb_cooldown_ticks > 0) --rb_cooldown_ticks;
 
-            // Track "missing sign" for APPROACH & EXIT_PREP
             if (rb_state == RbState::APPROACH ||
                 rb_state == RbState::EXIT_PREP) {
                 if (rb_visible_now) rb_missing_sign = 0;
@@ -304,65 +285,46 @@ int main() {
                 case RbState::NONE:
                     if (rb_committed && rb_cooldown_ticks <= 0) {
                         rb_state = RbState::APPROACH;
-                        rb_state_enter_tick = tickIdx;
                         rb_missing_sign = 0;
                     }
                     break;
 
-                case RbState::APPROACH: {
-                    const uint32_t dur = tickIdx - rb_state_enter_tick;
-                    const bool min_ok = dur >= (uint32_t)ucr::config::RB_APPROACH_MIN_TICKS;
-                    const bool sign_gone = rb_missing_sign >= ucr::config::RB_MISSING_SIGN_TICKS;
-                    if (min_ok && sign_gone) {
+                case RbState::APPROACH:
+                    if (rb_missing_sign >= ucr::config::RB_MISSING_SIGN_TICKS) {
                         rb_state = RbState::IN_CIRCLE;
-                        rb_state_enter_tick = tickIdx;
                         rb_enter_tick = tickIdx;
                     }
                     break;
-                }
 
                 case RbState::IN_CIRCLE: {
-                    const uint32_t dur = tickIdx - rb_state_enter_tick;
-                    const bool min_ok = dur >= (uint32_t)ucr::config::RB_IN_CIRCLE_MIN_TICKS;
                     const bool timeout =
                         (int)(tickIdx - rb_enter_tick) >= ucr::config::RB_CIRCLE_TIMEOUT;
                     const bool rb_seen_again = rb_committed && rb_visible_now;
-                    if (min_ok && (timeout || rb_seen_again)) {
+                    if (timeout || rb_seen_again) {
                         rb_state = RbState::EXIT_PREP;
-                        rb_state_enter_tick = tickIdx;
                         rb_missing_sign = 0;
                     }
                     break;
                 }
 
-                case RbState::EXIT_PREP: {
-                    const uint32_t dur = tickIdx - rb_state_enter_tick;
-                    const bool min_ok = dur >= (uint32_t)ucr::config::RB_EXIT_PREP_MIN_TICKS;
-                    const bool sign_gone = rb_missing_sign >= ucr::config::RB_MISSING_SIGN_TICKS;
-                    if (min_ok && sign_gone) {
+                case RbState::EXIT_PREP:
+                    if (rb_missing_sign >= ucr::config::RB_MISSING_SIGN_TICKS) {
                         rb_state = RbState::EXIT_SEARCH;
-                        rb_state_enter_tick = tickIdx;
                         rb_exit_search_tick = 0;
                     }
                     break;
-                }
 
                 case RbState::EXIT_SEARCH:
                     ++rb_exit_search_tick;
                     if (rb_exit_search_tick >= ucr::config::RB_EXIT_SEARCH_TIMEOUT) {
                         rb_state = RbState::EXITING;
-                        rb_state_enter_tick = tickIdx;
                     }
                     break;
 
                 case RbState::EXITING:
-                    // Post-step handles transition to NONE
                     break;
             }
 
-            // =================================================
-            // 3. Compute bias + force sign by state
-            // =================================================
             v21::SignState signState = MakeSignState(voter.GetCommitted());
             float rb_bias_px = 0.0f;
 
@@ -382,7 +344,7 @@ int main() {
                 case RbState::EXIT_SEARCH:
                     signState.active   = true;
                     signState.side     = +1;
-                    signState.class_id = 7;   // fake turn_right → Bezier
+                    signState.class_id = 7;
                     rb_bias_px = -ucr::config::RB_BIAS_PX_LEFT;
                     break;
                 case RbState::EXITING:
@@ -394,32 +356,20 @@ int main() {
                     break;
             }
 
-            // =================================================
-            // 4. PID step with roundabout bias
-            // =================================================
             out = follower.step(small_mask, signState, NAN, rb_bias_px);
 
-            // =================================================
-            // 5. Post-step transitions
-            // =================================================
             if (rb_state == RbState::EXIT_SEARCH &&
                 out.state_str.find("TURN") != std::string::npos) {
                 rb_state = RbState::EXITING;
-                rb_state_enter_tick = tickIdx;
             }
             if (rb_state == RbState::EXITING &&
                 out.state_str == "CENTERLINE") {
                 rb_state = RbState::NONE;
-                rb_state_enter_tick = tickIdx;
                 rb_cooldown_ticks = ucr::config::RB_COOLDOWN_TICKS;
                 voter.Reset();
             }
 
-            // =================================================
-            // 6. Steering
-            // =================================================
             float desired_real_left = -static_cast<float>(out.angle);
-
             desired_real_left = std::clamp(desired_real_left,
                                            -ucr::config::MAX_REAL_ANGLE_DEG,
                                             ucr::config::MAX_REAL_ANGLE_DEG);
@@ -429,21 +379,16 @@ int main() {
                                     static_cast<float>(ucr::config::MAX_SERVO_CMD));
             const int final_angle = static_cast<int>(std::lround(servo_cmd));
 
-            // =================================================
-            // 7. Speed
-            // =================================================
             float speed = static_cast<float>(out.speed);
             if (!out.valid && out.coverage > 0.02)
                 speed = ucr::config::MIN_SPEED_CMS;
 
-            // Roundabout shared speed clamp (min/max)
             if (rb_state != RbState::NONE) {
                 speed = std::clamp(speed,
                                    ucr::config::RB_SPEED_MIN_CMS,
                                    ucr::config::RB_SPEED_MAX_CMS);
             }
 
-            // Stop overrides (person priority > red light)
             const bool stopForPerson =
                 (lastPersonSeenTick >= 0) &&
                 ((int)tickIdx - lastPersonSeenTick
@@ -454,7 +399,6 @@ int main() {
                  <= ucr::config::RED_LIGHT_HANGOVER_TICKS);
             if (stopForPerson || stopForRedLight) speed = 0.0f;
 
-            // Soft-start ramp
             const float max_delta = ucr::config::MAX_ACCEL_CMS2 *
                                     (ucr::config::CONTROL_PERIOD_MS / 1000.0f);
             if (speed > applied_speed)
@@ -465,9 +409,6 @@ int main() {
             motor.SetSpeedCms(applied_speed);
             servo.SetAngle(final_angle);
 
-            // =================================================
-            // 8. Advance tick + log
-            // =================================================
             ++tickIdx;
             next_control += std::chrono::milliseconds(ucr::config::CONTROL_PERIOD_MS);
             if (now - next_control > std::chrono::seconds(1))
@@ -480,13 +421,14 @@ int main() {
                                      :                   "-";
                 std::printf(
                     "[t=%u] sign=%-11s(%d) state=%-15s rb=%-11s "
-                    "bias=%+5.1f near=%6.1f far=%6.1f %-11s "
+                    "miss=%2d bias=%+5.1f near=%6.1f far=%6.1f %-11s "
                     "spd=%.1f pid=%.1f out=%.1f\n",
                     tickIdx,
                     ucr::config::SignClassName(voter.GetCommitted()),
                     voter.GetCommitted(),
                     out.state_str.c_str(),
                     RbStateName(rb_state),
+                    rb_missing_sign,
                     rb_bias_px,
                     out.near_e, out.far_e,
                     stop_str,
@@ -495,15 +437,11 @@ int main() {
             }
         }
 
-        // --- FPS ---
         ++frameCount;
         auto tNow = std::chrono::high_resolution_clock::now();
         double dt = std::chrono::duration<double>(tNow - tPrev).count();
         if (dt > 0.5) { fps = frameCount / dt; frameCount = 0; tPrev = tNow; }
 
-        // =====================================================
-        // UI
-        // =====================================================
         if (ucr::config::SHOW_UI) {
             cv::Mat overlay = frame.clone();
 
