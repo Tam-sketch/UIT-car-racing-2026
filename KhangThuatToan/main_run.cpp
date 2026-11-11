@@ -39,7 +39,7 @@ static constexpr bool  INVERT_STEER         = true;
 static constexpr bool  SHOW_UI              = true;
 static constexpr bool  DA_CHANNEL           = 1; 
 static constexpr float MIN_SPEED_CMS        = 22.0f;
-static constexpr int   SIGN_INTERVAL_FRAMES = 5;
+static constexpr int   SIGN_INTERVAL_FRAMES = 1;
 static constexpr int   SIGN_BLOCK_FRAMES    = 40; 
 
 volatile std::sig_atomic_t g_stopSignal = 0;
@@ -477,7 +477,11 @@ int main() {
             ui_y2 = y2;
 
             // Không nhận lệnh rẽ/roundabout khi đang ôm cua 90° (biển vẫn được latch, xử lý ngay sau khi ôm cua xong)
-            if (turn_controller.state == v20::LaneTurnController::State::IDLE && !corner_assist.active()) {
+            // Cho phép ghi đè nếu đang ở WAIT_CURVE (chưa tới ngã rẽ) mà chốt được biển mới
+            const bool can_accept_sign = !corner_assist.active() &&
+                (turn_controller.state == v20::LaneTurnController::State::IDLE ||
+                 (turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE && dec.active_sign != handled_sign));
+            if (can_accept_sign) {
                 if (dec.active_sign == "roundabout") {
                     turn_controller.start_turn("RIGHT", true);
                     handled_sign = dec.active_sign;
@@ -502,7 +506,11 @@ int main() {
             // Góc sàn: ưu tiên TurnController; khi IDLE thì CornerAssist lo cua 90° không biển
             applied_floor = turn_res.steer_floor_deg;
             if (turn_controller.state == v20::LaneTurnController::State::IDLE) {
-                const double cf = corner_assist.update(lx1, rx1, lx2, rx2, lx_bot, rx_bot, w, dt_loop);
+                const double cf = corner_assist.update(
+                    lx1, rx1, lx2, rx2, lx_bot, rx_bot, w, dt_loop,
+                    (dec.active_sign != "NONE"),
+                    previous_out.near_e, previous_out.mid_e, previous_out.far_e
+                );
                 if (std::abs(cf) > std::abs(applied_floor)) applied_floor = cf;
             } else {
                 corner_assist.reset();
