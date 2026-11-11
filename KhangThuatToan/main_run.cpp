@@ -31,7 +31,7 @@
 #include <sstream>
 
 static const std::string ENGINE_PATH      = "/home/car4/Downloads/road/kga2.engine";
-static const std::string SIGN_ENGINE_PATH = "/home/car4/Downloads/sign/huy_sign.engine";
+static const std::string SIGN_ENGINE_PATH = "/home/car4/Downloads/sign/signv4.engine";
 
 static constexpr float MAX_SPEED_CMS         = 30.0f;
 static constexpr int   MAX_STEER_DEG        = 50;
@@ -393,8 +393,11 @@ int main() {
         totalFrames++;
 
         if (totalFrames % SIGN_INTERVAL_FRAMES == 0) {
-            cachedSigns = signDetector.Detect(frame, 0.70f);
+            cachedSigns = signDetector.Detect(frame, 0.55f);
             navBrain.UpdateSign(cachedSigns);
+            const bool turn_armed = (turn_controller.state != v20::LaneTurnController::State::IDLE) &&
+                                    !turn_controller.is_unmarked_tjunction;
+            navBrain.UpdateHazards(frame, cachedSigns, turn_armed);
         }
 
         bool roadOK = roadModel.Predict(frame, mask);
@@ -416,17 +419,40 @@ int main() {
             int y2 = static_cast<int>(h * 0.65);
             int y_bottom = h - 1;
 
+            const int pref_side = turn_controller.get_preferred_side();
             auto get_mask_boundaries = [&](int y_row, int& lx, int& rx) {
                 lx = -1; rx = -1;
                 if (y_row < 0 || y_row >= h) return;
                 const uchar* row = mask.ptr<uchar>(y_row);
                 int start = -1; int best_len = -1;
+                bool has_pref = false;
+                const int half_w = w / 2;
                 for (int x = 0; x <= w; x++) {
                     bool on = (x < w) && (row[x] > 0);
                     if (on && start < 0) start = x;
                     if (!on && start >= 0) {
+                        int end_x = x - 1;
                         int len = x - start;
-                        if (len > best_len) { best_len = len; lx = start; rx = x - 1; }
+                        if (len > 15) {
+                            bool is_pref = (pref_side < 0 && start < half_w - 15) ||
+                                           (pref_side > 0 && end_x > half_w + 15);
+                            bool take = false;
+                            if (pref_side != 0) {
+                                if (is_pref && !has_pref) take = true;
+                                else if (is_pref && has_pref) {
+                                    if (pref_side < 0 && start < lx) take = true;
+                                    if (pref_side > 0 && end_x > rx) take = true;
+                                } else if (!has_pref && len > best_len) {
+                                    take = true;
+                                }
+                            } else if (len > best_len) {
+                                take = true;
+                            }
+                            if (take) {
+                                best_len = len; lx = start; rx = end_x;
+                                if (is_pref) has_pref = true;
+                            }
+                        }
                         start = -1;
                     }
                 }
@@ -444,6 +470,7 @@ int main() {
                         pts.push_back(cv::Point(is_left ? 0 : w - 1, y));
                     } else if (!is_touching && touching) {
                         touching = false;
+                        pts.push_back(cv::Point(is_left ? 0 : w - 1, std::max(start_y, y - 2)));
                     }
                 }
                 return pts;
@@ -477,10 +504,12 @@ int main() {
             ui_y2 = y2;
 
             // Không nhận lệnh rẽ/roundabout khi đang ôm cua 90° (biển vẫn được latch, xử lý ngay sau khi ôm cua xong)
-            // Cho phép ghi đè nếu đang ở WAIT_CURVE (chưa tới ngã rẽ) mà chốt được biển mới
+            // Cho phép ghi đè nếu đang ở WAIT_CURVE hoặc WAIT_STRAIGHT (chưa thực sự đánh lái EXECUTE) mà chốt được biển mới (ví dụ no_left từ xa -> no_right khi lại gần)
             const bool can_accept_sign = !corner_assist.active() &&
                 (turn_controller.state == v20::LaneTurnController::State::IDLE ||
-                 (turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE && dec.active_sign != handled_sign));
+                 ((turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE ||
+                   turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT) &&
+                  dec.active_sign != handled_sign));
             if (can_accept_sign) {
                 if (dec.active_sign == "roundabout") {
                     turn_controller.start_turn("RIGHT", true);
@@ -498,21 +527,45 @@ int main() {
                     navBrain.ClearLatchedSign();
                 }
             }
-            turn_res = turn_controller.update(
-                left_pts, right_pts, dt_loop, previous_out.valid,
-                lx1, rx1, lx2, rx2, w,
-                (dec.active_sign != "NONE")
-            );
-            // Góc sàn: ưu tiên TurnController; khi IDLE thì CornerAssist lo cua 90° không biển
+            // Đang dừng vì người đi bộ / đèn đỏ-vàng: ĐÓNG BĂNG turn controller & corner assist
+            // (xe đứng yên nên mask không đổi -> không được đếm frame thẳng ảo hay chạy hết timeout rẽ).
+            // Biển đã chốt vẫn được giữ, khi được đi sẽ tiếp tục chờ frame thẳng rồi mới quành như cũ.
+            const bool hazard_stop = navBrain.HazardStop();
+            if (!hazard_stop) {
+                turn_res = turn_controller.update(
+                    left_pts, right_pts, dt_loop, previous_out.valid,
+                    lx1, rx1, lx2, rx2, w,
+                    (dec.active_sign != "NONE" || handled_sign != "NONE"),
+                    previous_out.near_e, previous_out.mid_e, previous_out.far_e
+                );
+            } else {
+                // Khi đang dừng chờ đèn đỏ / người đi bộ: giữ sẵn trạng thái chờ rẽ của biển báo,
+                // đồng thời giữ straight_frames = 0 để khi đèn xanh xe tiến thẳng đủ 3 frame mới bắt đầu quành
+                if (turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE ||
+                    turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT) {
+                    turn_controller.straight_frames = 0;
+                }
+                turn_res.state           = turn_controller.state;
+                turn_res.direction       = turn_controller.direction;
+                turn_res.straight_frames = turn_controller.straight_frames;
+                turn_res.t_junction_count = turn_controller.t_junction_count;
+            }
+            // Góc sàn: ưu tiên TurnController; khi IDLE (hoặc đang đi trên đường dẫn chờ tới T-junction không biển) thì CornerAssist vẫn hỗ trợ cua 90° đơn thuần
             applied_floor = turn_res.steer_floor_deg;
-            if (turn_controller.state == v20::LaneTurnController::State::IDLE) {
+            const bool allow_corner_assist = !hazard_stop && (
+                (turn_controller.state == v20::LaneTurnController::State::IDLE) ||
+                (turn_controller.is_unmarked_tjunction &&
+                 turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE &&
+                 !turn_res.junction_opened &&
+                 !(lx2 >= 0 && lx2 <= 15 && rx2 >= w - 15)));
+            if (allow_corner_assist) {
                 const double cf = corner_assist.update(
                     lx1, rx1, lx2, rx2, lx_bot, rx_bot, w, dt_loop,
                     (dec.active_sign != "NONE"),
                     previous_out.near_e, previous_out.mid_e, previous_out.far_e
                 );
                 if (std::abs(cf) > std::abs(applied_floor)) applied_floor = cf;
-            } else {
+            } else if (!hazard_stop) {
                 corner_assist.reset();
             }
             out = follower.step(
@@ -520,7 +573,8 @@ int main() {
                 turn_res.steer_bias_px,
                 turn_res.lock_opposite_err,
                 applied_floor,
-                turn_res.steer_cap_deg
+                turn_res.steer_cap_deg,
+                turn_res.preferred_side
             );
             previous_out = out;
             if (turn_res.state == v20::LaneTurnController::State::DONE) {
@@ -599,7 +653,7 @@ int main() {
             std::cout << "[F " << totalFrames << "] "
                     << "Dev: " << std::fixed << std::setprecision(1) << turn_res.dev << "px | "
                     << "Junc: " << (turn_res.junction_opened ? "OPEN" : "WAIT") << " | "
-                    << "StrFrames: " << turn_res.straight_frames << "/3 | "
+                    << "StrFrames: " << turn_res.straight_frames << "/" << turn_controller.REQUIRED_STRAIGHT_FRAMES << " | "
                     << "P0(" << turn_res.p0.x << "," << turn_res.p0.y << ") "
                     << "P1(" << turn_res.p1.x << "," << turn_res.p1.y << ") "
                     << "P2(" << turn_res.p2.x << "," << turn_res.p2.y << ")\n";
@@ -745,9 +799,19 @@ int main() {
                     cv::putText(img, text, pos, cv::FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv::LINE_AA);
                 };
 
+                std::string sign_ui = (dec.active_sign != "NONE") ? dec.active_sign : handled_sign;
+                if (navBrain.TrafficLightColor() != "NONE") {
+                    sign_ui += " | TL:" + navBrain.TrafficLightColor();
+                }
+                if (navBrain.PedestrianStop()) {
+                    sign_ui += " [PED STOP]";
+                } else if (navBrain.TrafficLightStop()) {
+                    sign_ui += " [TL STOP]";
+                }
+
                 draw_text(overlay, cv::format("Frame: %ld", totalFrames), cv::Point(15, 25), cv::Scalar(255, 255, 255));
                 draw_text(overlay, cv::format("Action: %s", action_to_str(dec.action)), cv::Point(15, 50), cv::Scalar(0, 255, 255));
-                draw_text(overlay, cv::format("Sign: %s", dec.active_sign.c_str()), cv::Point(15, 75), cv::Scalar(0, 255, 0));
+                draw_text(overlay, cv::format("Sign: %s", sign_ui.c_str()), cv::Point(15, 75), cv::Scalar(0, 255, 0));
                 draw_text(overlay, cv::format("Speed: %.1f", speed), cv::Point(15, 100), cv::Scalar(255, 255, 255));
                 
                 draw_text(overlay, cv::format("Turn State: %s", state_to_str(turn_res.state)), cv::Point(15, 125), cv::Scalar(0, 165, 255));
