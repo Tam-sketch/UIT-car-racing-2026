@@ -485,7 +485,7 @@ int main() {
                             cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
             }
 
-            char text1[192], text2[192];
+            char text1[192], text2[192], text3[128];
             std::snprintf(text1, sizeof(text1),
                 "FPS %.1f | spd %.1f/%.1f | PID %.1f | out %d | kf %.2f%s",
                 fps, applied_speed, out.speed, out.angle_pre_gain,
@@ -496,10 +496,29 @@ int main() {
                 ucr::config::SignClassName(voter.GetCommitted()),
                 out.state_str.c_str(),
                 out.near_e, out.far_e, out.coverage);
+            std::snprintf(text3, sizeof(text3),
+                "rb %s | miss %d/%d",
+                RbStateName(rb_state),
+                rb_missing_sign,
+                ucr::config::RB_MISSING_SIGN_TICKS);
+
+            // Color rb state để dễ đọc
+            cv::Scalar rb_color(0, 255, 0);           // green default
+            switch (rb_state) {
+                case RbState::APPROACH:    rb_color = cv::Scalar(0, 200, 255); break;  // orange
+                case RbState::IN_CIRCLE:   rb_color = cv::Scalar(255, 150, 0); break;  // blue
+                case RbState::EXIT_PREP:   rb_color = cv::Scalar(0, 200, 255); break;  // orange
+                case RbState::EXIT_SEARCH: rb_color = cv::Scalar(0, 0, 255);   break;  // red
+                case RbState::EXITING:     rb_color = cv::Scalar(255, 0, 255); break;  // magenta
+                default:                   rb_color = cv::Scalar(180, 180, 180); break; // grey
+            }
+
             cv::putText(overlay, text1, {10, 30}, cv::FONT_HERSHEY_SIMPLEX, 0.55,
                         cv::Scalar(0, 255, 0), 2);
             cv::putText(overlay, text2, {10, 55}, cv::FONT_HERSHEY_SIMPLEX, 0.55,
                         cv::Scalar(0, 255, 0), 2);
+            cv::putText(overlay, text3, {10, 80}, cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                        rb_color, 2);
 
             cv::imshow("Lane Follower", overlay);
             const int key = cv::waitKey(1) & 0xFF;

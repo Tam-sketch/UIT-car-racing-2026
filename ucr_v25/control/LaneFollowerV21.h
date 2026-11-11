@@ -1,5 +1,6 @@
 // ============================================================
-// control/LaneFollowerV21.h — V6.4 + turn inputs
+// control/LaneFollowerV21.h — V6.7
+// (Roundabout: V6.6 Bezier path, Regular turns: Force turn)
 // ============================================================
 #pragma once
 
@@ -37,6 +38,9 @@ struct TurnMemory {
     int  last_y_mid = 9999;
 };
 
+// ============================================================
+// CONFIG
+// ============================================================
 struct Config {
     int    mask_width    = 320;
     bool   keep_largest  = true;
@@ -68,6 +72,7 @@ struct Config {
     double coverage_threshold = 0.05;
     double curve_scale = 150.0;
 
+    // V21 opening
     int open_thresh    = 15;
     int min_height     = 10;
     int smooth_win     = 5;
@@ -77,23 +82,34 @@ struct Config {
     int min_turn_dist  = 4;
     int extend_len     = 80;
 
+    // V6.1 turn completion
     int   turn_min_ticks         = 8;
     int   turn_max_ticks         = 30;
     int   turn_synth_width_px    = 60;
     float turn_release_road_frac = 0.65f;
     int   turn_release_window_px = 12;
-    float turn_commit_proximity  = 0.30f;
+    float turn_commit_proximity  = 0.40f;
     float turn_complete_deg      = 60.0f;
 
-    float bez_look_dist_base  = 40.0f;
-    float bez_look_dist_scale = 30.0f;
-    float bez_err_clamp_px    = 60.0f;
+    // Pure Pursuit (roundabout Bezier only)
+    float bez_look_dist_base  = 50.0f;
+    float bez_look_dist_scale = 40.0f;
+    float bez_err_clamp_px    = 70.0f;
 
+    // Bezier shape
     float bez_ctrl_offset_frac = 0.40f;
 
+    // Roundabout bias EMA
     float rb_bias_ema = 0.3f;
+
+    // V6.7 Force Turn (regular turns only)
+    float turn_floor_deg = 28.0f;
+    float turn_bias_px   = 40.0f;
 };
 
+// ============================================================
+// DETAIL HELPERS
+// ============================================================
 namespace detail {
 
 inline double medianInts(std::vector<int> v) {
@@ -293,6 +309,9 @@ inline Point purePursuitLookahead(const std::vector<Point>& path,
 
 }  // namespace detail
 
+// ============================================================
+// V20 CORE
+// ============================================================
 class OcclusionGate {
 public:
     explicit OcclusionGate(const Config& c = Config()) : c_(c) { reset(); }
@@ -390,7 +409,7 @@ public:
     }
     void softReset() { integral_ = prevErr_ = filtD_ = 0; first_ = true; }
     void setForcedEmergency(bool f) { forced_ = f; }
-    void overrideOutput(double a) { prevOut_ = a; }
+    void overrideOutput(double a) { prevOut_ = a; }   // V6.7: force turn support
     bool losing() const { return auth_.losing(); }
     bool emergencyAuthority() const { return emgAuth_; }
 
@@ -440,6 +459,9 @@ private:
     int emgStreak_;
 };
 
+// ============================================================
+// V21 LANE FOLLOWER
+// ============================================================
 class LaneFollower {
 public:
     struct Output {
@@ -464,6 +486,7 @@ public:
         lastAngle_ = 0; curveSmooth_ = 0; prevValid_ = false;
         prevFarE_ = 0; dFarFilt_ = 0; asymSmooth_ = 0; emerHold_ = 0;
         bias_smoothed_ = 0.0f;
+        turn_floor_smoothed_ = 0.0;   // V6.7
         turn_memory_ = TurnMemory();
         turn_committed_ = false;
         turn_committed_side_ = 0;
@@ -478,9 +501,7 @@ public:
     Output step(const cv::Mat& rawMask, const SignState& sign,
                 float heading_deg = NAN,
                 float bias_px = 0.0f,
-                float turn_floor_deg = 0.0f,
-                float turn_cap_deg = 0.0f,
-                bool  lock_opposite_err = false) {
+                bool use_force_turn = true) {   // V6.7
         Output o;
 
         double kept_frac = 1.0;
@@ -525,11 +546,6 @@ public:
         double asymApplied = (std::abs(asymSmooth_) < c_.asym_threshold)
                              ? 0.0 : c_.asym_strength * asymSmooth_;
         double eff_error_v20 = blended + asymApplied;
-
-        if (lock_opposite_err) {
-            if      (bias_px < -10.0f) eff_error_v20 = std::min(eff_error_v20, 0.0);
-            else if (bias_px >  10.0f) eff_error_v20 = std::max(eff_error_v20, 0.0);
-        }
 
         std::vector<Point> centerline_pts;
         for (auto& p : row_centers) centerline_pts.push_back({p.first, p.second});
@@ -653,21 +669,45 @@ public:
         }
 
         if (should_turn) {
-            final_path = buildPathWithTurn(centerline_pts, cleanMask, target_opening);
+            // V6.7: skip Bezier path when using force turn (regular turns)
+            if (!use_force_turn) {
+                final_path = buildPathWithTurn(centerline_pts, cleanMask, target_opening);
+            }
             if (o.state_str == "CENTERLINE")
                 o.state_str = "TURN " +
                     std::string(target_opening.side == -1 ? "LEFT" : "RIGHT");
         }
 
+        // ============================================================
+        // 6. Error into PID — Hybrid: Force (turn) vs Bezier (roundabout)
+        // ============================================================
         bias_smoothed_ = (1.0f - c_.rb_bias_ema) * bias_smoothed_
                        + c_.rb_bias_ema * bias_px;
-
         const double eff_error_with_bias = eff_error_v20 + bias_smoothed_;
 
         double final_error = eff_error_with_bias;
-        if (should_turn && final_path.size() > 5) {
-            const Point car_pt = { cleanMask.cols / 2, cleanMask.rows };
+        double force_floor_deg = 0.0;
 
+        if (should_turn && use_force_turn && turn_committed_) {
+            // ==== V6.7 FORCE TURN (Khang-style) ====
+            const double turn_bias =
+                (double)turn_committed_side_ * c_.turn_bias_px;
+            final_error += turn_bias;
+
+            // Lock opposite: chặn lane cũ kéo ngược
+            if (turn_committed_side_ < 0) {
+                final_error = std::min(final_error, 0.0);   // rẽ trái
+            } else {
+                final_error = std::max(final_error, 0.0);   // rẽ phải
+            }
+
+            force_floor_deg =
+                (double)turn_committed_side_ * c_.turn_floor_deg;
+            speed_ = c_.min_speed + 3.0;
+        }
+        else if (should_turn && !use_force_turn && final_path.size() > 5) {
+            // ==== BEZIER TURN (roundabout only) ====
+            const Point car_pt = { cleanMask.cols / 2, cleanMask.rows };
             const double speed_ratio =
                 std::min(1.0, std::max(0.0, speed_ / std::max(c_.max_speed, 1.0)));
             const double look_dist =
@@ -680,15 +720,29 @@ public:
             final_error = std::clamp(final_error,
                                      -(double)c_.bez_err_clamp_px,
                                       (double)c_.bez_err_clamp_px);
-
             speed_ = c_.min_speed + 3.0;
-        } else {
+        }
+        else {
+            // ==== NORMAL PID ====
             double target_speed = detail::planSpeed(
                 curveSmooth_, c_.max_speed, c_.min_speed, c_.curve_scale);
             double errMult   = detail::errorSpeedFactor(eff_error_with_bias);
             double authSpeed = pid_.losing() ? 0.6 : 1.0;
             target_speed = std::max(target_speed * errMult * authSpeed, 0.0);
             speed_ = 0.7 * speed_ + 0.3 * target_speed;
+        }
+
+        // Floor smoothing: instant active, ramp down on release
+        if (force_floor_deg != 0.0) {
+            turn_floor_smoothed_ = force_floor_deg;
+        } else if (std::abs(turn_floor_smoothed_) > 0.1) {
+            constexpr double FLOOR_RAMP_DEG_PER_TICK = 8.0;
+            if (turn_floor_smoothed_ > 0)
+                turn_floor_smoothed_ =
+                    std::max(0.0, turn_floor_smoothed_ - FLOOR_RAMP_DEG_PER_TICK);
+            else
+                turn_floor_smoothed_ =
+                    std::min(0.0, turn_floor_smoothed_ + FLOOR_RAMP_DEG_PER_TICK);
         }
 
         bool forcedEmer = emerHold_ > 0;
@@ -698,31 +752,23 @@ public:
         if (cl.valid) {
             if (!prevValid_) { pid_.softReset(); gate_.reset(); }
             angle_pre_gain = pid_.step(final_error);
+
+            // ==== V6.7 FLOOR SAFETY ====
+            if (turn_floor_smoothed_ < -0.5 && angle_pre_gain > turn_floor_smoothed_) {
+                angle_pre_gain = turn_floor_smoothed_;
+                pid_.overrideOutput(angle_pre_gain);
+            } else if (turn_floor_smoothed_ > 0.5 && angle_pre_gain < turn_floor_smoothed_) {
+                angle_pre_gain = turn_floor_smoothed_;
+                pid_.overrideOutput(angle_pre_gain);
+            }
+            // ============================
+
             lastAngle_ = angle_pre_gain * c_.post_pid_gain;
         } else {
             angle_pre_gain = (c_.post_pid_gain > 0)
                              ? lastAngle_ / c_.post_pid_gain : lastAngle_;
             speed_ = 0.85 * speed_;
         }
-
-        {
-            const double inv_gain = 1.0 / std::max(c_.post_pid_gain, 0.01);
-            if (turn_floor_deg < -0.5f && lastAngle_ > turn_floor_deg) {
-                lastAngle_     = turn_floor_deg;
-                angle_pre_gain = lastAngle_ * inv_gain;
-                pid_.overrideOutput(angle_pre_gain);
-            } else if (turn_floor_deg > 0.5f && lastAngle_ < turn_floor_deg) {
-                lastAngle_     = turn_floor_deg;
-                angle_pre_gain = lastAngle_ * inv_gain;
-                pid_.overrideOutput(angle_pre_gain);
-            }
-            if (turn_cap_deg > 0.5f && lastAngle_ > turn_cap_deg) {
-                lastAngle_     = turn_cap_deg;
-                angle_pre_gain = lastAngle_ * inv_gain;
-                pid_.overrideOutput(angle_pre_gain);
-            }
-        }
-
         prevValid_ = cl.valid;
 
         o.angle          = lastAngle_;
@@ -751,6 +797,7 @@ private:
     bool prevValid_;
     int emerHold_;
     float bias_smoothed_ = 0.0f;
+    double turn_floor_smoothed_ = 0.0;   // V6.7
 
     bool  turn_committed_       = false;
     int   turn_committed_side_  = 0;

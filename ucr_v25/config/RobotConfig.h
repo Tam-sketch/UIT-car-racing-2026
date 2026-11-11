@@ -1,17 +1,27 @@
 // ============================================================
-// config/RobotConfig.h — UCR 2026 V6.6
+// config/RobotConfig.h — UCR 2026 V6.7
+// (Force turn for regular turns, Roundabout V6.6 unchanged)
 // ============================================================
 #pragma once
 
 namespace ucr {
 namespace config {
 
+// --------------------------------------------------------
+// Model paths
+// --------------------------------------------------------
 inline constexpr char ROAD_ENGINE_PATH[] = "/home/car4/Downloads/road/kga2.engine";
 inline constexpr char SIGN_ENGINE_PATH[] = "/home/car4/Downloads/sign/signv4.engine";
 
+// --------------------------------------------------------
+// Hardware limits
+// --------------------------------------------------------
 inline constexpr float MAX_SPEED_CMS = 30.0f;
 inline constexpr float MIN_SPEED_CMS = 20.0f;
 
+// --------------------------------------------------------
+// Servo calibration
+// --------------------------------------------------------
 inline constexpr float SERVO_LEFT_SLOPE    = 0.96f;
 inline constexpr float SERVO_LEFT_OFFSET   = -6.2f;
 inline constexpr float SERVO_RIGHT_SLOPE   = 0.71f;
@@ -31,12 +41,21 @@ inline float ServoToRealAngle(float servo_cmd) {
     return 0.0f;
 }
 
+// --------------------------------------------------------
+// Control loop
+// --------------------------------------------------------
 inline constexpr int   CONTROL_PERIOD_MS = 100;
 inline constexpr float MAX_ACCEL_CMS2    = 30.0f;
 
+// --------------------------------------------------------
+// Road model
+// --------------------------------------------------------
 inline constexpr int   ROAD_DA_CHANNEL  = 1;
 inline constexpr float ROAD_CONF_MARGIN = 0.02f;
 
+// --------------------------------------------------------
+// Lane follower tuning
+// --------------------------------------------------------
 inline constexpr float  CURVE_SCALE        = 150.0f;
 inline constexpr double POST_PID_GAIN      = 2.2;
 inline constexpr int    MIN_ROWS           = 5;
@@ -44,6 +63,9 @@ inline constexpr double COVERAGE_THRESHOLD = 0.05;
 
 inline constexpr bool SHOW_UI = true;
 
+// --------------------------------------------------------
+// Sign model
+// --------------------------------------------------------
 inline constexpr float SIGN_CONF_THRESH = 0.5f;
 inline constexpr float SIGN_IOU_THRESH  = 0.45f;
 inline constexpr int   SIGN_INPUT_SIZE  = 416;
@@ -75,6 +97,9 @@ inline constexpr const char* SignClassName(int id) {
     }
 }
 
+// --------------------------------------------------------
+// Traffic light HSV
+// --------------------------------------------------------
 namespace tl {
     inline constexpr int RED_H1_LO = 0;
     inline constexpr int RED_H1_HI = 10;
@@ -91,21 +116,33 @@ namespace tl {
 }
 
 inline constexpr int PERSON_STOP_HANGOVER_TICKS = 20;
-inline constexpr int RED_LIGHT_HANGOVER_TICKS   = 30;
+inline constexpr int RED_LIGHT_HANGOVER_TICKS   = 10;
 
+// --------------------------------------------------------
+// Sign detect + voter
+// --------------------------------------------------------
 inline constexpr int SIGN_DETECT_EVERY             = 2;
 inline constexpr int SIGN_VOTER_ACTIVATE_FRAMES    = 2;
 inline constexpr int SIGN_VOTER_TIMEOUT_FRAMES     = 30;
 
+// --------------------------------------------------------
+// Opening detection
+// --------------------------------------------------------
 inline constexpr int OPEN_THRESH      = 15;
 inline constexpr int OPEN_MIN_HEIGHT  = 10;
 inline constexpr int OPEN_SMOOTH_WIN  = 5;
 inline constexpr int OPEN_BASE_WIN    = 50;
 
+// --------------------------------------------------------
+// Bezier path (roundabout only)
+// --------------------------------------------------------
 inline constexpr int BEZIER_CORNER_RADIUS  = 20;
 inline constexpr int BEZIER_MIN_TURN_DIST  = 4;
 inline constexpr int BEZIER_EXTEND_LEN     = 80;
 
+// --------------------------------------------------------
+// Turn completion
+// --------------------------------------------------------
 inline constexpr int   TURN_MIN_TICKS         = 8;
 inline constexpr int   TURN_MAX_TICKS         = 30;
 inline constexpr int   TURN_SYNTH_WIDTH_PX    = 60;
@@ -114,25 +151,46 @@ inline constexpr int   TURN_RELEASE_WINDOW_PX = 12;
 inline constexpr float TURN_COMMIT_PROXIMITY  = 0.40f;
 inline constexpr float TURN_COMPLETE_DEG      = 60.0f;
 
+// --------------------------------------------------------
+// Pure Pursuit lookahead (roundabout Bezier only)
+// --------------------------------------------------------
 inline constexpr float BEZ_LOOK_DIST_BASE  = 50.0f;
 inline constexpr float BEZ_LOOK_DIST_SCALE = 40.0f;
 inline constexpr float BEZ_ERR_CLAMP_PX    = 70.0f;
 
+// --------------------------------------------------------
+// Bezier shape
+// --------------------------------------------------------
 inline constexpr float BEZ_CTRL_OFFSET_FRAC = 0.40f;
 
-inline constexpr float RB_BIAS_PX_RIGHT        = 55.0f;
-inline constexpr float RB_BIAS_PX_LEFT         = 30.0f;
+// --------------------------------------------------------
+// Force Turn — regular turns only (Khang-style)
+//   turn_left/right/no_left/right/construct
+//   Không dùng Bézier path, thay bằng bias + floor + lock_opposite
+// --------------------------------------------------------
+inline constexpr float TURN_FORCE_FLOOR_DEG = 28.0f;   // ép góc tối thiểu (≤ MAX_REAL_ANGLE_DEG = 30)
+inline constexpr float TURN_FORCE_BIAS_PX   = 40.0f;   // bias dịch target sang phía cua
+
+// --------------------------------------------------------
+// Roundabout state machine (V6.6 — unchanged)
+// --------------------------------------------------------
+inline constexpr float RB_BIAS_PX_RIGHT        = 28.0f;
+inline constexpr float RB_BIAS_PX_LEFT         = 45.0f;
 inline constexpr float RB_BIAS_EMA             = 0.3f;
 
-inline constexpr int   RB_MISSING_SIGN_TICKS   = 10;
-inline constexpr int   RB_CIRCLE_TIMEOUT       = 100;
-inline constexpr int   RB_EXIT_SEARCH_TIMEOUT  = 40;
+inline constexpr int   RB_MISSING_SIGN_TICKS   = 16;
+
+inline constexpr int   RB_CIRCLE_TIMEOUT       = 100;   // 10s
+inline constexpr int   RB_EXIT_SEARCH_TIMEOUT  = 40;    // 4s
 
 inline constexpr float RB_SPEED_MIN_CMS        = 20.0f;
 inline constexpr float RB_SPEED_MAX_CMS        = 30.0f;
 
 inline constexpr int   RB_COOLDOWN_TICKS       = 20;
 
+// --------------------------------------------------------
+// Heading
+// --------------------------------------------------------
 inline constexpr float HEADING_SIGN       = 1.0f;
 inline constexpr float HEADING_OFFSET_DEG = 0.0f;
 
