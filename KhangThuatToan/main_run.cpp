@@ -39,7 +39,8 @@ static constexpr bool  INVERT_STEER         = true;
 static constexpr bool  SHOW_UI              = true;
 static constexpr bool  DA_CHANNEL           = 1; 
 static constexpr float MIN_SPEED_CMS        = 22.0f;
-static constexpr int   SIGN_INTERVAL_FRAMES = 5;
+static constexpr int   SIGN_INTERVAL_FRAMES = 1;
+static constexpr int   SIGN_BLOCK_FRAMES    = 40; 
 
 volatile std::sig_atomic_t g_stopSignal = 0;
 static void SignalHandler(int) { g_stopSignal = 1; }
@@ -354,6 +355,8 @@ int main() {
 
     v20::LaneFollower follower(cfg);
     v20::LaneTurnController turn_controller;
+    v20::CornerAssist corner_assist;
+    std::string handled_sign = "NONE";
     v20::LaneFollower::Output previous_out;
 
     RunFileLogger runLogger;
@@ -400,13 +403,13 @@ int main() {
         int final_angle = 0;
         NavDecision dec;
         v20::LaneTurnController::TurnResult turn_res{v20::LaneTurnController::State::IDLE, 0.0, "NONE"};
-
+        double applied_floor = 0.0;
         // --- UI DATA EXPORT VARIABLES ---
         std::vector<cv::Point> ui_left_pts, ui_right_pts;
         int ui_y1 = 0, ui_y2 = 0;
 
         if (roadOK) {
-            dec = navBrain.Process(follower.speed());
+            dec = navBrain.Process(mask, follower.speed());
 
             int h = mask.rows, w = mask.cols;
             int y1 = static_cast<int>(h * 0.45);
@@ -441,6 +444,7 @@ int main() {
                         pts.push_back(cv::Point(is_left ? 0 : w - 1, y));
                     } else if (!is_touching && touching) {
                         touching = false;
+                        pts.push_back(cv::Point(is_left ? 0 : w - 1, std::max(start_y, y - 2)));
                     }
                 }
                 return pts;
@@ -473,38 +477,60 @@ int main() {
             ui_y1 = y1; 
             ui_y2 = y2;
 
-            if (turn_controller.state == v20::LaneTurnController::State::IDLE) {
-                // KÍCH HOẠT CHẾ ĐỘ BÙNG BINH KHI NHẬN ĐƯỢC BIỂN ROUNDABOUT
+            // Không nhận lệnh rẽ/roundabout khi đang ôm cua 90° (biển vẫn được latch, xử lý ngay sau khi ôm cua xong)
+            // Cho phép ghi đè nếu đang ở WAIT_CURVE hoặc WAIT_STRAIGHT (chưa thực sự đánh lái EXECUTE) mà chốt được biển mới (ví dụ no_left từ xa -> no_right khi lại gần)
+            const bool can_accept_sign = !corner_assist.active() &&
+                (turn_controller.state == v20::LaneTurnController::State::IDLE ||
+                 ((turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE ||
+                   turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT) &&
+                  dec.active_sign != handled_sign));
+            if (can_accept_sign) {
                 if (dec.active_sign == "roundabout") {
-                    turn_controller.start_turn("RIGHT", true); // Bật cờ roundabout_mode = true
+                    turn_controller.start_turn("RIGHT", true);
+                    handled_sign = dec.active_sign;
                     navBrain.ClearLatchedSign();
                 }
                 else if (dec.action == NavAction::FORCE_LEFT) {
                     turn_controller.start_turn("LEFT", false);
+                    handled_sign = dec.active_sign;
                     navBrain.ClearLatchedSign();
                 }
                 else if (dec.action == NavAction::FORCE_RIGHT) {
                     turn_controller.start_turn("RIGHT", false);
+                    handled_sign = dec.active_sign;
                     navBrain.ClearLatchedSign();
                 }
             }
-
-            // Dùng previous_out (frame trước) - `out` lúc này vẫn là giá trị rỗng
             turn_res = turn_controller.update(
-                left_pts,
-                right_pts,
-                dt_loop,
-                previous_out.valid,
-                lx1, rx1, w            // mép đường ở tầng xa y1 + bề rộng ảnh
+                left_pts, right_pts, dt_loop, previous_out.valid,
+                lx1, rx1, lx2, rx2, w,
+                (dec.active_sign != "NONE"),
+                previous_out.near_e, previous_out.mid_e, previous_out.far_e
             );
-            bool is_turning = (turn_res.state == v20::LaneTurnController::State::EXECUTE ||
-                       turn_res.state == v20::LaneTurnController::State::SETTLE);
-            out = follower.step(mask, turn_res.steer_bias_px, is_turning, turn_res.steer_floor_deg);
+            // Góc sàn: ưu tiên TurnController; khi IDLE thì CornerAssist lo cua 90° không biển
+            applied_floor = turn_res.steer_floor_deg;
+            if (turn_controller.state == v20::LaneTurnController::State::IDLE) {
+                const double cf = corner_assist.update(
+                    lx1, rx1, lx2, rx2, lx_bot, rx_bot, w, dt_loop,
+                    (dec.active_sign != "NONE"),
+                    previous_out.near_e, previous_out.mid_e, previous_out.far_e
+                );
+                if (std::abs(cf) > std::abs(applied_floor)) applied_floor = cf;
+            } else {
+                corner_assist.reset();
+            }
+            out = follower.step(
+                mask,
+                turn_res.steer_bias_px,
+                turn_res.lock_opposite_err,
+                applied_floor,
+                turn_res.steer_cap_deg
+            );
             previous_out = out;
-
-            // Rẽ xong -> xoá biển bị latch lại trong lúc đang quành (biển thật vẫn còn thấy sẽ được detect lại sau <= 5 frame)
             if (turn_res.state == v20::LaneTurnController::State::DONE) {
                 navBrain.ClearLatchedSign();
+                if (handled_sign != "NONE") navBrain.BlockSign(handled_sign, SIGN_BLOCK_FRAMES);
+                handled_sign = "NONE";
             }
 
             if (dec.emergency_stop) {
@@ -563,7 +589,7 @@ int main() {
                 static_cast<float>(turn_controller.get_turn_elapsed()),
 
                 static_cast<float>(turn_res.steer_bias_px),
-                static_cast<float>(turn_res.steer_floor_deg),
+                static_cast<float>(applied_floor),   
 
                 turn_res.p0,
                 turn_res.p1,
@@ -577,7 +603,7 @@ int main() {
             std::cout << "[F " << totalFrames << "] "
                     << "Dev: " << std::fixed << std::setprecision(1) << turn_res.dev << "px | "
                     << "Junc: " << (turn_res.junction_opened ? "OPEN" : "WAIT") << " | "
-                    << "StrFrames: " << turn_res.straight_frames << "/3 | "
+                    << "StrFrames: " << turn_res.straight_frames << "/" << turn_controller.REQUIRED_STRAIGHT_FRAMES << " | "
                     << "P0(" << turn_res.p0.x << "," << turn_res.p0.y << ") "
                     << "P1(" << turn_res.p1.x << "," << turn_res.p1.y << ") "
                     << "P2(" << turn_res.p2.x << "," << turn_res.p2.y << ")\n";
@@ -732,8 +758,7 @@ int main() {
                 draw_text(overlay, cv::format("Turn Dir: %s", turn_res.direction.c_str()), cv::Point(15, 150), cv::Scalar(0, 165, 255)); 
                 
                 draw_text(overlay, cv::format("Turn Bias: %.1fpx", turn_res.steer_bias_px), cv::Point(15, 175), cv::Scalar(255, 255, 0));
-                draw_text(overlay, cv::format("Turn Floor: %.1fdeg", turn_res.steer_floor_deg), cv::Point(15, 200), cv::Scalar(255, 255, 0));
-                
+                draw_text(overlay, cv::format("Turn Floor: %.1fdeg", applied_floor), cv::Point(15, 200), cv::Scalar(255, 255, 0)); // <--- ĐỔI DÒNG 749 NÀY                
                 draw_text(overlay, cv::format("Near E: %.1f | Far E: %.1f", out.near_e, out.far_e), cv::Point(15, 225), cv::Scalar(255, 255, 255));
                 draw_text(overlay, cv::format("Lane Angle: %.2f", out.angle), cv::Point(15, 250), cv::Scalar(255, 0, 255));
             }
