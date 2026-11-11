@@ -140,10 +140,15 @@ namespace tl {
     inline constexpr int YEL_H_HI  = 35;
     inline constexpr int GRN_H_LO  = 40;
     inline constexpr int GRN_H_HI  = 90;
-    inline constexpr int S_MIN     = 100;
-    inline constexpr int V_MIN     = 100;
-    inline constexpr int MIN_LIT_PIXELS = 20;   // winner needs this many bright px
-    inline constexpr float ROI_EXPAND   = 1.20f;
+    
+    inline constexpr int S_MIN     = 150; // For saturated red
+    inline constexpr int V_MIN     = 250;
+    
+    // The tiny green light in your image is only ~5 pixels.
+    // We set this low so a distant red light is still caught.
+    inline constexpr int MIN_LIT_PIXELS = 10; 
+    
+    inline constexpr float ROI_EXPAND   = 1.05f; // Tight crop to avoid red background lines
 }
 
 // Stop hangover after last sighting (control ticks, 10 Hz → ticks = decisec)
