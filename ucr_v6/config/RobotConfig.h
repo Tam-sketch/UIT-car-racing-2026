@@ -141,7 +141,7 @@ namespace tl {
     inline constexpr int GRN_H_LO  = 40;
     inline constexpr int GRN_H_HI  = 90;
     
-    inline constexpr int S_MIN     = 100; // For saturated red
+    inline constexpr int S_MIN     = 150; // For saturated red
     inline constexpr int V_MIN     = 250;
     
     // The tiny green light in your image is only ~5 pixels.
