@@ -18,7 +18,7 @@ public:
     enum class State { IDLE, WAIT_CURVE, WAIT_STRAIGHT, EXECUTE, SETTLE, DONE };
     enum class RoundaboutPhase { NONE = 0, WAIT_ENTRY, ENTER_RIGHT, CIRCLE_LEFT, EXIT_RIGHT };
 
-    double TURN_STEER_DEG      = 32.0;
+    double TURN_STEER_DEG      = 28.0;
     double TURN_RAMP_DEG_PER_S = 90.0;
     double MIN_TURN_TIME       = 0.8;
     double TURN_BIAS_PX        = 35.0;
@@ -492,7 +492,7 @@ class CornerAssist {
 public:
     enum class Phase { IDLE, ACTIVE, RELEASE };
 
-    double CORNER_STEER_DEG      = 45.0;
+    double CORNER_STEER_DEG      = 30.0;
     double CORNER_RAMP_DEG_PER_S = 60.0;
     double CORNER_RELEASE_TIME   = 0.4;
     double CORNER_MIN_TIME       = 0.6;

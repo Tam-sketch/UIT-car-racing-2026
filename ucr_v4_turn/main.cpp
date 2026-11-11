@@ -1,5 +1,6 @@
 // ============================================================
-// main.cpp — UCR 2026: v21 Lane + v20 Turn Logic (integrated)
+// main.cpp — UCR 2026: v21 Lane + turn controller + SignVoter
+// Đã fix: active_block_ticks đúng đơn vị, xoá dead code
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -7,9 +8,10 @@
 #include "common/Logger.h"
 
 #include "control/LaneFollowerV21.h"
-#include "control/TurnController.h"      // ← turn::LaneTurnController + turn::CornerAssist
-#include "SignDetector.h"                // YOLOv8 (thư mục gốc)
-#include "NavigationBrain.h"             // thư mục gốc
+#include "control/TurnController.h"
+#include "control/SignVoter.h"
+#include "SignDetector.h"
+#include "NavTypes.h"
 #include "config/RobotConfig.h"
 
 #include <opencv2/opencv.hpp>
@@ -260,8 +262,22 @@ int main() {
     if (!signReady)
         std::cerr << "[Main] SignDetector init failed — turns DISABLED\n";
 
-    NavigationBrain navBrain;
+    // ───────────────────────────────────────────────────────
+    // SignVoter thay cho NavigationBrain
+    // ───────────────────────────────────────────────────────
+    ucr::control::SignVoter voter(
+        ucr::config::SIGN_VOTER_ACTIVATE_FRAMES,
+        ucr::config::SIGN_VOTER_TIMEOUT_FRAMES);
 
+    // ✅ FIX: quy đổi timeout (đơn vị Update của voter) sang frame tick
+    // Voter.Update() gọi mỗi SIGN_DETECT_EVERY tick → 30 Update = 60 tick
+    const int SIGN_BLOCK_TICKS =
+        ucr::config::SIGN_VOTER_TIMEOUT_FRAMES * ucr::config::SIGN_DETECT_EVERY;
+
+    std::string active_turn_sign    = "NONE";
+    int         active_block_ticks  = 0;
+
+    // ───────────────────────────────────────────────────────
     v21::Config cfg;
     cfg.max_speed          = ucr::config::MAX_SPEED_CMS;
     cfg.min_speed          = ucr::config::MIN_SPEED_CMS;
@@ -272,8 +288,8 @@ int main() {
     cfg.rb_bias_ema        = ucr::config::RB_BIAS_EMA;
 
     v21::LaneFollower follower(cfg);
-    turn::LaneTurnController turn_controller;   // ← namespace turn::
-    turn::CornerAssist        corner_assist;    // ← namespace turn::
+    turn::LaneTurnController turn_controller;
+    turn::CornerAssist        corner_assist;
     v21::LaneFollower::Output previous_out;
 
     cv::Mat frame, mask;
@@ -289,12 +305,15 @@ int main() {
     uint32_t tickIdx = 0;
     auto next_control = std::chrono::steady_clock::now();
 
-    std::cout << "\n=== UCR2026 (v21 lane + turn controller) ===\n"
+    std::cout << "\n=== UCR2026 (v21 lane + turn + SignVoter) ===\n"
               << "Road: " << ucr::config::ROAD_ENGINE_PATH << "\n"
               << "Sign: " << ucr::config::SIGN_ENGINE_PATH
               << " (" << (signReady ? "OK" : "FAILED") << ")\n"
               << "Speed: [" << ucr::config::MIN_SPEED_CMS
               << ", " << ucr::config::MAX_SPEED_CMS << "] cm/s\n"
+              << "Voter: activate=" << ucr::config::SIGN_VOTER_ACTIVATE_FRAMES
+              << " timeout=" << ucr::config::SIGN_VOTER_TIMEOUT_FRAMES
+              << " (block " << SIGN_BLOCK_TICKS << " ticks)\n"
               << "Press 'q' / ESC to quit\n\n";
 
     while (!g_stopSignal) {
@@ -315,6 +334,9 @@ int main() {
         if (dt_loop <= 0.0 || dt_loop > 0.5) dt_loop = 1.0 / 30.0;
         totalFrames++;
 
+        // ═══════════════════════════════════════════════════════
+        // A. SIGN DETECTION + VOTER
+        // ═══════════════════════════════════════════════════════
         if (signReady && (tickIdx % ucr::config::SIGN_DETECT_EVERY) == 0) {
             cachedSigns = signDetector.Detect(
                 frame,
@@ -330,11 +352,58 @@ int main() {
                 break;
             }
 
-            navBrain.UpdateSign(cachedSigns);
+            std::vector<int> classIds;
+            for (const auto& s : cachedSigns) {
+                if (s.name == "traffic_light") continue;
+                if (s.confidence < ucr::config::SIGN_CONF_THRESH) continue;
+                if (active_block_ticks > 0 && s.name == active_turn_sign) continue;
+                classIds.push_back(s.class_id);
+            }
+            voter.Update(classIds, tickIdx);
         }
 
-        v21::LaneFollower::Output out;
+        // ═══════════════════════════════════════════════════════
+        // B. ADAPTER: SignVoter → NavDecision
+        // ═══════════════════════════════════════════════════════
         NavDecision dec;
+        dec.action         = NavAction::FOLLOW_LANE;
+        dec.active_sign    = "NONE";
+        dec.emergency_stop = false;
+        // ✅ FIX: đã xoá dec.target_speed (dead code, không dùng)
+
+        {
+            const int committed_id = voter.GetCommitted();
+            if (committed_id >= 0 &&
+                committed_id < (int)SignDetector::CLASS_NAMES.size()) {
+
+                const std::string& sign_name = SignDetector::CLASS_NAMES[committed_id];
+                const bool is_blocked =
+                    (active_block_ticks > 0 && sign_name == active_turn_sign);
+
+                if (!is_blocked) {
+                    dec.active_sign = sign_name;
+
+                    if (sign_name == "parking") {
+                        dec.action = NavAction::STOP_PARKING;
+                        dec.emergency_stop = true;
+                    }
+                    else if (sign_name == "turn_left" ||
+                             sign_name == "construction_ahead" ||
+                             sign_name == "no_right") {
+                        dec.action = NavAction::FORCE_LEFT;
+                    }
+                    else if (sign_name == "turn_right" ||
+                             sign_name == "no_left") {
+                        dec.action = NavAction::FORCE_RIGHT;
+                    }
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════
+        // C. CONTROL
+        // ═══════════════════════════════════════════════════════
+        v21::LaneFollower::Output out;
         turn::LaneTurnController::TurnResult turn_res{
             turn::LaneTurnController::State::IDLE, 0.0, "NONE"};
         double applied_floor = 0.0;
@@ -342,8 +411,6 @@ int main() {
         int    final_servo = 0;
 
         if (roadOK) {
-            dec = navBrain.Process(follower.speed());
-
             const int h = mask.rows, w = mask.cols;
             const int y1 = (int)(h * 0.45);
             const int y2 = (int)(h * 0.65);
@@ -405,13 +472,19 @@ int main() {
                 && !corner_assist.active()) {
                 if (dec.active_sign == "roundabout") {
                     turn_controller.start_turn("RIGHT", true);
-                    navBrain.ClearLatchedSign();
+                    active_turn_sign   = "roundabout";
+                    active_block_ticks = SIGN_BLOCK_TICKS;   // ✅ FIX
+                    voter.Reset();
                 } else if (dec.action == NavAction::FORCE_LEFT) {
                     turn_controller.start_turn("LEFT", false);
-                    navBrain.ClearLatchedSign();
+                    active_turn_sign   = dec.active_sign;
+                    active_block_ticks = SIGN_BLOCK_TICKS;   // ✅ FIX
+                    voter.Reset();
                 } else if (dec.action == NavAction::FORCE_RIGHT) {
                     turn_controller.start_turn("RIGHT", false);
-                    navBrain.ClearLatchedSign();
+                    active_turn_sign   = dec.active_sign;
+                    active_block_ticks = SIGN_BLOCK_TICKS;   // ✅ FIX
+                    voter.Reset();
                 }
             }
 
@@ -453,26 +526,29 @@ int main() {
             }
 
             if (turn_res.state == turn::LaneTurnController::State::DONE) {
-                navBrain.ClearLatchedSign();
-                if (dec.active_sign != "NONE")
-                    navBrain.BlockSign(dec.active_sign,
-                                       ucr::config::SIGN_VOTER_TIMEOUT_FRAMES);
+                voter.Reset();
+                if (active_turn_sign != "NONE") {
+                    active_block_ticks = SIGN_BLOCK_TICKS;   // ✅ FIX
+                }
             }
 
             if (dec.emergency_stop) {
                 speed_cmd   = 0.0f;
                 final_servo = MapWheelAngleToServoCmd(0.0);
+            } else if (!out.valid && out.coverage < 0.02f) {
+                speed_cmd   = 0.0f;
+                final_servo = MapWheelAngleToServoCmd(0.0);
             } else {
                 final_servo = MapWheelAngleToServoCmd(out.angle);
-                speed_cmd = std::clamp(
-                    dec.target_speed,
-                    (float)ucr::config::MIN_SPEED_CMS,
-                    (float)ucr::config::MAX_SPEED_CMS);
+                float target = out.valid ? static_cast<float>(out.speed)
+                                        : static_cast<float>(ucr::config::MIN_SPEED_CMS);
+                speed_cmd = std::clamp(target,
+                                    static_cast<float>(ucr::config::MIN_SPEED_CMS),
+                                    static_cast<float>(ucr::config::MAX_SPEED_CMS));
             }
 
             if (lastRedSeenTick >= 0 &&
-                ((int)tickIdx - lastRedSeenTick
-                 <= ucr::config::RED_LIGHT_HANGOVER_TICKS)) {
+                ((int)tickIdx - lastRedSeenTick <= ucr::config::RED_LIGHT_HANGOVER_TICKS)) {
                 speed_cmd = 0.0f;
             }
         } else {
@@ -483,7 +559,17 @@ int main() {
             previous_out = v21::LaneFollower::Output{};
             turn_controller = turn::LaneTurnController{};
             corner_assist.reset();
-            navBrain.ClearLatchedSign();
+            voter.Reset();
+            active_turn_sign   = "NONE";
+            active_block_ticks = 0;
+        }
+
+        if (active_block_ticks > 0 &&
+            turn_controller.state == turn::LaneTurnController::State::IDLE) {
+            --active_block_ticks;
+            if (active_block_ticks == 0) {
+                active_turn_sign = "NONE";
+            }
         }
 
         if (roadOK) {
@@ -538,7 +624,7 @@ int main() {
                 return "?";
             };
 
-            char l1[256], l2[256], l3[256];
+            char l1[256], l2[256], l3[256], l4[256];
             std::snprintf(l1, sizeof(l1),
                 "FPS %.1f | spd %.1f/%.1f | PID %.1f | out %d",
                 currentFps, applied_speed, out.speed, out.angle, final_servo);
@@ -551,9 +637,14 @@ int main() {
                 turn_res.steer_bias_px, applied_floor,
                 out.near_e, out.far_e, out.coverage,
                 out.valid ? "" : " INV");
+            std::snprintf(l4, sizeof(l4),
+                "voter committed=%d | block %s(%d)",
+                voter.GetCommitted(),
+                active_turn_sign.c_str(), active_block_ticks);
             cv::putText(overlay, l1, {10, 25},  cv::FONT_HERSHEY_SIMPLEX, 0.55, {0,255,0}, 2);
             cv::putText(overlay, l2, {10, 50},  cv::FONT_HERSHEY_SIMPLEX, 0.55, {0,255,255}, 2);
             cv::putText(overlay, l3, {10, 75},  cv::FONT_HERSHEY_SIMPLEX, 0.55, {0,255,0}, 2);
+            cv::putText(overlay, l4, {10, 100}, cv::FONT_HERSHEY_SIMPLEX, 0.50, {255,128,0}, 1);
 
             cv::imshow("UCR2026", overlay);
             int key = cv::waitKey(1) & 0xFF;
@@ -572,12 +663,13 @@ int main() {
             static auto lastLog = std::chrono::steady_clock::now();
             if (now - lastLog >= std::chrono::seconds(1)) {
                 std::printf(
-                    "[t=%u] sign=%s turn=%d/%s bias=%.1f floor=%.1f "
-                    "near=%.1f far=%.1f spd=%.1f servo=%d\n",
-                    tickIdx, dec.active_sign.c_str(),
+                    "[t=%u] voter=%d sign=%s turn=%d/%s bias=%.1f floor=%.1f "
+                    "near=%.1f far=%.1f spd=%.1f servo=%d block=%s(%d)\n",
+                    tickIdx, voter.GetCommitted(), dec.active_sign.c_str(),
                     (int)turn_res.state, turn_res.direction.c_str(),
                     turn_res.steer_bias_px, applied_floor,
-                    out.near_e, out.far_e, applied_speed, final_servo);
+                    out.near_e, out.far_e, applied_speed, final_servo,
+                    active_turn_sign.c_str(), active_block_ticks);
                 lastLog = now;
             }
         }

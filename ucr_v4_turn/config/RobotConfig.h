@@ -91,7 +91,7 @@ namespace tl {
 }
 
 inline constexpr int PERSON_STOP_HANGOVER_TICKS = 20;
-inline constexpr int RED_LIGHT_HANGOVER_TICKS   = 10;
+inline constexpr int RED_LIGHT_HANGOVER_TICKS   = 30;
 
 inline constexpr int SIGN_DETECT_EVERY             = 2;
 inline constexpr int SIGN_VOTER_ACTIVATE_FRAMES    = 2;

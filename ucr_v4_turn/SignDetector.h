@@ -1,5 +1,5 @@
 // ============================================================
-// SignDetector.h — YOLOv8 TensorRT detector (thư mục gốc)
+// SignDetector.h — YOLOv8 TensorRT (thư mục gốc)
 // ============================================================
 #pragma once
 
@@ -35,7 +35,7 @@ public:
 
     bool Init(const std::string& enginePath) {
         try {
-            std::cout << "[SignDetector] Loading Engine: " << enginePath << "\n";
+            std::cout << "[SignDetector] Loading: " << enginePath << "\n";
             std::ifstream file(enginePath, std::ios::binary);
             if (!file) {
                 std::cerr << "[SignDetector] Cannot open: " << enginePath << "\n";
