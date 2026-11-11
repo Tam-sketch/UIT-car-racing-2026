@@ -27,6 +27,7 @@
 #include "perception/RoadSegmenter.h"
 #include "perception/SignDetector.h"
 #include "config/RobotConfig.h"
+#include "control/TurnController.h"    // ← turn::LaneTurnController + turn::CornerAssist
 
 #include <opencv2/opencv.hpp>
 
