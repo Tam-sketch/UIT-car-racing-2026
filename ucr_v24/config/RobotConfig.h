@@ -166,15 +166,15 @@ inline constexpr float BEZ_CTRL_OFFSET_FRAC = 0.40f;
 // --------------------------------------------------------
 // Roundabout state machine (V6.6)
 // --------------------------------------------------------
-inline constexpr float RB_BIAS_PX_RIGHT        = 55.0f;
-inline constexpr float RB_BIAS_PX_LEFT         = 30.0f;
+inline constexpr float RB_BIAS_PX_RIGHT        = 28.0f;
+inline constexpr float RB_BIAS_PX_LEFT         = 45.0f;
 inline constexpr float RB_BIAS_EMA             = 0.3f;
 
 // Only tick-based transition: sign absent count
-inline constexpr int   RB_MISSING_SIGN_TICKS   = 10;    // 1.0s
+inline constexpr int   RB_MISSING_SIGN_TICKS   = 16;    // 2.0s
 
-inline constexpr int   RB_CIRCLE_TIMEOUT       = 100;   // 10s (IN_CIRCLE fallback)
-inline constexpr int   RB_EXIT_SEARCH_TIMEOUT  = 40;    // 4s  (EXIT_SEARCH fallback)
+inline constexpr int   RB_CIRCLE_TIMEOUT       = 100;   // 15s (IN_CIRCLE fallback)
+inline constexpr int   RB_EXIT_SEARCH_TIMEOUT  = 40;    // 7s  (EXIT_SEARCH fallback)
 
 // --- Shared speed clamp for all roundabout states ---
 inline constexpr float RB_SPEED_MIN_CMS        = 20.0f;
