@@ -76,7 +76,7 @@ static v21::SignState MakeSignState(int committed) {
 // ============================================================
 // TRAFFIC LIGHT: dominant lit color in the bbox ROI
 // ============================================================
-enum class LightColor { NONE, RED, YELLOW, GREEN };
+enum class LightColor { NONE, RED };
 
 static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect2f& bbox) {
     using namespace ucr::config::tl;
@@ -89,27 +89,61 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect2f& bbo
     const int y1 = std::max(0, static_cast<int>(cy - h * 0.5f));
     const int x2 = std::min(bgr.cols, static_cast<int>(cx + w * 0.5f));
     const int y2 = std::min(bgr.rows, static_cast<int>(cy + h * 0.5f));
+    
     if (x2 - x1 < 4 || y2 - y1 < 4) return LightColor::NONE;
 
     cv::Mat hsv;
     cv::cvtColor(bgr(cv::Rect(x1, y1, x2 - x1, y2 - y1)), hsv, cv::COLOR_BGR2HSV);
+    cv::Mat roi_bgr = bgr(cv::Rect(x1, y1, x2 - x1, y2 - y1));
 
-    int nRed = 0, nYel = 0, nGrn = 0;
+    int nRed = 0;
+    int nGrnYel = 0; // We group green and yellow together as "not red"
+
     for (int y = 0; y < hsv.rows; ++y) {
-        const uchar* p = hsv.ptr<uchar>(y);
+        const uchar* hsv_p = hsv.ptr<uchar>(y);
+        const uchar* bgr_p = roi_bgr.ptr<uchar>(y);
+        
         for (int x = 0; x < hsv.cols; ++x) {
-            const uchar H = p[x*3+0], S = p[x*3+1], V = p[x*3+2];
-            if (S < S_MIN || V < V_MIN) continue;
-            if ((H >= RED_H1_LO && H <= RED_H1_HI) ||
-                (H >= RED_H2_LO && H <= RED_H2_HI))   { ++nRed; }
-            else if (H >= YEL_H_LO && H <= YEL_H_HI)  { ++nYel; }
-            else if (H >= GRN_H_LO && H <= GRN_H_HI)  { ++nGrn; }
+            const uchar H = hsv_p[x*3+0];
+            const uchar S = hsv_p[x*3+1];
+            const uchar V = hsv_p[x*3+2];
+            const uchar B = bgr_p[x*3+0];
+            const uchar G = bgr_p[x*3+1];
+            const uchar R = bgr_p[x*3+2];
+
+            // 1. Standard Red Detection
+            if (S >= S_MIN && V >= V_MIN) {
+                if ((H >= RED_H1_LO && H <= RED_H1_HI) ||
+                    (H >= RED_H2_LO && H <= RED_H2_HI)) {
+                    ++nRed;
+                }
+                else if ((H >= YEL_H_LO && H <= YEL_H_HI) ||
+                         (H >= GRN_H_LO && H <= GRN_H_HI)) {
+                    ++nGrnYel;
+                }
+            }
+            // 2. Bloom Fallback: Red LED blown out to white
+            else if (V >= 220 && S < 50) {
+                // If it's bright white, check if Red channel is slightly dominant
+                if (R > G + 10 && R > B + 10 && R >= 200) {
+                    ++nRed;
+                }
+                // If it's bright white but Green is dominant, count it as "not red"
+                else if (G > R + 10 && G > B + 10 && G >= 200) {
+                    ++nGrnYel;
+                }
+            }
         }
     }
 
-    if (nRed >= MIN_LIT_PIXELS && nRed > nYel && nRed > nGrn) return LightColor::RED;
-    if (nYel >= MIN_LIT_PIXELS && nYel > nRed && nYel > nGrn) return LightColor::YELLOW;
-    if (nGrn >= MIN_LIT_PIXELS && nGrn > nRed && nGrn > nYel) return LightColor::GREEN;
+    // Optional debug print (uncomment to see counts)
+    // std::printf("[tl] red=%d not_red=%d\n", nRed, nGrnYel);
+
+    // Stop ONLY if we have enough red pixels AND red is the dominant color
+    if (nRed >= MIN_LIT_PIXELS && nRed > nGrnYel) {
+        return LightColor::RED;
+    }
+
     return LightColor::NONE;
 }
 
@@ -243,6 +277,7 @@ int main() {
                     }
 
                     // Traffic light → HSV color check on the bbox ROI (bypasses the voter)
+                    // Traffic light → HSV color check on the bbox ROI
                     if (d.class_id == TRAFFIC_LIGHT) {
                         if (ClassifyTrafficLight(frame, d.bbox) == LightColor::RED) {
                             lastRedSeenTick = static_cast<int>(tickIdx);
