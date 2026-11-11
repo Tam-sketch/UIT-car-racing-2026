@@ -112,12 +112,13 @@ static constexpr int SIGN_VOTER_TIMEOUT_DS      = 30;    // 30 deciseconds = 3.0
 // Sign re-trigger block after a completed turn (V6.6 handled_sign)
 static constexpr double SIGN_BLOCK_SECONDS      = 4.0;
 
-// Roundabout timings (V6.6, converted to seconds at 10 Hz)
-static constexpr float  RB_BIAS_PX_RIGHT        = 55.0f;
-static constexpr float  RB_BIAS_PX_LEFT         = 30.0f;
-static constexpr double RB_MISSING_SIGN_S       = 1.0;   // was 10 ticks @ 10 Hz
-static constexpr double RB_CIRCLE_TIMEOUT_S     = 10.0;  // was 100 ticks
-static constexpr double RB_EXIT_SEARCH_TIMEOUT_S = 4.0;  // was 40 ticks
+// Roundabout timings (V6.6 tuned — seconds)
+static constexpr float  RB_BIAS_PX_RIGHT        = 28.0f;
+static constexpr float  RB_BIAS_PX_LEFT         = 45.0f;
+static constexpr float  RB_BIAS_EMA             = 0.30f;
+static constexpr double RB_MISSING_SIGN_S       = 2.0;   // was 16 ticks
+static constexpr double RB_CIRCLE_TIMEOUT_S     = 15.0;  // was 100 ticks
+static constexpr double RB_EXIT_SEARCH_TIMEOUT_S = 7.0;  // was 40 ticks
 static constexpr double RB_COOLDOWN_S           = 2.0;   // was 20 ticks
 static constexpr float  RB_SPEED_MIN_CMS        = 20.0f;
 static constexpr float  RB_SPEED_MAX_CMS        = 30.0f;
