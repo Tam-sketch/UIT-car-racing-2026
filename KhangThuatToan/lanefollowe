@@ -1,7 +1,7 @@
 // ============================================================
 // LaneFollowerV20.h
 // ============================================================
-//1
+//3
 #pragma once
 
 #ifdef LANEV20_USE_SHIM
@@ -435,22 +435,6 @@ public:
         S7_EXIT_TURN_RIGHT     // Pha 7: Bẻ PHẢI thoát ra Nhánh thứ 2 và căn thẳng vào làn mới
     };
 
-	// ---------------- T-JUNCTION KHÔNG BIỂN: lái gắt + kết thúc theo heading ----------------
-    double TJ_STEER_DEG     = 45.0;  // góc sàn (thường là 33)
-    double TJ_INIT_DEG      = 36.0;
-    double TJ_MAX_TURN_TIME = 8.0;   // chỉ là lưới an toàn
-    double TJ_YAW_DONE_DEG  = 80.0;  // xoay đủ ~80° thì chốt (xe còn trượt thêm vài độ)
-    double TJ_YAW_TAPER_DEG = 55.0;  // từ góc này bắt đầu nhả dần lái
-    double TJ_TAPER_MIN     = 0.40;
-    double TJ_MIN_YAW_ALIGN = 40.0;  // chưa xoay ≥ 40° thì không cho "aligned" sớm
-
-    void feed_heading(double deg, bool ok) { heading_deg_ = deg; heading_ok_ = ok; }
-
-    private_like_members:
-    double heading_deg_ = 0.0, yaw0_ = 0.0;
-    bool   heading_ok_ = false, yaw0_ok_ = false;
-    static double wrap180(double a) { while (a > 180) a -= 360; while (a < -180) a += 360; return a; }
-
     // ---------------- GÓC QUÀNH T-JUNCTION / NGÃ RẼ THƯỜNG ----------------
     double TURN_STEER_DEG      = 33.0;   // Góc sàn khi quành theo biển / T-junction (33 độ theo yêu cầu)
     double TURN_INIT_DEG       = 18.0;   // Khởi điểm góc sàn ngay frame bắt đầu EXECUTE để lên 33 độ nhanh hơn
@@ -458,13 +442,6 @@ public:
     double MIN_TURN_TIME       = 0.8;
     double TURN_BIAS_PX        = 38.0;
     double turn_floor_current  = 0.0;
-
-    const double dir_sign = (direction == "LEFT") ? -1.0 : 1.0;
-const double steer_deg = is_unmarked_tjunction ? TJ_STEER_DEG : TURN_STEER_DEG;
-const double init_deg  = is_unmarked_tjunction ? TJ_INIT_DEG  : TURN_INIT_DEG;
-yaw0_ = heading_deg_;  yaw0_ok_ = heading_ok_;
-turn_bias_current  = dir_sign * TURN_BIAS_PX;
-turn_floor_current = dir_sign * std::min(steer_deg, std::max(init_deg, TURN_RAMP_DEG_PER_S * dt));
 
     // =========================================================================
     // BẢNG THÔNG SỐ TÙY CHỈNH 7 TRẠNG THÁI ROUNDABOUT (Chỉnh từng pha tại đây)
@@ -503,8 +480,8 @@ turn_floor_current = dir_sign * std::min(steer_deg, std::max(init_deg, TURN_RAMP
     double RB_S6_BIAS_PX        = 20.0;  // Bias âm (-20px) giữ làn vòng quanh đảo
     double RB_S6_FLOOR_DEG      = 18.0;  // Góc sàn giữ TRÁI (-18 độ) ôm theo đường cong của đảo
     double RB_S6_CAP_DEG        = 28.0;  // Trần góc trái tối đa (-28 độ)
-    double RB_S6_MIN_TIME       = 0.80;  // Thời gian tối thiểu ở Pha 6 trước khi bắt Nhánh 2 (s)
-    double RB_S6_MAX_TIME       = 1.5;  // Thời gian tối đa ở Pha 6 trước khi chuyển sang rẽ phải ra Nhánh 2 (s)
+    double RB_S6_MIN_TIME       = 0.40;  // Thời gian tối thiểu ở Pha 6 trước khi bắt Nhánh 2 (s)
+    double RB_S6_MAX_TIME       = 0.95;  // Thời gian tối đa ở Pha 6 trước khi chuyển sang rẽ phải ra Nhánh 2 (s)
 
     // --- PHA 7 (S7_EXIT_TURN_RIGHT): Bẻ PHẢI thoát ra Nhánh thứ 2 ---
     double RB_S7_BIAS_PX        = 26.0;  // Bias dương (+26px) kéo vào nhánh ra bên phải
@@ -618,6 +595,18 @@ turn_floor_current = dir_sign * std::min(steer_deg, std::max(init_deg, TURN_RAMP
             case RoundaboutPhase::S7_EXIT_TURN_RIGHT:   return "RB_S7_EXIT_RIGHT";
             default:                                    return "NONE";
         }
+    }
+
+    void force_execute_now() {
+        if (state != State::WAIT_CURVE && state != State::WAIT_STRAIGHT) return;
+        const double dir_sign = (direction == "LEFT") ? -1.0 : 1.0;
+        state              = State::EXECUTE;
+        turn_elapsed       = 0.0;
+        aligned_frames     = 0;
+        far_swept          = false;
+        straight_frames    = 0;
+        turn_bias_current  = dir_sign * TURN_BIAS_PX;
+        turn_floor_current = 0.0;
     }
 
     void start_turn(const std::string& dir, bool is_roundabout = false, bool unmarked_tjunction = false) {
@@ -1109,57 +1098,61 @@ turn_floor_current = dir_sign * std::min(steer_deg, std::max(init_deg, TURN_RAMP
                 std::cout << "[TURN] >>> EXECUTING TURN (Verified straight " << req_straight << " frames)\n";
             }
         }
-        const bool tj = is_unmarked_tjunction;
-const double steer_max = tj ? TJ_STEER_DEG : TURN_STEER_DEG;
-const double mag = std::min(steer_max, std::abs(turn_floor_current) + TURN_RAMP_DEG_PER_S * dt);
-turn_floor_current = dir_sign * mag;
+        else if (state == State::EXECUTE) {
+            turn_elapsed += dt;
+            const double dir_sign = (direction == "LEFT") ? -1.0 : 1.0;
 
-const bool yaw_known = tj && yaw0_ok_ && heading_ok_;
-const double yaw_delta = yaw_known ? std::abs(wrap180(heading_deg_ - yaw0_)) : 0.0;
-double taper = 1.0;
-if (yaw_known && yaw_delta > TJ_YAW_TAPER_DEG) {
-    const double t = std::clamp((yaw_delta - TJ_YAW_TAPER_DEG) /
-                                std::max(TJ_YAW_DONE_DEG - TJ_YAW_TAPER_DEG, 1.0), 0.0, 1.0);
-    taper = 1.0 - t * (1.0 - TJ_TAPER_MIN);
-}
-const bool yaw_done = yaw_known && yaw_delta >= TJ_YAW_DONE_DEG && lane_valid;
+            const double mag = std::min(TURN_STEER_DEG, std::abs(turn_floor_current) + TURN_RAMP_DEG_PER_S * dt);
+            turn_floor_current = dir_sign * mag;
 
-const bool far_bounded = (far_lx > ALIGN_EDGE_MARGIN) && (far_rx >= 0) &&
-                         (far_rx < img_w - 1 - ALIGN_EDGE_MARGIN) &&
-                         (far_rx - far_lx >= ALIGN_MIN_WIDTH_PX);
-if (!far_bounded) far_swept = true;
-const double far_center_off = far_bounded ? (0.5 * (far_lx + far_rx) - 0.5 * img_w) : 9999.0;
-const double off_dir = dir_sign * far_center_off;
-const bool far_centered = far_bounded && (off_dir < ALIGN_FAR_CENTER_PX) && (off_dir > -ALIGN_FAR_OPPOSITE_PX);
+            const bool far_bounded = (far_lx > ALIGN_EDGE_MARGIN) && (far_rx >= 0) &&
+                                     (far_rx < img_w - 1 - ALIGN_EDGE_MARGIN) &&
+                                     (far_rx - far_lx >= ALIGN_MIN_WIDTH_PX);
+            if (!far_bounded) far_swept = true;
 
-const bool lane_aligned = (turn_elapsed >= MIN_TURN_TIME) && lane_valid && far_swept && far_centered &&
-                          (!yaw_known || yaw_delta >= TJ_MIN_YAW_ALIGN);
-if (lane_aligned) aligned_frames++; else aligned_frames = 0;
+            const double far_center_off = far_bounded ? (0.5 * (far_lx + far_rx) - 0.5 * img_w) : 9999.0;
+            const double off_dir = dir_sign * far_center_off;
+            const bool far_centered = far_bounded &&
+                                      (off_dir <  ALIGN_FAR_CENTER_PX) &&
+                                      (off_dir > -ALIGN_FAR_OPPOSITE_PX);
 
-res.steer_bias_px     = turn_bias_current * taper;
-res.steer_floor_deg   = turn_floor_current * taper;
-res.lock_opposite_err = true;
+            const bool lane_aligned =
+                (turn_elapsed >= MIN_TURN_TIME) &&
+                lane_valid &&
+                far_swept &&
+                far_centered;
 
-if (aligned_frames >= REQUIRED_ALIGNED_FRAMES || yaw_done) {
-    state              = State::SETTLE;
-    settle_start_bias  = turn_bias_current * taper;
-    settle_start_floor = turn_floor_current * taper;
-    settle_elapsed     = 0.0;
-    std::cout << "[TURN] DONE (yaw=" << yaw_delta << ", aligned=" << aligned_frames << ") - SETTLE\n";
-}
+            if (lane_aligned) aligned_frames++;
+            else aligned_frames = 0;
 
-const bool wide_open_intersection =
-    (direction == "RIGHT" && mid_lx >= 0 && mid_lx <= 25 && mid_rx >= img_w - 15 && mid_e < 12.0) ||
-    (direction == "LEFT"  && mid_rx >= img_w - 26 && mid_lx >= 0 && mid_lx <= 15 && mid_e > -12.0);
-const double effective_max_turn_time = tj ? TJ_MAX_TURN_TIME : (wide_open_intersection ? 6.8 : MAX_TURN_TIME);
+            res.steer_bias_px     = turn_bias_current;
+            res.steer_floor_deg   = turn_floor_current;
+            res.lock_opposite_err = true;
 
-if (turn_elapsed >= effective_max_turn_time && state == State::EXECUTE) {
-    state              = State::SETTLE;
-    settle_start_bias  = turn_bias_current * taper;
-    settle_start_floor = turn_floor_current * taper;
-    settle_elapsed     = 0.0;
-    std::cout << "[TURN] TIMEOUT - RELEASE TURN BIAS\n";
-}
+            if (aligned_frames >= REQUIRED_ALIGNED_FRAMES) {
+                state              = State::SETTLE;
+                settle_start_bias  = turn_bias_current;
+                settle_start_floor = turn_floor_current;
+                settle_elapsed     = 0.0;
+                std::cout << "[TURN] NEW LANE ALIGNED (far off: " << far_center_off << ") - SETTLE\n";
+            }
+
+            // Khi rẽ từ đường lớn sang đường lớn (như turn_right ở frame 1599-1648),
+            // mask giữa ngã tư rộng toàn màn hình (mid_lx <= 25, mid_rx >= img_w - 15) suốt hơn 4s.
+            // Không cho phép ngắt timeout 4.0s khi xe vẫn đang nằm giữa bụng ngã tư rộng mà chưa thấy mép làn mới!
+            const bool wide_open_intersection =
+                (direction == "RIGHT" && mid_lx >= 0 && mid_lx <= 25 && mid_rx >= img_w - 15 && mid_e < 12.0) ||
+                (direction == "LEFT"  && mid_rx >= img_w - 26 && mid_lx >= 0 && mid_lx <= 15 && mid_e > -12.0);
+            const double effective_max_turn_time = wide_open_intersection ? 6.8 : MAX_TURN_TIME;
+
+            if (turn_elapsed >= effective_max_turn_time && state == State::EXECUTE) {
+                state              = State::SETTLE;
+                settle_start_bias  = turn_bias_current;
+                settle_start_floor = turn_floor_current;
+                settle_elapsed     = 0.0;
+                std::cout << "[TURN] TIMEOUT - RELEASE TURN BIAS\n";
+            }
+        }
         else if (state == State::SETTLE) {
             settle_elapsed += dt;
             double ratio = std::clamp(1.0 - settle_elapsed / std::max(SETTLE_TIME, 0.01), 0.0, 1.0);
@@ -1356,12 +1349,12 @@ public:
     };
 
     // Thông số hiệu chỉnh né vật cản
-    double DODGE_BIAS_PX         = 36.0;   // Kéo tâm lệch 36px sang làn bên cạnh
-    double DODGE_FLOOR_DEG       = 22.0;   // Góc sàn bẻ lái dứt khoát 22 độ để đổi làn nhanh
-    double PASSING_BIAS_PX       = 14.0;   // Giữ nhẹ 14px bám làn an toàn khi đi ngang hông vật cản
-    double DODGE_MIN_TIME        = 0.50;   // Thời gian tối thiểu ở pha né trước khi sang passing (s)
-    double DODGE_MAX_TIME        = 2.80;   // Bảo hiểm thời gian pha né (s)
-    int    CUT_STEP_THRESHOLD_PX = 55;     // Độ giật bước thềm mask (>= 55px) để xác nhận có vật cản cắt
+    double DODGE_BIAS_PX         = 24.0;   // Kéo tâm lệch 24px sang làn né (hạ từ 36px để không văng khỏi đường)
+    double DODGE_FLOOR_DEG       = 13.0;   // Góc sàn bẻ dứt khoát 13 độ (hạ từ 22 độ để xe không bị bẻ gắt vọt ra ngoài)
+    double PASSING_BIAS_PX       = 12.0;   // Giữ nhẹ 12px bám làn an toàn khi đi ngang hông vật cản
+    double DODGE_MIN_TIME        = 0.35;   // Thời gian tối thiểu ở pha né trước khi sang passing (s)
+    double DODGE_MAX_TIME        = 1.20;   // Giới hạn an toàn pha né 1.2s (giảm từ 2.80s để chống kẹt ép xe ra lề)
+    int    CUT_STEP_THRESHOLD_PX = 50;     // Độ giật bước thềm mask (>= 50px) để xác nhận có vật cản cắt
     int    CLEAR_CONFIRM_FRAMES  = 3;      // Cần 3 frame liên tiếp Near & Mid ổn định đầy đủ mask mới chốt thoát
 
     void reset() {
@@ -1548,8 +1541,9 @@ public:
             // Xe dạt sang làn né: chuyển sang PASSING khi:
             // 1. Thân vật cản đã trôi xuống vùng Near bên hông xe (near_cut_current_ == true)
             // 2. Hoặc xe đã dạt làn đủ thời gian an toàn (>= DODGE_MIN_TIME) và tâm xe đã nằm trọn làn mới
-            const bool shifted_to_clear_lane = (dodge_dir_ < 0 && near_e <= -8.0) ||
-                                               (dodge_dir_ > 0 && near_e >= 8.0);
+            // LƯU Ý HỆ TRỤC: Khi xe dạt TRÁI (dodge_dir_ < 0), tâm đường trong camera dạt sang PHẢI -> near_e >= 6.0px!
+            const bool shifted_to_clear_lane = (dodge_dir_ < 0 && near_e >= 6.0) ||
+                                               (dodge_dir_ > 0 && near_e <= -6.0);
             if ((near_cut_current_ && elapsed_ >= 0.35) || (shifted_to_clear_lane && elapsed_ >= DODGE_MIN_TIME) ||
                 elapsed_ >= DODGE_MAX_TIME) {
                 state_        = State::PASSING;
@@ -1795,10 +1789,12 @@ Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingT
     // 3. KHÓA LỰC KÉO CỦA LÀN ĐI THẲNG CŨ TRONG TRẠNG THÁI RẼ / NÉ VẬT CẢN
     // ------------------------------------------------------------------------
     if (lockObstacleDir) {
-        if (obstacleSide > 0) {
+        // Chỉ cấm lực kéo về phía vật cản khi xe chưa bị dạt quá xa ra mép ngoài của làn né (|nearE| <= 28px)
+        // Nếu |nearE| > 28px, xe đang chạm mép đường đối diện -> phải cho phép PID kéo xe lại để không văng ra ngoài!
+        if (obstacleSide > 0 && nearE < 28.0) {
             // Vật cản ở bên PHẢI: Khóa cứng, cấm hoàn toàn mọi lực kéo dương (sang phải) về phía vật cản
             lane_err = std::min(lane_err, 0.0);
-        } else if (obstacleSide < 0) {
+        } else if (obstacleSide < 0 && nearE > -28.0) {
             // Vật cản ở bên TRÁI: Khóa cứng, cấm hoàn toàn mọi lực kéo âm (sang trái) về phía vật cản
             lane_err = std::max(lane_err, 0.0);
         }
