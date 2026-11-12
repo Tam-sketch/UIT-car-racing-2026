@@ -133,8 +133,8 @@ static constexpr int SIGN_VOTER_TIMEOUT_DS      = 30;
 static constexpr double SIGN_BLOCK_SECONDS      = 4.0;
 
 // Roundabout timings
-static constexpr float  RB_BIAS_PX_RIGHT         = 28.0f;
-static constexpr float  RB_BIAS_PX_LEFT          = 20.0f;
+static constexpr float  RB_BIAS_PX_RIGHT         = 25.0f;
+static constexpr float  RB_BIAS_PX_LEFT          = 24.0f;
 static constexpr float  RB_BIAS_EMA              = 0.30f;
 static constexpr double RB_MISSING_SIGN_S        = 2.0;
 static constexpr double RB_CIRCLE_TIMEOUT_S      = 12.0;
@@ -145,8 +145,8 @@ static constexpr float  RB_SPEED_MIN_CMS         = 20.0f;
 static constexpr float  RB_SPEED_MAX_CMS         = 30.0f;
 
 // Roundabout exit turn params (gentler than regular turn)
-static constexpr float  RB_EXIT_TURN_FLOOR_DEG   = 16.0f;
-static constexpr float  RB_EXIT_TURN_BIAS_PX     = 18.0f;
+static constexpr float  RB_EXIT_TURN_FLOOR_DEG   = 26.0f;
+static constexpr float  RB_EXIT_TURN_BIAS_PX     = 30.0f;
 
 // ============================================================
 // PARKING CONSTANTS
@@ -871,7 +871,7 @@ int main() {
 
                     if (rb_pass_count == 1) {
                         turn_controller.waiting_for_tjunction = true;
-                        turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
+                        turn_controller.tjunction_cooldown = 8.0;
                         std::printf("[RB] Pass 1 done — armed T-junction for loop-back "
                                     "(turn defaults restored: %.0f° / %.0fpx)\n",
                                     turn_controller.TURN_STEER_DEG,
