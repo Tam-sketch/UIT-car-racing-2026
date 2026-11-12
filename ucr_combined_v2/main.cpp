@@ -105,7 +105,7 @@ namespace tl {
     inline constexpr int RED_H2_LO = 170, RED_H2_HI = 180;
     inline constexpr int YEL_H_LO  = 15,  YEL_H_HI  = 35;
     inline constexpr int GRN_H_LO  = 40,  GRN_H_HI  = 90;
-    inline constexpr int S_MIN     = 500;
+    inline constexpr int S_MIN     = 50;
     inline constexpr int V_MIN     = 230;
     inline constexpr int MIN_LIT_PIXELS = 10;
     inline constexpr float ROI_EXPAND   = 1.05f;
