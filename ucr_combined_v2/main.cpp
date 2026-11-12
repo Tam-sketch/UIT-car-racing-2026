@@ -754,7 +754,7 @@ int main() {
                 // test_bno055 + parking.cpp). eulerDeg.y is pitch/roll —
                 // it changes on every bump, so it must NOT be used for
                 // heading-hold or turn-release logic.
-                heading_now = HEADING_SIGN * static_cast<float>(imu_data.eulerDeg.x);
+                heading_now = PARK_HEADING_SIGN * static_cast<float>(imu_data.eulerDeg.x);
                 heading_ok  = true;
             }
         }
