@@ -2,14 +2,13 @@
 // main_run.cpp — UCR2026 Full Integrated + Heading-only Parking
 // ============================================================
 // 2026-11-12 changes:
-//  - Wired BNO055 IMU and TOF sensors
-//  - EXIT_SEARCH bias flipped from LEFT to RIGHT (R1)
-//  - RB_BIAS_EMA now actually applied (R2)
-//  - EXIT_SEARCH force-execute after RB_EXIT_FORCE_EXEC_S (R3)
-//  - waiting_for_tjunction cleared on roundabout entry (R4)
-//  - [RB] state-transition printf
-//  - PARK_HEADING_SIGN applied to heading-hold P loops
-//  - [PERSON] WALKING_PERSON class 8 detection + hard stop (global, incl. parking)
+//  - Wired BNO055 IMU and TOF sensors (no more stubs)
+//  - EXIT_SEARCH bias flipped from LEFT to RIGHT (was bug R1)
+//  - RB_BIAS_EMA now actually applied (was dead constant R2)
+//  - EXIT_SEARCH force-execute after RB_EXIT_FORCE_EXEC_S (was bug R3)
+//  - waiting_for_tjunction cleared on roundabout entry (was bug R4)
+//  - [RB] state-transition printf for diagnostics
+//  - PARK_HEADING_SIGN flag applied to both heading-hold P loops
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -56,8 +55,6 @@ static constexpr float MAX_ACCEL_CMS2        = 30.0f;
 static constexpr bool  SHOW_UI               = true;
 static constexpr int   SIGN_INTERVAL_FRAMES  = 1;
 static constexpr float SIGN_CONF_THRESH      = 0.70f;
-// [PERSON] separate lower threshold for pedestrian — safe-side bias
-static constexpr float PERSON_CONF_THRESH    = 0.35f;
 static constexpr float SIGN_NMS_THRESH       = 0.45f;
 static constexpr bool  DA_CHANNEL            = 1;
 static constexpr int   MAX_STEER_DEG         = 50;
@@ -71,7 +68,7 @@ static constexpr float SERVO_RIGHT_OFFSET  = 2.5f;
 static constexpr float MAX_REAL_ANGLE_DEG  = 30.0f;
 static constexpr int   MAX_SERVO_CMD       = 55;
 
-// Sign class indices  (must match SignDetector::CLASS_NAMES order)
+// Sign class indices
 namespace sign_class {
     inline constexpr int CONSTRUCTION_AHEAD = 0;
     inline constexpr int NO_LEFT            = 1;
@@ -81,7 +78,6 @@ namespace sign_class {
     inline constexpr int TRAFFIC_LIGHT      = 5;
     inline constexpr int TURN_LEFT          = 6;
     inline constexpr int TURN_RIGHT         = 7;
-    inline constexpr int WALKING_PERSON     = 8;   // [PERSON]
 }
 
 // Traffic light HSV
@@ -96,7 +92,6 @@ namespace tl {
     inline constexpr float ROI_EXPAND   = 1.05f;
 }
 
-// [PERSON] hard stop hangover after last sighting (seconds)
 static constexpr double PERSON_STOP_HANGOVER_S = 2.0;
 static constexpr double RED_LIGHT_HANGOVER_S   = 1.0;
 
@@ -112,7 +107,7 @@ static constexpr float  RB_BIAS_EMA             = 0.30f;
 static constexpr double RB_MISSING_SIGN_S       = 2.0;
 static constexpr double RB_CIRCLE_TIMEOUT_S     = 12.0;
 static constexpr double RB_EXIT_SEARCH_TIMEOUT_S = 15.0;
-static constexpr double RB_EXIT_FORCE_EXEC_S    = 1.5;
+static constexpr double RB_EXIT_FORCE_EXEC_S    = 1.5;   // force turn into EXECUTE after this long in EXIT_SEARCH
 static constexpr double RB_COOLDOWN_S           = 2.0;
 static constexpr float  RB_SPEED_MIN_CMS        = 20.0f;
 static constexpr float  RB_SPEED_MAX_CMS        = 30.0f;
@@ -139,14 +134,15 @@ static constexpr float PARK_HEADING_TOL_DEG        = 3.0f;
 static constexpr double PARK_STOP_DWELL_S          = 0.5;
 static constexpr double PARK_REVERSE_TIMEOUT_S     = 4.0;
 
-// +1 if BNO055 eulerDeg.y INCREASES on a right turn
+// +1 if BNO055 eulerDeg.y INCREASES on a right turn (matches PID convention).
+// Flip to -1.0f if the car steers AWAY from centre during SLOT_SEARCH.
 static constexpr float PARK_HEADING_SIGN           = +1.0f;
 
 volatile std::sig_atomic_t g_stopSignal = 0;
 static void SignalHandler(int) { g_stopSignal = 1; }
 
 // ============================================================
-// TRT MODEL (road segmentation)
+// TRT MODEL
 // ============================================================
 static void CheckCuda(cudaError_t s, const char* op) {
     if (s != cudaSuccess)
@@ -313,8 +309,14 @@ static const char* RbStateName(RbState s) {
 // PARKING STATE
 // ============================================================
 enum class ParkState {
-    NONE, CAPTURE, SLOT_SEARCH, SLOT_FOUND, WAIT_FULL_STOP,
-    REVERSE_1, REVERSE_2, DONE
+    NONE,
+    CAPTURE,
+    SLOT_SEARCH,
+    SLOT_FOUND,
+    WAIT_FULL_STOP,
+    REVERSE_1,
+    REVERSE_2,
+    DONE
 };
 
 static const char* ParkStateName(ParkState s) {
@@ -424,7 +426,6 @@ static const char* SignName(int id) {
         case TRAFFIC_LIGHT:      return "traffic_light";
         case TURN_LEFT:          return "turn_left";
         case TURN_RIGHT:         return "turn_right";
-        case WALKING_PERSON:     return "walk_person";
         default:                 return "-";
     }
 }
@@ -450,7 +451,9 @@ int main() {
     motor.SetSpeedCms(0.0f);
     servo.SetAngle(0);
 
-    // IMU
+    // =========================================================
+    // BNO055 IMU  (non-fatal: parking disabled if it fails)
+    // =========================================================
     BNO055 imu;
     bool imu_ok = imu.initialize(std::chrono::milliseconds(1000));
     if (!imu_ok) {
@@ -458,7 +461,9 @@ int main() {
                   << " (parking DISABLED)\n";
     }
 
-    // TOF
+    // =========================================================
+    // TOF cluster  (non-fatal: parking disabled if it fails)
+    // =========================================================
     sensor::TOF tof;
     bool tof_ok = tof.Init("/dev/i2c-1");
     if (!tof_ok) {
@@ -474,7 +479,7 @@ int main() {
     SignDetector signDetector;
     bool signReady = signDetector.Init(SIGN_ENGINE_PATH);
     if (!signReady) {
-        std::cerr << "[Main] Sign Detector init failed — turns/roundabout/parking/person-stop DISABLED\n";
+        std::cerr << "[Main] Sign Detector init failed — turns/roundabout/parking DISABLED\n";
     }
 
     ucr::control::SignVoter voter(
@@ -513,9 +518,7 @@ int main() {
     int      rb_missing_sign_ticks = 0;
     double   last_rb_visible_time  = -1e9;
 
-    // [PERSON] hard-stop tracking
     double   last_person_seen_time = -1e9;
-    float    last_person_conf      = 0.0f;
     double   last_red_seen_time    = -1e9;
     double   sign_block_until_time = -1.0;
 
@@ -546,14 +549,12 @@ int main() {
     cv::Mat frame, mask;
     std::vector<SignObject> cachedSigns;
 
-    std::cout << "\n=== UCR2026: Full Integrated (v20 + RbState + SignVoter + Parking + PersonStop) ===\n"
+    std::cout << "\n=== UCR2026: Full Integrated (v20 + RbState + SignVoter + Parking) ===\n"
               << "Road: " << ENGINE_PATH << "\n"
               << "Sign: " << SIGN_ENGINE_PATH << (signReady ? "" : " (DISABLED)") << "\n"
               << "IMU:  " << (imu_ok ? "OK" : "FAILED — parking disabled") << "\n"
               << "TOF:  " << (tof_ok ? "OK" : "FAILED — parking disabled") << "\n"
               << "Speed: [" << MIN_SPEED_CMS << ", " << MAX_SPEED_CMS << "] cm/s\n"
-              << "Person-stop: conf>=" << PERSON_CONF_THRESH
-              << " hangover=" << PERSON_STOP_HANGOVER_S << "s (safety override)\n"
               << "Parking: heading-hold, window=" << PARK_HEADING_WINDOW
               << " kp=" << PARK_HEADING_KP
               << " tof_blk=" << PARK_TOF_BLOCKED_MM << "mm"
@@ -582,26 +583,17 @@ int main() {
         // 1. Sign detection + voter update
         // -----------------------------------------------------
         if (signReady && (totalFrames % SIGN_INTERVAL_FRAMES) == 0) {
-            // [PERSON] Detect at PERSON_CONF_THRESH so low-conf pedestrians
-            // still come through. Other classes re-filtered to SIGN_CONF_THRESH.
-            cachedSigns = signDetector.Detect(frame, PERSON_CONF_THRESH, SIGN_NMS_THRESH);
+            cachedSigns = signDetector.Detect(frame, SIGN_CONF_THRESH, SIGN_NMS_THRESH);
 
             std::vector<int> classIds;
             classIds.reserve(cachedSigns.size());
             for (auto& d : cachedSigns) {
-                // --- [PERSON] hard-stop detector ---
-                if (d.name == "walking_person" || d.class_id == sign_class::WALKING_PERSON) {
-                    last_person_seen_time = elapsed_total;
-                    last_person_conf      = d.confidence;
-                    // Log every detection (safe side: more log lines is fine)
-                    std::printf("[PERSON] Detection! conf=%.2f box=(%d,%d,%dx%d)\n",
-                                d.confidence, d.box.x, d.box.y, d.box.width, d.box.height);
-                    continue;   // never feed person to the voter
-                }
-
-                // --- Other classes require the stricter threshold ---
                 if (d.confidence < SIGN_CONF_THRESH) continue;
 
+                if (d.name == "walking_person" || d.class_id == 8) {
+                    last_person_seen_time = elapsed_total;
+                    continue;
+                }
                 if (d.name == "traffic_light" || d.class_id == sign_class::TRAFFIC_LIGHT) {
                     if (ClassifyTrafficLight(frame, d.box) == LightColor::RED)
                         last_red_seen_time = elapsed_total;
@@ -656,6 +648,7 @@ int main() {
                     rb_missing_sign_ticks = 0;
                     rb_phase_start_time   = elapsed_total;
                     rb_bias_smoothed      = 0.0f;
+                    // Clear any stale T-junction follow-up state from a previous roundabout
                     turn_controller.waiting_for_tjunction   = false;
                     turn_controller.tjunction_cooldown      = 0.0;
                     turn_controller.tjunction_detect_frames = 0;
@@ -690,6 +683,7 @@ int main() {
                     turn_controller.start_turn("RIGHT", false);
                 }
                 const double in_exit = elapsed_total - rb_exit_search_start;
+                // If the strict junction gate never fires, force the turn
                 if (in_exit >= RB_EXIT_FORCE_EXEC_S &&
                     (turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE ||
                      turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT)) {
@@ -728,6 +722,7 @@ int main() {
             }
         }
 
+        // Diagnostic: log every RbState transition
         if (rb_state != rb_state_prev) {
             std::printf("[RB] %-10s -> %-10s t=%.2f sign=%s bias=%.1f\n",
                         RbStateName(rb_state_prev), RbStateName(rb_state),
@@ -754,7 +749,11 @@ int main() {
 
         if (tof_ok) {
             sensor::TOFReadings readings;
+            // Return value may be false on partial API errors; per-slot
+            // 'valid' / 'distanceMm' are authoritative — ignore the bool.
             tof.Read(readings, std::chrono::milliseconds(50));
+            // TODO: verify which slot is physically LEFT vs RIGHT on this chassis.
+            // Convention assumed here: index 0 = left, index 1 = right.
             if (readings[0].valid && readings[0].distanceMm > 0)
                 tof_left_mm  = static_cast<float>(readings[0].distanceMm);
             if (readings[1].valid && readings[1].distanceMm > 0)
@@ -1052,12 +1051,13 @@ int main() {
                 corner_assist.reset();
             }
 
+            // ---- Roundabout bias table (EMA-smoothed) ----
             float rb_bias_px = 0.0f;
             switch (rb_state) {
                 case RbState::APPROACH:    rb_bias_px = +RB_BIAS_PX_RIGHT; break;
                 case RbState::IN_CIRCLE:   rb_bias_px = -RB_BIAS_PX_LEFT;  break;
                 case RbState::EXIT_PREP:   rb_bias_px = +RB_BIAS_PX_RIGHT; break;
-                case RbState::EXIT_SEARCH: rb_bias_px = +RB_BIAS_PX_RIGHT; break;
+                case RbState::EXIT_SEARCH: rb_bias_px = +RB_BIAS_PX_RIGHT; break; // was -RB_BIAS_PX_LEFT (R1 fix)
                 default:                   rb_bias_px =  0.0f;             break;
             }
             rb_bias_smoothed = (1.0f - RB_BIAS_EMA) * rb_bias_smoothed + RB_BIAS_EMA * rb_bias_px;
@@ -1100,22 +1100,12 @@ int main() {
         // -----------------------------------------------------
         // 6. Stop overrides, soft-start, servo, motor
         // -----------------------------------------------------
-        // [PERSON] Person stop is a global safety override — fires even during
-        // parking. Traffic-light stop only during normal driving.
-        const bool stopForPerson =
-            (elapsed_total - last_person_seen_time) <= PERSON_STOP_HANGOVER_S;
-        if (stopForPerson) {
-            if (speed > 0.0f) {
-                std::printf("[PERSON] STOP applied (%.2fs since last sighting)\n",
-                            elapsed_total - last_person_seen_time);
-            }
-            speed = 0.0f;
-        }
-
         if (!parking_active) {
+            const bool stopForPerson =
+                (elapsed_total - last_person_seen_time) <= PERSON_STOP_HANGOVER_S;
             const bool stopForRedLight =
                 (elapsed_total - last_red_seen_time) <= RED_LIGHT_HANGOVER_S;
-            if (stopForRedLight) speed = 0.0f;
+            if (stopForPerson || stopForRedLight) speed = 0.0f;
         }
 
         const float max_delta = MAX_ACCEL_CMS2 * static_cast<float>(dt_loop);
@@ -1142,10 +1132,8 @@ int main() {
         static auto lastLog = std::chrono::steady_clock::now();
         auto tNow = std::chrono::steady_clock::now();
         if (tNow - lastLog >= std::chrono::seconds(1)) {
-            const float person_secs = static_cast<float>(elapsed_total - last_person_seen_time);
-            const char* person_str  = (person_secs <= PERSON_STOP_HANGOVER_S) ? "LIVE" : "clear";
             std::printf(
-                "[t=%ld] sign=%-11s(%d) rb=%-11s park=%-11s person=%-5s "
+                "[t=%ld] sign=%-11s(%d) rb=%-11s park=%-11s "
                 "near=%6.1f hdg=%7.2f ref=%7.2f tofL=%5.1f tofR=%5.1f "
                 "spd=%.1f pid=%.1f srv=%d\n",
                 tickIdx,
@@ -1153,7 +1141,6 @@ int main() {
                 voter.GetCommitted(),
                 RbStateName(rb_state),
                 ParkStateName(park_state),
-                person_str,
                 out.near_e, heading_now, park_ref_heading,
                 tof_left_mm, tof_right_mm,
                 applied_speed, out.angle, final_angle);
@@ -1204,18 +1191,12 @@ int main() {
                 }
             }
 
-            // [PERSON] draw detection boxes — walking_person in bold red
             for (const auto& s : cachedSigns) {
-                bool is_person = (s.name == "walking_person" ||
-                                  s.class_id == sign_class::WALKING_PERSON);
-                cv::Scalar color = is_person ? cv::Scalar(0, 0, 255)
-                                             : cv::Scalar(0, 255, 255);
-                int thickness    = is_person ? 3 : 2;
-                cv::rectangle(overlay, s.box, color, thickness);
+                cv::rectangle(overlay, s.box, cv::Scalar(0, 255, 255), 2);
                 char label[64];
                 std::snprintf(label, sizeof(label), "%s %.2f", s.name.c_str(), s.confidence);
                 cv::putText(overlay, label, {s.box.x, std::max(12, s.box.y - 5)},
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, color, is_person ? 2 : 1);
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
             }
 
             char t1[200], t2[200], t3[200], t4[200];
@@ -1227,10 +1208,9 @@ int main() {
                 SignName(voter.GetCommitted()), voter.GetCommitted(),
                 RbStateName(rb_state), ParkStateName(park_state));
             std::snprintf(t3, sizeof(t3),
-                "hdg %.2f° ref %.2f° Δ%.2f° | person %.1fs ago (conf %.2f)",
+                "hdg %.2f° ref %.2f° Δ%.2f°",
                 heading_now, park_ref_heading,
-                normalizeAngleP(heading_now - park_ref_heading),
-                elapsed_total - last_person_seen_time, last_person_conf);
+                normalizeAngleP(heading_now - park_ref_heading));
             std::snprintf(t4, sizeof(t4),
                 "tof L=%.0f R=%.0f (blk<%.0f) | near %.1f",
                 tof_left_mm, tof_right_mm, PARK_TOF_BLOCKED_MM, out.near_e);
