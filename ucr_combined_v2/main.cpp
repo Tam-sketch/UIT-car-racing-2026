@@ -2,18 +2,21 @@
 // main_run.cpp — UCR2026 Full Integrated + Heading-only Parking
 // ============================================================
 // 2026-11-12 changes:
-//  - Wired BNO055 IMU and TOF sensors (no more stubs)
-//  - EXIT_SEARCH bias flipped from LEFT to RIGHT (was bug R1)
-//  - RB_BIAS_EMA now actually applied (was dead constant R2)
-//  - EXIT_SEARCH force-execute after RB_EXIT_FORCE_EXEC_S (was bug R3)
-//  - waiting_for_tjunction cleared on roundabout entry (was bug R4)
-//  - [RB] state-transition printf for diagnostics
-//  - PARK_HEADING_SIGN flag applied to both heading-hold P loops
+//  - Wired BNO055 IMU and TOF sensors
+//  - EXIT_SEARCH bias flipped from LEFT to RIGHT (R1)
+//  - RB_BIAS_EMA applied (R2)
+//  - EXIT_SEARCH force-execute after RB_EXIT_FORCE_EXEC_S (R3)
+//  - waiting_for_tjunction cleared on roundabout entry (R4)
+//  - PARK_HEADING_SIGN applied to both heading-hold P loops
 // 2026-11-12 (2-pass):
-//  - Added rb_pass_count: Pass 1 = LEFT exit, Pass 2 = RIGHT exit
-//  - EXIT_SEARCH turn params override: floor=16°, bias=18px (nhẹ)
-//  - EXITING resets rb_bias_smoothed (hard reset, no decay)
-//  - Bias table: EXIT_SEARCH = 0 (turn_ctrl tự lo direction + bias)
+//  - rb_pass_count: Pass 1 = LEFT exit, Pass 2 = RIGHT exit
+//  - EXIT_SEARCH turn params override (floor=16°, bias=18px)
+//  - EXITING resets rb_bias_smoothed (hard reset)
+// 2026-11-12 (P0/P1 fixes):
+//  - [P0] Snapshot & restore TURN_STEER_DEG/TURN_BIAS_PX across roundabout
+//  - [P0] Parking reverse: 28→38° steer, 4→6s timeout, servo settle
+//  - [P1] HEADING_SIGN applied to raw axis; PARK_HEADING_SIGN only to P-ctrl
+//  - [P1] MAX_REAL_ANGLE_DEG 30→45, PARK_HEADING_KP 1.2→2.2, WIN 10→4
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -25,7 +28,7 @@
 #include "perception/SignDetector.h"
 #include "sensor/BNO055.h"
 #include "sensor/TOF.h"
-#include "TelemetryHelper.h"   // ← add this line
+#include "control/TelemetryHelper.h"
 
 #include <opencv2/opencv.hpp>
 #include <NvInfer.h>
@@ -71,7 +74,7 @@ static constexpr float SERVO_LEFT_SLOPE    = 0.96f;
 static constexpr float SERVO_LEFT_OFFSET   = -6.2f;
 static constexpr float SERVO_RIGHT_SLOPE   = 0.71f;
 static constexpr float SERVO_RIGHT_OFFSET  = 2.5f;
-static constexpr float MAX_REAL_ANGLE_DEG  = 30.0f;
+static constexpr float MAX_REAL_ANGLE_DEG  = 45.0f;   // [P1] was 30 — allow 38° reverse arcs
 static constexpr int   MAX_SERVO_CMD       = 55;
 
 // Rear-facing ToF sensor slots
@@ -79,6 +82,8 @@ static constexpr int TOF_IDX_REAR_LEFT  = 1;
 static constexpr int TOF_IDX_REAR_RIGHT = 3;
 
 // Heading source (BNO055 eulerDeg.x is yaw on this mount)
+// HEADING_SIGN flips the RAW axis only. PARK_HEADING_SIGN (below) flips
+// the parking P-controller error sign. Do NOT mix the two roles.
 static constexpr float HEADING_SIGN = 1.0f;
 
 // Sign class indices
@@ -133,9 +138,9 @@ static constexpr float  RB_EXIT_TURN_BIAS_PX     = 18.0f;
 // ============================================================
 // PARKING CONSTANTS
 // ============================================================
-static constexpr int   PARK_HEADING_WINDOW         = 10;
-static constexpr float PARK_HEADING_KP             = 1.2f;
-static constexpr float PARK_HEADING_MAX_DEG        = 20.0f;
+static constexpr int   PARK_HEADING_WINDOW         = 4;       // [P1] was 10 — less tilt
+static constexpr float PARK_HEADING_KP             = 2.2f;    // [P1] was 1.2 — faster
+static constexpr float PARK_HEADING_MAX_DEG        = 25.0f;   // [P1] was 20
 static constexpr double PARK_CAPTURE_TIMEOUT_S     = 3.0;
 
 static constexpr float PARK_TOF_BLOCKED_MM         = 300.0f;
@@ -145,19 +150,21 @@ static constexpr float PARK_CAPTURE_SPEED_CMS      = 15.0f;
 static constexpr float PARK_APPROACH_SPEED_CMS     = 10.0f;
 static constexpr float PARK_REVERSE_SPEED_CMS      = -8.0f;
 
-static constexpr float PARK_REVERSE_STEER_DEG      = 28.0f;
+static constexpr float PARK_REVERSE_STEER_DEG      = 38.0f;   // [P0] was 28 — ≈12.5°/s
 static constexpr float PARK_TARGET_HEADING_DEG     = 45.0f;
 static constexpr float PARK_HEADING_TOL_DEG        = 3.0f;
 
 static constexpr double PARK_STOP_DWELL_S          = 0.5;
-static constexpr double PARK_REVERSE_TIMEOUT_S     = 4.0;
+static constexpr double PARK_REVERSE_TIMEOUT_S     = 6.0;     // [P0] was 4.0 — headroom
+static constexpr double PARK_REVERSE_SETTLE_S      = 0.4;     // [P0] NEW — servo settle
 
+// Parking P-controller sign flip (independent of HEADING_SIGN above).
+// Leave +1 unless the car steers AWAY from straight during SLOT_SEARCH
+// even though hdg / ref display correctly.
 static constexpr float PARK_HEADING_SIGN           = +1.0f;
 
 // ============================================================
 // TELEMETRY (UCR 2026 competition requirement)
-//   - Change TELEMETRY_SERVER_IP if the venue server differs.
-//   - TELEMETRY_CAR_ID must be ≤ 15 ASCII chars, no accents.
 // ============================================================
 static constexpr const char* TELEMETRY_SERVER_IP = "192.168.1.100";
 static constexpr int         TELEMETRY_PORT      = 9999;
@@ -334,14 +341,8 @@ static const char* RbStateName(RbState s) {
 // PARKING STATE
 // ============================================================
 enum class ParkState {
-    NONE,
-    CAPTURE,
-    SLOT_SEARCH,
-    SLOT_FOUND,
-    WAIT_FULL_STOP,
-    REVERSE_1,
-    REVERSE_2,
-    DONE
+    NONE, CAPTURE, SLOT_SEARCH, SLOT_FOUND, WAIT_FULL_STOP,
+    REVERSE_1, REVERSE_2, DONE
 };
 
 static const char* ParkStateName(ParkState s) {
@@ -363,10 +364,7 @@ static float normalizeAngleP(float a) {
     return a;
 }
 
-// Return `angle` (deg) shifted by a multiple of 360 so that
-// `angle - ref` is in (-180, 180]. Used to make arithmetic
-// across the 0/360 boundary behave as if the sensor range were
-// continuous, not circular.
+// Shift `angle` by a multiple of 360 so that `angle - ref` ∈ (-180, 180].
 static float unwrapNear(float ref, float angle) {
     float d = angle - ref;
     while (d >  180.0f) d -= 360.0f;
@@ -374,10 +372,7 @@ static float unwrapNear(float ref, float angle) {
     return ref + d;
 }
 
-// Wrap-safe median of a set of headings in degrees. Each sample is
-// unwrapped relative to the FIRST sample before sorting, so a cluster
-// of samples near 0/360 does not split around the wrap and inflate the
-// median to ~180. Result is returned in [0, 360).
+// Wrap-safe median of heading samples (deg). Result in [0, 360).
 static float medianHeadingDeg(const std::vector<float>& samples) {
     if (samples.empty()) return 0.0f;
     const float ref = samples.front();
@@ -536,8 +531,7 @@ int main() {
         std::cerr << "[Main] Sign Detector init failed — turns/roundabout/parking DISABLED\n";
     }
 
-    // Telemetry: fire-and-forget UDP. Bad IP / no network is non-fatal —
-    // the helper just stops sending.
+    // Telemetry
     telemetry::Helper telem;
     const bool telem_ready = telem.Init(TELEMETRY_SERVER_IP, TELEMETRY_PORT, TELEMETRY_CAR_ID);
     if (!telem_ready) {
@@ -572,6 +566,13 @@ int main() {
     v20::CornerAssist       corner_assist;
     v20::LaneFollower::Output previous_out;
 
+    // [P0] Snapshot default turn params — they get overridden for the
+    // roundabout exit and must be restored after EXITING so subsequent
+    // 90° turns (loop-back T-junction, sign-driven turns) use aggressive
+    // defaults (32°, 35px) not the gentle exit params (16°, 18px).
+    const double DEFAULT_TURN_STEER_DEG = turn_controller.TURN_STEER_DEG;
+    const double DEFAULT_TURN_BIAS_PX   = turn_controller.TURN_BIAS_PX;
+
     // Run-state
     RbState  rb_state              = RbState::NONE;
     RbState  rb_state_prev         = RbState::NONE;
@@ -583,14 +584,12 @@ int main() {
     double   rb_cooldown_until     = 0.0;
     int      rb_missing_sign_ticks = 0;
     double   last_rb_visible_time  = -1e9;
-    int      rb_pass_count         = 0;      // 0 = idle, 1 = pass 1, 2 = pass 2
+    int      rb_pass_count         = 0;   // 0=idle, 1=pass 1, 2=pass 2
 
     double   last_person_seen_time = -1e9;
     double   last_red_seen_time    = -1e9;
     double   sign_block_until_time = -1.0;
 
-    // Telemetry-only (not used for control): the sign that started the
-    // currently-running turn, so state survives voter.Reset().
     int      active_turn_sign_class = -1;
 
     // Parking state
@@ -628,12 +627,15 @@ int main() {
               << "TELEM:" << (telem_ready ? " OK" : " DISABLED")
               << " → " << TELEMETRY_SERVER_IP << ":" << TELEMETRY_PORT << "\n"
               << "Speed: [" << MIN_SPEED_CMS << ", " << MAX_SPEED_CMS << "] cm/s\n"
-              << "Roundabout: 2-pass (P1=LEFT, P2=RIGHT) exit floor="
-              << RB_EXIT_TURN_FLOOR_DEG << "° bias=" << RB_EXIT_TURN_BIAS_PX << "px\n"
+              << "Roundabout: 2-pass exit floor=" << RB_EXIT_TURN_FLOOR_DEG
+              << "° bias=" << RB_EXIT_TURN_BIAS_PX << "px (restored after EXITING)\n"
               << "Parking: heading-hold, window=" << PARK_HEADING_WINDOW
               << " kp=" << PARK_HEADING_KP
+              << " rev_steer=" << PARK_REVERSE_STEER_DEG
+              << "° settle=" << PARK_REVERSE_SETTLE_S << "s"
               << " tof_blk=" << PARK_TOF_BLOCKED_MM << "mm"
-              << " heading_sign=" << (PARK_HEADING_SIGN > 0 ? "+1" : "-1") << "\n"
+              << " HEADING_SIGN=" << (HEADING_SIGN > 0 ? "+1" : "-1")
+              << " PARK_HEADING_SIGN=" << (PARK_HEADING_SIGN > 0 ? "+1" : "-1") << "\n"
               << "Press 'q' or ESC to quit\n\n";
 
     while (!g_stopSignal) {
@@ -654,8 +656,6 @@ int main() {
         elapsed_total += dt_loop;
         totalFrames++;
 
-        // Per-frame detection flags for telemetry. The tracker adds its own
-        // hangover (2 s person, 1 s lights), so pass raw "saw it this frame".
         bool person_seen_this_frame = false;
         bool red_seen_this_frame    = false;
         bool green_seen_this_frame  = false;
@@ -733,8 +733,6 @@ int main() {
                     elapsed_total >= rb_cooldown_until &&
                     turn_controller.state == v20::LaneTurnController::State::IDLE &&
                     !corner_assist.active()) {
-
-                    // 2-pass design: tăng counter mỗi lần vào vòng
                     rb_pass_count++;
                     if (rb_pass_count > 2) rb_pass_count = 2;
                     std::printf("[RB] === Starting pass %d/2 ===\n", rb_pass_count);
@@ -774,12 +772,9 @@ int main() {
                 break;
             case RbState::EXIT_SEARCH: {
                 if (turn_controller.state == v20::LaneTurnController::State::IDLE) {
-                    // 2-pass: Pass 1 = LEFT (loop back), Pass 2 = RIGHT (final exit)
                     const char* exit_dir = (rb_pass_count == 1) ? "LEFT" : "RIGHT";
-
-                    // Override turn params cho roundabout exit (nhẹ hơn 90°)
-                    turn_controller.TURN_STEER_DEG = RB_EXIT_TURN_FLOOR_DEG;  // 16°
-                    turn_controller.TURN_BIAS_PX   = RB_EXIT_TURN_BIAS_PX;    // 18px
+                    turn_controller.TURN_STEER_DEG = RB_EXIT_TURN_FLOOR_DEG;
+                    turn_controller.TURN_BIAS_PX   = RB_EXIT_TURN_BIAS_PX;
 
                     std::printf("[RB] Pass %d/2 EXIT_SEARCH → start_turn(%s) floor=%.0f° bias=%.0fpx\n",
                                 rb_pass_count, exit_dir,
@@ -789,7 +784,6 @@ int main() {
                     turn_controller.start_turn(exit_dir, false);
                 }
                 const double in_exit = elapsed_total - rb_exit_search_start;
-                // If the strict junction gate never fires, force the turn
                 if (in_exit >= RB_EXIT_FORCE_EXEC_S &&
                     (turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE ||
                      turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT)) {
@@ -818,18 +812,29 @@ int main() {
                         turn_controller = v20::LaneTurnController{};
                         corner_assist.reset();
                     }
+
+                    // [P0] Restore default aggressive turn params so subsequent
+                    // 90° turns (loop-back T-junction, sign turns) are not
+                    // limited to the gentle roundabout-exit values.
+                    turn_controller.TURN_STEER_DEG = DEFAULT_TURN_STEER_DEG;
+                    turn_controller.TURN_BIAS_PX   = DEFAULT_TURN_BIAS_PX;
+
                     rb_state = RbState::NONE;
-                    rb_bias_smoothed = 0.0f;   // HARD RESET
+                    rb_bias_smoothed = 0.0f;
 
                     if (rb_pass_count == 1) {
-                        // Pass 1 xong → arm T-junction để loop back
                         turn_controller.waiting_for_tjunction = true;
                         turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
-                        std::printf("[RB] Pass 1 done — armed T-junction for loop-back\n");
+                        std::printf("[RB] Pass 1 done — armed T-junction for loop-back "
+                                    "(turn defaults restored: %.0f° / %.0fpx)\n",
+                                    turn_controller.TURN_STEER_DEG,
+                                    turn_controller.TURN_BIAS_PX);
                     } else {
-                        // Pass 2 xong → hoàn thành, reset counter
                         turn_controller.waiting_for_tjunction = false;
-                        std::printf("[RB] Pass 2 done — roundabout sequence COMPLETE\n");
+                        std::printf("[RB] Pass 2 done — roundabout sequence COMPLETE "
+                                    "(turn defaults restored: %.0f° / %.0fpx)\n",
+                                    turn_controller.TURN_STEER_DEG,
+                                    turn_controller.TURN_BIAS_PX);
                         rb_pass_count = 0;
                     }
 
@@ -841,7 +846,6 @@ int main() {
             }
         }
 
-        // Diagnostic: log every RbState transition
         if (rb_state != rb_state_prev) {
             std::printf("[RB] %-10s -> %-10s t=%.2f sign=%s bias=%.1f pass=%d\n",
                         RbStateName(rb_state_prev), RbStateName(rb_state),
@@ -861,11 +865,11 @@ int main() {
         if (imu_ok) {
             BNO055::Data imu_data;
             if (imu.read(imu_data)) {
-                // eulerDeg.x is the yaw axis on this mount (confirmed by
-                // test_bno055 + parking.cpp). eulerDeg.y is pitch/roll —
-                // it changes on every bump, so it must NOT be used for
-                // heading-hold or turn-release logic.
-                heading_now = PARK_HEADING_SIGN * static_cast<float>(imu_data.eulerDeg.x);
+                // [P1] HEADING_SIGN flips the raw axis only. PARK_HEADING_SIGN
+                // (further below) flips the P-controller error sign — the two
+                // are independent so either can be adjusted without breaking
+                // the other.
+                heading_now = HEADING_SIGN * static_cast<float>(imu_data.eulerDeg.x);
                 heading_ok  = true;
             }
         }
@@ -911,10 +915,6 @@ int main() {
                 if ((int)park_heading_buf.size() >= PARK_HEADING_WINDOW) {
                     std::vector<float> samples(park_heading_buf.begin(),
                                                park_heading_buf.end());
-                    // Wrap-safe median: samples near 0/360 are unwrapped
-                    // around the first sample before sorting, so the
-                    // reference does not jump to ~180° when the true
-                    // heading is close to 0.
                     park_ref_heading = medianHeadingDeg(samples);
                     park_state = ParkState::SLOT_SEARCH;
                     std::printf("[PARK] Reference captured: %.2f° → SLOT_SEARCH\n",
@@ -1003,19 +1003,31 @@ int main() {
                 park_reverse_elapsed += dt_loop;
                 park_angle_override = (park_side < 0) ? -PARK_REVERSE_STEER_DEG
                                                       :  PARK_REVERSE_STEER_DEG;
-                park_speed_override = PARK_REVERSE_SPEED_CMS;
-                if (heading_ok) {
-                    float d = std::abs(normalizeAngleP(heading_now - park_heading_0));
-                    if (d >= PARK_TARGET_HEADING_DEG) {
-                        park_state = ParkState::REVERSE_2;
-                        park_reverse_elapsed = 0.0;
-                        std::printf("[PARK] REVERSE_1 done (Δ=%.1f°) → REVERSE_2\n", d);
+
+                // [P0] Servo-settle: hold speed 0 until the servo has had
+                // time to swing to the commanded angle, so the reverse arc
+                // starts with wheels already turned (previously the first
+                // ~0.3s of reversing happened mid-swing, shrinking the arc).
+                if (park_reverse_elapsed < PARK_REVERSE_SETTLE_S) {
+                    park_speed_override = 0.0f;
+                } else {
+                    park_speed_override = PARK_REVERSE_SPEED_CMS;
+                    if (heading_ok) {
+                        float d = std::abs(normalizeAngleP(heading_now - park_heading_0));
+                        if (d >= PARK_TARGET_HEADING_DEG) {
+                            park_state = ParkState::REVERSE_2;
+                            park_reverse_elapsed = 0.0;
+                            std::printf("[PARK] REVERSE_1 done (Δ=%.1f°) → REVERSE_2\n", d);
+                        }
                     }
                 }
                 if (park_reverse_elapsed >= PARK_REVERSE_TIMEOUT_S) {
+                    float d_actual = heading_ok
+                        ? std::abs(normalizeAngleP(heading_now - park_heading_0))
+                        : -1.0f;
+                    std::printf("[PARK] REVERSE_1 TIMEOUT (Δ=%.1f°) → REVERSE_2\n", d_actual);
                     park_state = ParkState::REVERSE_2;
                     park_reverse_elapsed = 0.0;
-                    std::printf("[PARK] REVERSE_1 timeout → REVERSE_2\n");
                 }
                 break;
             }
@@ -1023,17 +1035,25 @@ int main() {
                 park_reverse_elapsed += dt_loop;
                 park_angle_override = (park_side < 0) ?  PARK_REVERSE_STEER_DEG
                                                       : -PARK_REVERSE_STEER_DEG;
-                park_speed_override = PARK_REVERSE_SPEED_CMS;
-                if (heading_ok) {
-                    float d = std::abs(normalizeAngleP(heading_now - park_heading_0));
-                    if (d <= PARK_HEADING_TOL_DEG) {
-                        park_state = ParkState::DONE;
-                        std::printf("[PARK] REVERSE_2 done (Δ=%.1f°) → DONE\n", d);
+
+                if (park_reverse_elapsed < PARK_REVERSE_SETTLE_S) {
+                    park_speed_override = 0.0f;
+                } else {
+                    park_speed_override = PARK_REVERSE_SPEED_CMS;
+                    if (heading_ok) {
+                        float d = std::abs(normalizeAngleP(heading_now - park_heading_0));
+                        if (d <= PARK_HEADING_TOL_DEG) {
+                            park_state = ParkState::DONE;
+                            std::printf("[PARK] REVERSE_2 done (Δ=%.1f°) → DONE\n", d);
+                        }
                     }
                 }
                 if (park_reverse_elapsed >= PARK_REVERSE_TIMEOUT_S) {
+                    float d_actual = heading_ok
+                        ? std::abs(normalizeAngleP(heading_now - park_heading_0))
+                        : -1.0f;
+                    std::printf("[PARK] REVERSE_2 TIMEOUT (Δ=%.1f°) → DONE\n", d_actual);
                     park_state = ParkState::DONE;
-                    std::printf("[PARK] REVERSE_2 timeout → DONE\n");
                 }
                 break;
             }
@@ -1154,7 +1174,7 @@ int main() {
                 elapsed_total >= sign_block_until_time) {
                 std::string dir = (signCommit.side == -1) ? "LEFT" : "RIGHT";
                 turn_controller.start_turn(dir, false);
-                active_turn_sign_class = signCommit.class_id;   // telemetry
+                active_turn_sign_class = signCommit.class_id;
                 voter.Reset();
             }
 
@@ -1185,7 +1205,7 @@ int main() {
                 case RbState::APPROACH:    rb_bias_px = +RB_BIAS_PX_RIGHT; break;
                 case RbState::IN_CIRCLE:   rb_bias_px = -RB_BIAS_PX_LEFT;  break;
                 case RbState::EXIT_PREP:   rb_bias_px = +RB_BIAS_PX_RIGHT; break;
-                case RbState::EXIT_SEARCH: rb_bias_px = 0.0f;              break; // turn_ctrl tự lo
+                case RbState::EXIT_SEARCH: rb_bias_px = 0.0f;              break;
                 default:                   rb_bias_px =  0.0f;             break;
             }
             rb_bias_smoothed = (1.0f - RB_BIAS_EMA) * rb_bias_smoothed + RB_BIAS_EMA * rb_bias_px;
@@ -1198,7 +1218,7 @@ int main() {
             if (turn_res.state == v20::LaneTurnController::State::DONE) {
                 sign_block_until_time = elapsed_total + SIGN_BLOCK_SECONDS;
                 voter.Reset();
-                active_turn_sign_class = -1;   // telemetry
+                active_turn_sign_class = -1;
             }
 
             out = follower.step(mask, final_bias, exec_turn, applied_floor, applied_cap);
@@ -1256,10 +1276,7 @@ int main() {
         servo.SetAngle(final_angle);
 
         // -----------------------------------------------------
-        // Telemetry (UCR 2026): build StateInputs from this frame
-        // and hand off to the helper. Internal rate limiter drops
-        // calls until 50 ms have elapsed, so calling every loop
-        // is correct — no extra timing needed here.
+        // Telemetry (UCR 2026)
         // -----------------------------------------------------
         if (telem_ready) {
             telemetry::StateInputs ti;
@@ -1268,21 +1285,13 @@ int main() {
             ti.green_light_detected = green_seen_this_frame;
             ti.in_roundabout        = (rb_state != RbState::NONE);
             ti.parking_active       = (park_state != ParkState::NONE);
-            ti.bridge_active        = false;   // no bridge state in this codebase
+            ti.bridge_active        = false;
             ti.active_sign_class    = active_turn_sign_class;
             ti.last_seen_sign_class = voter.GetCommitted();
-            // Sign class IDs already match the defaults in StateInputs:
-            //   turn_left=6, turn_right=7, no_left=1, no_right=2,
-            //   construction=0, roundabout=4, parking=3.
 
             const double now_telem_s = std::chrono::duration<double>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             telem.TrackInputs(ti, now_telem_s);
-            // Send applied_speed (what the motor actually received) and
-            // final_angle (servo command in degrees, ±55). If the server
-            // team wants "real-world steering degrees" instead, use
-            // static_cast<int>(std::lround(out.angle)) — the PID output,
-            // positive = right, bounded ±50.
             telem.Tick(frame, applied_speed, final_angle, now_telem_s);
         }
 
