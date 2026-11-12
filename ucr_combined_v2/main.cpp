@@ -9,6 +9,11 @@
 //  - waiting_for_tjunction cleared on roundabout entry (was bug R4)
 //  - [RB] state-transition printf for diagnostics
 //  - PARK_HEADING_SIGN flag applied to both heading-hold P loops
+// 2026-11-12 (2-pass):
+//  - Added rb_pass_count: Pass 1 = LEFT exit, Pass 2 = RIGHT exit
+//  - EXIT_SEARCH turn params override: floor=16°, bias=18px (nhẹ)
+//  - EXITING resets rb_bias_smoothed (hard reset, no decay)
+//  - Bias table: EXIT_SEARCH = 0 (turn_ctrl tự lo direction + bias)
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -68,11 +73,12 @@ static constexpr float SERVO_RIGHT_OFFSET  = 2.5f;
 static constexpr float MAX_REAL_ANGLE_DEG  = 30.0f;
 static constexpr int   MAX_SERVO_CMD       = 55;
 
-// Rear-facing ToF sensor slots (matches RobotConfig.h TOF_IDX_*).
-// Slots 0 and 2 are not wired on this chassis — the working pair for
-// parking slot detection is the rear left (slot 1) + rear right (slot 3).
+// Rear-facing ToF sensor slots
 static constexpr int TOF_IDX_REAR_LEFT  = 1;
 static constexpr int TOF_IDX_REAR_RIGHT = 3;
+
+// Heading source (BNO055 eulerDeg.x is yaw on this mount)
+static constexpr float HEADING_SIGN = 1.0f;
 
 // Sign class indices
 namespace sign_class {
@@ -84,7 +90,7 @@ namespace sign_class {
     inline constexpr int TRAFFIC_LIGHT      = 5;
     inline constexpr int TURN_LEFT          = 6;
     inline constexpr int TURN_RIGHT         = 7;
-    inline constexpr int WALKING_PERSON     = 8;   // ← NEW
+    inline constexpr int WALKING_PERSON     = 8;
 }
 
 // Traffic light HSV
@@ -108,16 +114,20 @@ static constexpr int SIGN_VOTER_TIMEOUT_DS      = 30;
 static constexpr double SIGN_BLOCK_SECONDS      = 4.0;
 
 // Roundabout timings
-static constexpr float  RB_BIAS_PX_RIGHT        = 28.0f;
-static constexpr float  RB_BIAS_PX_LEFT         = 20.0f;
-static constexpr float  RB_BIAS_EMA             = 0.30f;
-static constexpr double RB_MISSING_SIGN_S       = 2.0;
-static constexpr double RB_CIRCLE_TIMEOUT_S     = 12.0;
+static constexpr float  RB_BIAS_PX_RIGHT         = 28.0f;
+static constexpr float  RB_BIAS_PX_LEFT          = 20.0f;
+static constexpr float  RB_BIAS_EMA              = 0.30f;
+static constexpr double RB_MISSING_SIGN_S        = 2.0;
+static constexpr double RB_CIRCLE_TIMEOUT_S      = 12.0;
 static constexpr double RB_EXIT_SEARCH_TIMEOUT_S = 15.0;
-static constexpr double RB_EXIT_FORCE_EXEC_S    = 1.5;   // force turn into EXECUTE after this long in EXIT_SEARCH
-static constexpr double RB_COOLDOWN_S           = 2.0;
-static constexpr float  RB_SPEED_MIN_CMS        = 20.0f;
-static constexpr float  RB_SPEED_MAX_CMS        = 30.0f;
+static constexpr double RB_EXIT_FORCE_EXEC_S     = 1.5;
+static constexpr double RB_COOLDOWN_S            = 2.0;
+static constexpr float  RB_SPEED_MIN_CMS         = 20.0f;
+static constexpr float  RB_SPEED_MAX_CMS         = 30.0f;
+
+// Roundabout exit turn params (gentler than regular turn)
+static constexpr float  RB_EXIT_TURN_FLOOR_DEG   = 16.0f;
+static constexpr float  RB_EXIT_TURN_BIAS_PX     = 18.0f;
 
 // ============================================================
 // PARKING CONSTANTS
@@ -141,8 +151,6 @@ static constexpr float PARK_HEADING_TOL_DEG        = 3.0f;
 static constexpr double PARK_STOP_DWELL_S          = 0.5;
 static constexpr double PARK_REVERSE_TIMEOUT_S     = 4.0;
 
-// +1 if BNO055 eulerDeg.y INCREASES on a right turn (matches PID convention).
-// Flip to -1.0f if the car steers AWAY from centre during SLOT_SEARCH.
 static constexpr float PARK_HEADING_SIGN           = +1.0f;
 
 volatile std::sig_atomic_t g_stopSignal = 0;
@@ -433,7 +441,7 @@ static const char* SignName(int id) {
         case TRAFFIC_LIGHT:      return "traffic_light";
         case TURN_LEFT:          return "turn_left";
         case TURN_RIGHT:         return "turn_right";
-        case WALKING_PERSON:     return "walking_person";   // ← NEW
+        case WALKING_PERSON:     return "walking_person";
         default:                 return "-";
     }
 }
@@ -525,6 +533,7 @@ int main() {
     double   rb_cooldown_until     = 0.0;
     int      rb_missing_sign_ticks = 0;
     double   last_rb_visible_time  = -1e9;
+    int      rb_pass_count         = 0;      // 0 = idle, 1 = pass 1, 2 = pass 2
 
     double   last_person_seen_time = -1e9;
     double   last_red_seen_time    = -1e9;
@@ -563,6 +572,8 @@ int main() {
               << "IMU:  " << (imu_ok ? "OK" : "FAILED — parking disabled") << "\n"
               << "TOF:  " << (tof_ok ? "OK" : "FAILED — parking disabled") << "\n"
               << "Speed: [" << MIN_SPEED_CMS << ", " << MAX_SPEED_CMS << "] cm/s\n"
+              << "Roundabout: 2-pass (P1=LEFT, P2=RIGHT) exit floor="
+              << RB_EXIT_TURN_FLOOR_DEG << "° bias=" << RB_EXIT_TURN_BIAS_PX << "px\n"
               << "Parking: heading-hold, window=" << PARK_HEADING_WINDOW
               << " kp=" << PARK_HEADING_KP
               << " tof_blk=" << PARK_TOF_BLOCKED_MM << "mm"
@@ -652,11 +663,16 @@ int main() {
                     elapsed_total >= rb_cooldown_until &&
                     turn_controller.state == v20::LaneTurnController::State::IDLE &&
                     !corner_assist.active()) {
+
+                    // 2-pass design: tăng counter mỗi lần vào vòng
+                    rb_pass_count++;
+                    if (rb_pass_count > 2) rb_pass_count = 2;
+                    std::printf("[RB] === Starting pass %d/2 ===\n", rb_pass_count);
+
                     rb_state = RbState::APPROACH;
                     rb_missing_sign_ticks = 0;
                     rb_phase_start_time   = elapsed_total;
                     rb_bias_smoothed      = 0.0f;
-                    // Clear any stale T-junction follow-up state from a previous roundabout
                     turn_controller.waiting_for_tjunction   = false;
                     turn_controller.tjunction_cooldown      = 0.0;
                     turn_controller.tjunction_detect_frames = 0;
@@ -688,7 +704,19 @@ int main() {
                 break;
             case RbState::EXIT_SEARCH: {
                 if (turn_controller.state == v20::LaneTurnController::State::IDLE) {
-                    turn_controller.start_turn("RIGHT", false);
+                    // 2-pass: Pass 1 = LEFT (loop back), Pass 2 = RIGHT (final exit)
+                    const char* exit_dir = (rb_pass_count == 1) ? "LEFT" : "RIGHT";
+
+                    // Override turn params cho roundabout exit (nhẹ hơn 90°)
+                    turn_controller.TURN_STEER_DEG = RB_EXIT_TURN_FLOOR_DEG;  // 16°
+                    turn_controller.TURN_BIAS_PX   = RB_EXIT_TURN_BIAS_PX;    // 18px
+
+                    std::printf("[RB] Pass %d/2 EXIT_SEARCH → start_turn(%s) floor=%.0f° bias=%.0fpx\n",
+                                rb_pass_count, exit_dir,
+                                turn_controller.TURN_STEER_DEG,
+                                turn_controller.TURN_BIAS_PX);
+
+                    turn_controller.start_turn(exit_dir, false);
                 }
                 const double in_exit = elapsed_total - rb_exit_search_start;
                 // If the strict junction gate never fires, force the turn
@@ -721,10 +749,22 @@ int main() {
                         corner_assist.reset();
                     }
                     rb_state = RbState::NONE;
+                    rb_bias_smoothed = 0.0f;   // HARD RESET
+
+                    if (rb_pass_count == 1) {
+                        // Pass 1 xong → arm T-junction để loop back
+                        turn_controller.waiting_for_tjunction = true;
+                        turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
+                        std::printf("[RB] Pass 1 done — armed T-junction for loop-back\n");
+                    } else {
+                        // Pass 2 xong → hoàn thành, reset counter
+                        turn_controller.waiting_for_tjunction = false;
+                        std::printf("[RB] Pass 2 done — roundabout sequence COMPLETE\n");
+                        rb_pass_count = 0;
+                    }
+
                     rb_cooldown_until = elapsed_total + RB_COOLDOWN_S;
                     voter.Reset();
-                    turn_controller.waiting_for_tjunction = true;
-                    turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
                 }
                 break;
             }
@@ -732,10 +772,10 @@ int main() {
 
         // Diagnostic: log every RbState transition
         if (rb_state != rb_state_prev) {
-            std::printf("[RB] %-10s -> %-10s t=%.2f sign=%s bias=%.1f\n",
+            std::printf("[RB] %-10s -> %-10s t=%.2f sign=%s bias=%.1f pass=%d\n",
                         RbStateName(rb_state_prev), RbStateName(rb_state),
                         elapsed_total, SignName(voter.GetCommitted()),
-                        rb_bias_smoothed);
+                        rb_bias_smoothed, rb_pass_count);
             rb_state_prev = rb_state;
         }
 
@@ -761,14 +801,7 @@ int main() {
 
         if (tof_ok) {
             sensor::TOFReadings readings;
-            // Return value may be false on partial API errors; per-slot
-            // 'valid' / 'distanceMm' are authoritative — ignore the bool.
             tof.Read(readings, std::chrono::milliseconds(50));
-            // Rear pair (RobotConfig.h):
-            //   slot 1 = rear left  (TOF_IDX_REAR_LEFT)
-            //   slot 3 = rear right (TOF_IDX_REAR_RIGHT)
-            // Rear sensors are the ones that see the parking slot during the
-            // reverse manoeuvre, so they drive SLOT_SEARCH / SLOT_FOUND.
             if (readings[TOF_IDX_REAR_LEFT].valid &&
                 readings[TOF_IDX_REAR_LEFT].distanceMm > 0)
                 tof_left_mm  = static_cast<float>(
@@ -1076,7 +1109,7 @@ int main() {
                 case RbState::APPROACH:    rb_bias_px = +RB_BIAS_PX_RIGHT; break;
                 case RbState::IN_CIRCLE:   rb_bias_px = -RB_BIAS_PX_LEFT;  break;
                 case RbState::EXIT_PREP:   rb_bias_px = +RB_BIAS_PX_RIGHT; break;
-                case RbState::EXIT_SEARCH: rb_bias_px = +RB_BIAS_PX_RIGHT; break; // was -RB_BIAS_PX_LEFT (R1 fix)
+                case RbState::EXIT_SEARCH: rb_bias_px = 0.0f;              break; // turn_ctrl tự lo
                 default:                   rb_bias_px =  0.0f;             break;
             }
             rb_bias_smoothed = (1.0f - RB_BIAS_EMA) * rb_bias_smoothed + RB_BIAS_EMA * rb_bias_px;
@@ -1152,13 +1185,14 @@ int main() {
         auto tNow = std::chrono::steady_clock::now();
         if (tNow - lastLog >= std::chrono::seconds(1)) {
             std::printf(
-                "[t=%ld] sign=%-11s(%d) rb=%-11s park=%-11s "
+                "[t=%ld] sign=%-11s(%d) rb=%-11s(p%d) park=%-11s "
                 "near=%6.1f hdg=%7.2f ref=%7.2f tofL=%5.1f tofR=%5.1f "
                 "spd=%.1f pid=%.1f srv=%d\n",
                 tickIdx,
                 SignName(voter.GetCommitted()),
                 voter.GetCommitted(),
                 RbStateName(rb_state),
+                rb_pass_count,
                 ParkStateName(park_state),
                 out.near_e, heading_now, park_ref_heading,
                 tof_left_mm, tof_right_mm,
@@ -1223,9 +1257,9 @@ int main() {
                 "FPS %.1f | spd %.1f/%.1f | pid %.1f | srv %d",
                 currentFps, applied_speed, speed, out.angle, final_angle);
             std::snprintf(t2, sizeof(t2),
-                "sign %s (%d) | rb %s | park %s",
+                "sign %s (%d) | rb %s (pass %d/2) | park %s",
                 SignName(voter.GetCommitted()), voter.GetCommitted(),
-                RbStateName(rb_state), ParkStateName(park_state));
+                RbStateName(rb_state), rb_pass_count, ParkStateName(park_state));
             std::snprintf(t3, sizeof(t3),
                 "hdg %.2f° ref %.2f° Δ%.2f°",
                 heading_now, park_ref_heading,
