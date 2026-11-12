@@ -83,9 +83,46 @@ static inline float normalizeAngle(float angle) {
     return angle;
 }
 
-// Các thông số cấu hình riêng cho Parking
-static constexpr int   PARK_SCANLINE_LEFT_X   = 100;    // Scanline cố định bên trái (bỏ qua mask ngoài này)
-static constexpr int   PARK_SCANLINE_RIGHT_X  = 380;    // Scanline cố định bên phải (bỏ qua mask ngoài này)
+// Cấu trúc hành lang 3 điểm chéo theo góc camera cho Parking
+struct ParkingCorridor {
+    bool latched = false;
+    cv::Point left_far{90, 135};
+    cv::Point left_mid{70, 195};
+    cv::Point left_bot{50, 299};
+
+    cv::Point right_far{390, 135};
+    cv::Point right_mid{410, 195};
+    cv::Point right_bot{430, 299};
+
+    int get_left_x(int y) const {
+        if (y <= left_mid.y) {
+            double dy = left_mid.y - left_far.y;
+            if (std::abs(dy) < 1e-4) return left_mid.x;
+            double t = (double)(y - left_far.y) / dy;
+            return static_cast<int>(std::lround(left_far.x + t * (left_mid.x - left_far.x)));
+        } else {
+            double dy = left_bot.y - left_mid.y;
+            if (std::abs(dy) < 1e-4) return left_bot.x;
+            double t = (double)(y - left_mid.y) / dy;
+            return static_cast<int>(std::lround(left_mid.x + t * (left_bot.x - left_mid.x)));
+        }
+    }
+
+    int get_right_x(int y) const {
+        if (y <= right_mid.y) {
+            double dy = right_mid.y - right_far.y;
+            if (std::abs(dy) < 1e-4) return right_mid.x;
+            double t = (double)(y - right_far.y) / dy;
+            return static_cast<int>(std::lround(right_far.x + t * (right_mid.x - right_far.x)));
+        } else {
+            double dy = right_bot.y - right_mid.y;
+            if (std::abs(dy) < 1e-4) return right_bot.x;
+            double t = (double)(y - right_mid.y) / dy;
+            return static_cast<int>(std::lround(right_mid.x + t * (right_bot.x - right_mid.x)));
+        }
+    }
+};
+
 static constexpr float PARK_TOF_BLOCKED_MM    = 350.0f; // Ngưỡng mm (< 350mm coi là bị block)
 static constexpr float PARK_APPROACH_SPEED    = 10.0f;  // Tốc độ tiến trong bãi đỗ (cm/s)
 static constexpr float PARK_REVERSE_SPEED     = -8.0f;  // Tốc độ lùi chậm (cm/s)
@@ -501,6 +538,7 @@ int main() {
 
     // --- Biến trạng thái Parking (Hành lang & Ô đỗ) ---
     ParkingState park_state = ParkingState::IDLE;
+    ParkingCorridor park_corridor;
     int park_free_side = -1; // -1: LEFT trống, +1: RIGHT trống
     float park_heading_0 = 0.0f;
     double park_dwell_time = 0.0;
@@ -591,8 +629,32 @@ int main() {
         if (roadOK) {
             dec = navBrain.Process(mask, follower.speed());
 
+            int h = mask.rows, w = mask.cols;
+            int y1 = static_cast<int>(h * 0.45);
+            int y2 = static_cast<int>(h * 0.65);
+            int y_bottom = h - 1;
+
+            auto get_raw_boundaries = [&](const cv::Mat& m, int y_row, int& lx, int& rx) {
+                lx = -1; rx = -1;
+                if (m.empty() || y_row < 0 || y_row >= m.rows) return;
+                const uchar* row = m.ptr<uchar>(y_row);
+                int start = -1; int best_len = -1;
+                for (int x = 0; x <= m.cols; x++) {
+                    bool on = (x < m.cols) && (row[x] > 0);
+                    if (on && start < 0) start = x;
+                    if (!on && start >= 0) {
+                        int end_x = x - 1;
+                        int len = x - start;
+                        if (len > 15 && len > best_len) {
+                            best_len = len; lx = start; rx = end_x;
+                        }
+                        start = -1;
+                    }
+                }
+            };
+
             // -------------------------------------------------------------
-            // QUẢN LÝ TRẠNG THÁI PARKING & KẺ 2 SCANLINE CỐ ĐỊNH CẮT MASK
+            // QUẢN LÝ TRẠNG THÁI PARKING & KẺ 2 SCANLINE CHÉO 3 ĐIỂM CỐ ĐỊNH
             // -------------------------------------------------------------
             if (dec.active_sign == "parking") {
                 parking_active = true;
@@ -605,24 +667,59 @@ int main() {
                 std::cout << "[PARK] >>> PARKING SIGN CONFIRMED -> ACTIVATING PARKING MODE <<<\n";
             }
 
-            // Bỏ qua tất cả các pixel mask nằm ngoài 2 scanline cố định khi vào bãi đỗ
+            if (dec.active_sign == "parking" && !park_corridor.latched) {
+                int raw_lx1 = -1, raw_rx1 = -1;
+                int raw_lx2 = -1, raw_rx2 = -1;
+                int raw_lx_bot = -1, raw_rx_bot = -1;
+                get_raw_boundaries(mask, y1, raw_lx1, raw_rx1);
+                get_raw_boundaries(mask, y2, raw_lx2, raw_rx2);
+                get_raw_boundaries(mask, y_bottom, raw_lx_bot, raw_rx_bot);
+
+                int clx_bot = (raw_lx_bot > 5 && raw_lx_bot < w / 2 - 10) ? raw_lx_bot : 50;
+                int crx_bot = (raw_rx_bot > w / 2 + 10 && raw_rx_bot < w - 6) ? raw_rx_bot : (w - 51);
+
+                int clx_mid = (raw_lx2 > 10 && raw_lx2 < w / 2 - 10) ? raw_lx2 : (clx_bot + 20);
+                int crx_mid = (raw_rx2 > w / 2 + 10 && raw_rx2 < w - 11) ? raw_rx2 : (crx_bot - 20);
+
+                int clx_far = (raw_lx1 > 15 && raw_lx1 < w / 2 - 10) ? raw_lx1 : (clx_mid + 20);
+                int crx_far = (raw_rx1 > w / 2 + 10 && raw_rx1 < w - 16) ? raw_rx1 : (crx_mid - 20);
+
+                // Giữ tính chất tụ phối cảnh về tâm ảnh
+                if (clx_mid < clx_bot) clx_mid = clx_bot + 15;
+                if (clx_far < clx_mid) clx_far = clx_mid + 15;
+                if (crx_mid > crx_bot) crx_mid = crx_bot - 15;
+                if (crx_far > crx_mid) crx_far = crx_mid - 15;
+
+                park_corridor.left_far  = cv::Point(clx_far, y1);
+                park_corridor.left_mid  = cv::Point(clx_mid, y2);
+                park_corridor.left_bot  = cv::Point(clx_bot, y_bottom);
+
+                park_corridor.right_far = cv::Point(crx_far, y1);
+                park_corridor.right_mid = cv::Point(crx_mid, y2);
+                park_corridor.right_bot = cv::Point(crx_bot, y_bottom);
+                park_corridor.latched   = true;
+
+                std::cout << "[PARK] >>> LATCHED PERSPECTIVE 3-PT SCANLINES: Left [("
+                          << clx_far << "," << y1 << ") -> (" << clx_mid << "," << y2 << ") -> (" << clx_bot << "," << y_bottom
+                          << ")], Right [("
+                          << crx_far << "," << y1 << ") -> (" << crx_mid << "," << y2 << ") -> (" << crx_bot << "," << y_bottom
+                          << ")] <<<\n";
+            }
+
+            // Bỏ qua tất cả các pixel mask nằm ngoài hành lang chéo 3 điểm khi vào bãi đỗ
             cv::Mat active_mask = mask;
             cv::Mat park_mask;
-            if (parking_active) {
+            if (parking_active && park_corridor.latched) {
                 park_mask = mask.clone();
-                if (PARK_SCANLINE_LEFT_X > 0 && PARK_SCANLINE_LEFT_X < park_mask.cols) {
-                    park_mask(cv::Rect(0, 0, PARK_SCANLINE_LEFT_X, park_mask.rows)).setTo(0);
-                }
-                if (PARK_SCANLINE_RIGHT_X > 0 && PARK_SCANLINE_RIGHT_X < park_mask.cols) {
-                    park_mask(cv::Rect(PARK_SCANLINE_RIGHT_X, 0, park_mask.cols - PARK_SCANLINE_RIGHT_X, park_mask.rows)).setTo(0);
+                for (int y = 0; y < park_mask.rows; ++y) {
+                    int xl = std::clamp(park_corridor.get_left_x(y), 0, park_mask.cols);
+                    int xr = std::clamp(park_corridor.get_right_x(y), 0, park_mask.cols);
+                    uchar* ptr = park_mask.ptr<uchar>(y);
+                    if (xl > 0) std::memset(ptr, 0, xl);
+                    if (xr < park_mask.cols) std::memset(ptr + xr, 0, park_mask.cols - xr);
                 }
                 active_mask = park_mask;
             }
-
-            int h = active_mask.rows, w = active_mask.cols;
-            int y1 = static_cast<int>(h * 0.45);
-            int y2 = static_cast<int>(h * 0.65);
-            int y_bottom = h - 1;
 
             const int pref_side = turn_controller.get_preferred_side();
             auto get_mask_boundaries = [&](int y_row, int& lx, int& rx) {
@@ -762,17 +859,17 @@ int main() {
             // Tự động nhận diện vết cắt mask (step/shelf), đo khoảng cách px,
             // né mạnh sang làn đối diện, và KHÓA CỨNG hướng vật cản khi đang chạy ngang hông!
             // -------------------------------------------------------------
-            const bool turn_in_progress = (turn_controller.state == v20::LaneTurnController::State::EXECUTE ||
-                                           turn_controller.state == v20::LaneTurnController::State::SETTLE ||
-                                           turn_controller.is_roundabout_mode);
-            if (!parking_active && !hazard_stop && !turn_in_progress) {
+            const bool turn_active_or_armed = (turn_controller.state != v20::LaneTurnController::State::IDLE) ||
+                                              (dec.active_sign != "NONE") ||
+                                              (handled_sign != "NONE");
+            if (!parking_active && !hazard_stop && !turn_active_or_armed) {
                 obs_res = obstacle_controller.update(
                     active_mask, left_pts, right_pts,
                     lx1, rx1, lx2, rx2, lx_bot, rx_bot,
                     w, dt_loop,
                     previous_out.near_e, previous_out.mid_e, previous_out.far_e
                 );
-            } else if (turn_in_progress || parking_active) {
+            } else {
                 obstacle_controller.reset();
             }
 
@@ -1112,19 +1209,26 @@ int main() {
                 blended.copyTo(overlay, mask);
 
                 // ============================================================
-                // PARKING SCANLINES UI (2 scanline thẳng cố định giới hạn làn bãi đỗ)
+                // PARKING SCANLINES UI (Hành lang chéo 3 điểm mỗi bên theo góc camera)
                 // ============================================================
-                if (parking_active) {
-                    cv::line(overlay, cv::Point(PARK_SCANLINE_LEFT_X, 0), cv::Point(PARK_SCANLINE_LEFT_X, frame.rows - 1),
-                             cv::Scalar(0, 140, 255), 2, cv::LINE_AA);
-                    cv::line(overlay, cv::Point(PARK_SCANLINE_RIGHT_X, 0), cv::Point(PARK_SCANLINE_RIGHT_X, frame.rows - 1),
-                             cv::Scalar(0, 140, 255), 2, cv::LINE_AA);
-                    cv::putText(overlay, cv::format("PARK SCAN L (X=%d)", PARK_SCANLINE_LEFT_X),
-                                cv::Point(PARK_SCANLINE_LEFT_X + 5, 45),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 140, 255), 1, cv::LINE_AA);
-                    cv::putText(overlay, cv::format("PARK SCAN R (X=%d)", PARK_SCANLINE_RIGHT_X),
-                                cv::Point(PARK_SCANLINE_RIGHT_X - 150, 45),
-                                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 140, 255), 1, cv::LINE_AA);
+                if (parking_active && park_corridor.latched) {
+                    // Vẽ 2 đường chéo nối 3 điểm mỗi bên
+                    cv::line(overlay, park_corridor.left_far, park_corridor.left_mid, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+                    cv::line(overlay, park_corridor.left_mid, park_corridor.left_bot, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+                    cv::line(overlay, park_corridor.right_far, park_corridor.right_mid, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+                    cv::line(overlay, park_corridor.right_mid, park_corridor.right_bot, cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+
+                    // Vẽ các điểm mốc 3 tầng (Far, Mid, Bot)
+                    cv::circle(overlay, park_corridor.left_far, 4, cv::Scalar(0, 255, 0), -1);
+                    cv::circle(overlay, park_corridor.left_mid, 4, cv::Scalar(0, 255, 0), -1);
+                    cv::circle(overlay, park_corridor.left_bot, 4, cv::Scalar(0, 255, 0), -1);
+                    cv::circle(overlay, park_corridor.right_far, 4, cv::Scalar(0, 255, 0), -1);
+                    cv::circle(overlay, park_corridor.right_mid, 4, cv::Scalar(0, 255, 0), -1);
+                    cv::circle(overlay, park_corridor.right_bot, 4, cv::Scalar(0, 255, 0), -1);
+
+                    cv::putText(overlay, "PARK CORRIDOR (DIAGONAL 3-PTS)",
+                                cv::Point(std::max(10, park_corridor.left_far.x - 30), 45),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 255, 255), 1, cv::LINE_AA);
                 }
 
                 // ============================================================
