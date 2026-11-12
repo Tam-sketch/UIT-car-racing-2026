@@ -46,7 +46,7 @@
 // CONSTANTS
 // ============================================================
 static const std::string ENGINE_PATH      = "/home/car4/Downloads/road/kga3.engine";
-static const std::string SIGN_ENGINE_PATH = "/home/car4/Downloads/sign/huy_sign.engine";
+static const std::string SIGN_ENGINE_PATH = "/home/car4/Downloads/sign/signv4.engine";
 
 // Speed / control
 static constexpr float MAX_SPEED_CMS         = 30.0f;
@@ -78,6 +78,7 @@ namespace sign_class {
     inline constexpr int TRAFFIC_LIGHT      = 5;
     inline constexpr int TURN_LEFT          = 6;
     inline constexpr int TURN_RIGHT         = 7;
+    inline constexpr int WALKING_PERSON     = 8;   // ← NEW
 }
 
 // Traffic light HSV
@@ -426,6 +427,7 @@ static const char* SignName(int id) {
         case TRAFFIC_LIGHT:      return "traffic_light";
         case TURN_LEFT:          return "turn_left";
         case TURN_RIGHT:         return "turn_right";
+        case WALKING_PERSON:     return "walking_person";   // ← NEW
         default:                 return "-";
     }
 }
@@ -590,7 +592,7 @@ int main() {
             for (auto& d : cachedSigns) {
                 if (d.confidence < SIGN_CONF_THRESH) continue;
 
-                if (d.name == "walking_person" || d.class_id == 8) {
+                if (d.name == "walking_person" || d.class_id == sign_class::WALKING_PERSON) {
                     last_person_seen_time = elapsed_total;
                     continue;
                 }
