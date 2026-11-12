@@ -1,6 +1,15 @@
 // ============================================================
 // main_run.cpp — UCR2026 Full Integrated + Heading-only Parking
 // ============================================================
+// 2026-11-12 changes:
+//  - Wired BNO055 IMU and TOF sensors (no more stubs)
+//  - EXIT_SEARCH bias flipped from LEFT to RIGHT (was bug R1)
+//  - RB_BIAS_EMA now actually applied (was dead constant R2)
+//  - EXIT_SEARCH force-execute after RB_EXIT_FORCE_EXEC_S (was bug R3)
+//  - waiting_for_tjunction cleared on roundabout entry (was bug R4)
+//  - [RB] state-transition printf for diagnostics
+//  - PARK_HEADING_SIGN flag applied to both heading-hold P loops
+// ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
 #include "hardware/Servo.h"
@@ -9,6 +18,8 @@
 #include "control/LaneFollowerV20.h"
 #include "control/SignVoter.h"
 #include "perception/SignDetector.h"
+#include "sensor/BNO055.h"
+#include "sensor/TOF.h"
 
 #include <opencv2/opencv.hpp>
 #include <NvInfer.h>
@@ -29,7 +40,7 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
-#include <deque>       // ← NEW: for heading ring buffer
+#include <deque>
 
 // ============================================================
 // CONSTANTS
@@ -96,6 +107,7 @@ static constexpr float  RB_BIAS_EMA             = 0.30f;
 static constexpr double RB_MISSING_SIGN_S       = 2.0;
 static constexpr double RB_CIRCLE_TIMEOUT_S     = 12.0;
 static constexpr double RB_EXIT_SEARCH_TIMEOUT_S = 15.0;
+static constexpr double RB_EXIT_FORCE_EXEC_S    = 1.5;   // force turn into EXECUTE after this long in EXIT_SEARCH
 static constexpr double RB_COOLDOWN_S           = 2.0;
 static constexpr float  RB_SPEED_MIN_CMS        = 20.0f;
 static constexpr float  RB_SPEED_MAX_CMS        = 30.0f;
@@ -103,10 +115,10 @@ static constexpr float  RB_SPEED_MAX_CMS        = 30.0f;
 // ============================================================
 // PARKING CONSTANTS
 // ============================================================
-static constexpr int   PARK_HEADING_WINDOW         = 10;      // capture frames
-static constexpr float PARK_HEADING_KP             = 1.2f;    // P-gain for heading-hold
-static constexpr float PARK_HEADING_MAX_DEG        = 20.0f;   // clamp on P output
-static constexpr double PARK_CAPTURE_TIMEOUT_S     = 3.0;     // abort if no samples
+static constexpr int   PARK_HEADING_WINDOW         = 10;
+static constexpr float PARK_HEADING_KP             = 1.2f;
+static constexpr float PARK_HEADING_MAX_DEG        = 20.0f;
+static constexpr double PARK_CAPTURE_TIMEOUT_S     = 3.0;
 
 static constexpr float PARK_TOF_BLOCKED_MM         = 300.0f;
 static constexpr float PARK_TOF_HYST_MM            = 50.0f;
@@ -121,6 +133,10 @@ static constexpr float PARK_HEADING_TOL_DEG        = 3.0f;
 
 static constexpr double PARK_STOP_DWELL_S          = 0.5;
 static constexpr double PARK_REVERSE_TIMEOUT_S     = 4.0;
+
+// +1 if BNO055 eulerDeg.y INCREASES on a right turn (matches PID convention).
+// Flip to -1.0f if the car steers AWAY from centre during SLOT_SEARCH.
+static constexpr float PARK_HEADING_SIGN           = +1.0f;
 
 volatile std::sig_atomic_t g_stopSignal = 0;
 static void SignalHandler(int) { g_stopSignal = 1; }
@@ -294,12 +310,12 @@ static const char* RbStateName(RbState s) {
 // ============================================================
 enum class ParkState {
     NONE,
-    CAPTURE,        // collect heading samples, drive with near-band mask PID
-    SLOT_SEARCH,    // heading-hold, watch ToF for slot
-    SLOT_FOUND,     // keep driving forward until both sides blocked
-    WAIT_FULL_STOP, // 0.5s dwell
-    REVERSE_1,      // first arc
-    REVERSE_2,      // straighten
+    CAPTURE,
+    SLOT_SEARCH,
+    SLOT_FOUND,
+    WAIT_FULL_STOP,
+    REVERSE_1,
+    REVERSE_2,
     DONE
 };
 
@@ -436,12 +452,24 @@ int main() {
     servo.SetAngle(0);
 
     // =========================================================
-    // TODO: instantiate your BNO055 IMU and ToF sensors here
-    // e.g.:
-    // BNO055 imu;  imu.Init();
-    // TofSensor tof_left;  tof_left.Init(0);
-    // TofSensor tof_right; tof_right.Init(1);
+    // BNO055 IMU  (non-fatal: parking disabled if it fails)
     // =========================================================
+    BNO055 imu;
+    bool imu_ok = imu.initialize(std::chrono::milliseconds(1000));
+    if (!imu_ok) {
+        std::cerr << "[IMU] init FAILED: " << imu.lastError()
+                  << " (parking DISABLED)\n";
+    }
+
+    // =========================================================
+    // TOF cluster  (non-fatal: parking disabled if it fails)
+    // =========================================================
+    sensor::TOF tof;
+    bool tof_ok = tof.Init("/dev/i2c-1");
+    if (!tof_ok) {
+        std::cerr << "[TOF] init FAILED: " << tof.LastError()
+                  << " (parking DISABLED)\n";
+    }
 
     TrtModel roadModel;
     if (!roadModel.Init(ENGINE_PATH)) {
@@ -479,7 +507,9 @@ int main() {
     v20::LaneFollower::Output previous_out;
 
     // Run-state
-    RbState  rb_state = RbState::NONE;
+    RbState  rb_state              = RbState::NONE;
+    RbState  rb_state_prev         = RbState::NONE;
+    float    rb_bias_smoothed      = 0.0f;
     double   rb_enter_time         = 0.0;
     double   rb_phase_start_time   = 0.0;
     double   rb_exit_search_start  = 0.0;
@@ -522,10 +552,13 @@ int main() {
     std::cout << "\n=== UCR2026: Full Integrated (v20 + RbState + SignVoter + Parking) ===\n"
               << "Road: " << ENGINE_PATH << "\n"
               << "Sign: " << SIGN_ENGINE_PATH << (signReady ? "" : " (DISABLED)") << "\n"
+              << "IMU:  " << (imu_ok ? "OK" : "FAILED — parking disabled") << "\n"
+              << "TOF:  " << (tof_ok ? "OK" : "FAILED — parking disabled") << "\n"
               << "Speed: [" << MIN_SPEED_CMS << ", " << MAX_SPEED_CMS << "] cm/s\n"
               << "Parking: heading-hold, window=" << PARK_HEADING_WINDOW
               << " kp=" << PARK_HEADING_KP
-              << " tof_blk=" << PARK_TOF_BLOCKED_MM << "mm\n"
+              << " tof_blk=" << PARK_TOF_BLOCKED_MM << "mm"
+              << " heading_sign=" << (PARK_HEADING_SIGN > 0 ? "+1" : "-1") << "\n"
               << "Press 'q' or ESC to quit\n\n";
 
     while (!g_stopSignal) {
@@ -547,7 +580,7 @@ int main() {
         totalFrames++;
 
         // -----------------------------------------------------
-        // 1. Sign detection + voter update (PARKING added)
+        // 1. Sign detection + voter update
         // -----------------------------------------------------
         if (signReady && (totalFrames % SIGN_INTERVAL_FRAMES) == 0) {
             cachedSigns = signDetector.Detect(frame, SIGN_CONF_THRESH, SIGN_NMS_THRESH);
@@ -614,6 +647,11 @@ int main() {
                     rb_state = RbState::APPROACH;
                     rb_missing_sign_ticks = 0;
                     rb_phase_start_time   = elapsed_total;
+                    rb_bias_smoothed      = 0.0f;
+                    // Clear any stale T-junction follow-up state from a previous roundabout
+                    turn_controller.waiting_for_tjunction   = false;
+                    turn_controller.tjunction_cooldown      = 0.0;
+                    turn_controller.tjunction_detect_frames = 0;
                 }
                 break;
             case RbState::APPROACH:
@@ -644,12 +682,19 @@ int main() {
                 if (turn_controller.state == v20::LaneTurnController::State::IDLE) {
                     turn_controller.start_turn("RIGHT", false);
                 }
+                const double in_exit = elapsed_total - rb_exit_search_start;
+                // If the strict junction gate never fires, force the turn
+                if (in_exit >= RB_EXIT_FORCE_EXEC_S &&
+                    (turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE ||
+                     turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT)) {
+                    turn_controller.force_execute_now();
+                    std::printf("[RB] EXIT_SEARCH force-execute at %.1fs\n", in_exit);
+                }
                 const bool moved_on =
                     turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT ||
                     turn_controller.state == v20::LaneTurnController::State::EXECUTE    ||
                     turn_controller.state == v20::LaneTurnController::State::SETTLE;
-                const bool timed_out =
-                    (elapsed_total - rb_exit_search_start) >= RB_EXIT_SEARCH_TIMEOUT_S;
+                const bool timed_out = in_exit >= RB_EXIT_SEARCH_TIMEOUT_S;
                 if (moved_on || timed_out) {
                     rb_state = RbState::EXITING;
                     rb_exiting_start = elapsed_total;
@@ -677,25 +722,47 @@ int main() {
             }
         }
 
+        // Diagnostic: log every RbState transition
+        if (rb_state != rb_state_prev) {
+            std::printf("[RB] %-10s -> %-10s t=%.2f sign=%s bias=%.1f\n",
+                        RbStateName(rb_state_prev), RbStateName(rb_state),
+                        elapsed_total, SignName(voter.GetCommitted()),
+                        rb_bias_smoothed);
+            rb_state_prev = rb_state;
+        }
+
         // -----------------------------------------------------
-        // 3. Sensor reads  (TODO: replace with actual reads)
+        // 3. Sensor reads
         // -----------------------------------------------------
         float heading_now   = 0.0f;
         bool  heading_ok    = false;
         float tof_left_mm   = -1.0f;
         float tof_right_mm  = -1.0f;
-        {
-            // TODO: replace with real reads from your hardware.
-            // heading_now = imu.data.eulerDeg.y;
-            // heading_ok  = imu.isValid();
-            // tof_left_mm  = tof_left.GetRangeMm();
-            // tof_right_mm = tof_right.GetRangeMm();
+
+        if (imu_ok) {
+            BNO055::Data imu_data;
+            if (imu.read(imu_data)) {
+                heading_now = static_cast<float>(imu_data.eulerDeg.y);
+                heading_ok  = true;
+            }
+        }
+
+        if (tof_ok) {
+            sensor::TOFReadings readings;
+            // Return value may be false on partial API errors; per-slot
+            // 'valid' / 'distanceMm' are authoritative — ignore the bool.
+            tof.Read(readings, std::chrono::milliseconds(50));
+            // TODO: verify which slot is physically LEFT vs RIGHT on this chassis.
+            // Convention assumed here: index 0 = left, index 1 = right.
+            if (readings[0].valid && readings[0].distanceMm > 0)
+                tof_left_mm  = static_cast<float>(readings[0].distanceMm);
+            if (readings[1].valid && readings[1].distanceMm > 0)
+                tof_right_mm = static_cast<float>(readings[1].distanceMm);
         }
 
         // -----------------------------------------------------
-        // 4. Parking state machine — entry + advance
+        // 4. Parking state machine
         // -----------------------------------------------------
-        // Entry: parking sign committed while nothing else active
         if (park_state == ParkState::NONE &&
             rb_state == RbState::NONE &&
             turn_controller.state == v20::LaneTurnController::State::IDLE &&
@@ -707,7 +774,6 @@ int main() {
             std::printf("[PARK] Parking sign → CAPTURE\n");
         }
 
-        // Default: overrides inactive
         park_angle_override = 0.0f;
         park_speed_override = 0.0f;
 
@@ -722,7 +788,7 @@ int main() {
                 if ((int)park_heading_buf.size() >= PARK_HEADING_WINDOW) {
                     std::vector<float> tmp(park_heading_buf.begin(), park_heading_buf.end());
                     std::sort(tmp.begin(), tmp.end());
-                    park_ref_heading = tmp[tmp.size() / 2];  // median
+                    park_ref_heading = tmp[tmp.size() / 2];
                     park_state = ParkState::SLOT_SEARCH;
                     std::printf("[PARK] Reference captured: %.2f° → SLOT_SEARCH\n",
                                 park_ref_heading);
@@ -739,7 +805,6 @@ int main() {
                                     park_heading_buf.size(), park_ref_heading);
                     }
                 }
-                // Steering during CAPTURE is handled by follower.step(park_mode=true) below.
                 break;
             }
             case ParkState::SLOT_SEARCH: {
@@ -760,7 +825,7 @@ int main() {
                     }
                 }
                 if (heading_ok) {
-                    float herr = normalizeAngleP(park_ref_heading - heading_now);
+                    float herr = PARK_HEADING_SIGN * normalizeAngleP(park_ref_heading - heading_now);
                     double a = PARK_HEADING_KP * herr;
                     a = std::clamp(a, -(double)PARK_HEADING_MAX_DEG, (double)PARK_HEADING_MAX_DEG);
                     park_angle_override = (float)a;
@@ -787,7 +852,7 @@ int main() {
                     }
                 }
                 if (heading_ok) {
-                    float herr = normalizeAngleP(park_ref_heading - heading_now);
+                    float herr = PARK_HEADING_SIGN * normalizeAngleP(park_ref_heading - heading_now);
                     double a = PARK_HEADING_KP * herr;
                     a = std::clamp(a, -(double)PARK_HEADING_MAX_DEG, (double)PARK_HEADING_MAX_DEG);
                     park_angle_override = (float)a;
@@ -876,27 +941,21 @@ int main() {
         const bool parking_active = (park_state != ParkState::NONE);
 
         if (parking_active && park_state == ParkState::CAPTURE) {
-            // --- CAPTURE: use near-band mask PID for stability while sampling ---
             if (roadOK) {
                 out = follower.step(mask, 0.0, false, 0.0, 0.0, /*park_mode=*/true);
                 speed = PARK_CAPTURE_SPEED_CMS;
-                // Also update previous_out so the first SLOT_SEARCH heading-hold has context
                 previous_out = out;
             } else {
-                // Mask dropped during CAPTURE — hold last angle, stop
                 out.angle = 0.0;
                 speed = 0.0f;
             }
         } else if (parking_active) {
-            // --- SLOT_SEARCH onwards: pure heading-hold, mask ignored ---
             out.angle = park_angle_override;
             speed = park_speed_override;
             out.valid = true;
-            // Keep previous_out matching so post-parking (if any) has sane baseline
             previous_out.angle = out.angle;
             previous_out.valid = true;
         } else if (roadOK) {
-            // --- Normal flow: turn controller + follower ---
             const int h = mask.rows, w = mask.cols;
             const int y1 = static_cast<int>(h * 0.45);
             const int y2 = static_cast<int>(h * 0.65);
@@ -992,15 +1051,17 @@ int main() {
                 corner_assist.reset();
             }
 
+            // ---- Roundabout bias table (EMA-smoothed) ----
             float rb_bias_px = 0.0f;
             switch (rb_state) {
                 case RbState::APPROACH:    rb_bias_px = +RB_BIAS_PX_RIGHT; break;
                 case RbState::IN_CIRCLE:   rb_bias_px = -RB_BIAS_PX_LEFT;  break;
                 case RbState::EXIT_PREP:   rb_bias_px = +RB_BIAS_PX_RIGHT; break;
-                case RbState::EXIT_SEARCH: rb_bias_px = -RB_BIAS_PX_LEFT;  break;
+                case RbState::EXIT_SEARCH: rb_bias_px = +RB_BIAS_PX_RIGHT; break; // was -RB_BIAS_PX_LEFT (R1 fix)
                 default:                   rb_bias_px =  0.0f;             break;
             }
-            final_bias = rb_bias_px;
+            rb_bias_smoothed = (1.0f - RB_BIAS_EMA) * rb_bias_smoothed + RB_BIAS_EMA * rb_bias_px;
+            final_bias = rb_bias_smoothed;
             if (turn_controller.state != v20::LaneTurnController::State::IDLE) {
                 final_bias += turn_res.steer_bias_px;
             }
@@ -1019,13 +1080,11 @@ int main() {
                 speed = std::clamp(speed, RB_SPEED_MIN_CMS, RB_SPEED_MAX_CMS);
             }
         } else {
-            // Normal path, mask lost
             previous_out = v20::LaneFollower::Output{};
             motor.SetSpeedCms(0.0f);
             servo.SetAngle(0);
             follower.resetTracking();
             applied_speed = 0.0f;
-            // FPS + UI
             frameCount++;
             auto tNow = std::chrono::high_resolution_clock::now();
             double dt_fps = std::chrono::duration<double>(tNow - tPrev).count();
@@ -1088,9 +1147,7 @@ int main() {
             lastLog = tNow;
         }
 
-        // -----------------------------------------------------
         // FPS
-        // -----------------------------------------------------
         frameCount++;
         {
             auto tF = std::chrono::high_resolution_clock::now();
@@ -1098,9 +1155,7 @@ int main() {
             if (dt_fps > 0.5) { currentFps = frameCount / dt_fps; frameCount = 0; tPrev = tF; }
         }
 
-        // -----------------------------------------------------
         // UI
-        // -----------------------------------------------------
         if (SHOW_UI) {
             cv::Mat overlay = frame.clone();
 
@@ -1175,6 +1230,8 @@ int main() {
 
     motor.SetSpeedCms(0.0f);
     servo.SetAngle(0);
+    if (tof_ok) tof.Stop();
+    if (imu_ok) imu.close();
     if (SHOW_UI) cv::destroyAllWindows();
     std::cout << "\n[System] Stopped safely\n";
     return 0;

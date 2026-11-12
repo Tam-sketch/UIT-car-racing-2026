@@ -541,6 +541,21 @@ public:
         }
     }
 
+    // Bypass WAIT_CURVE / WAIT_STRAIGHT when the junction gate never fires
+    // (roundabout exit on this map: segmentation doesn't mask far enough ahead).
+    void force_execute_now() {
+        if (state != State::WAIT_CURVE && state != State::WAIT_STRAIGHT) return;
+        const double dir_sign = (direction == "LEFT") ? -1.0 : 1.0;
+        state              = State::EXECUTE;
+        turn_elapsed       = 0.0;
+        aligned_frames     = 0;
+        far_swept          = false;
+        straight_frames    = 0;
+        turn_bias_current  = dir_sign * TURN_BIAS_PX;
+        turn_floor_current = 0.0;   // EXECUTE state ramps up smoothly from here
+        std::cout << "[TURN] FORCE EXECUTE (dir=" << direction << ")\n";
+    }
+
     struct TurnResult {
         State state;
         double steer_bias_px;
