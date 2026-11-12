@@ -1,26 +1,5 @@
 // ============================================================
-// main_run.cpp — UCR2026 Full Integrated
-//
-// Merge of three working pieces:
-//   • v20::LaneFollower          — lane follow (LaneFollowerV20.h)
-//   • v20::LaneTurnController    — turn sequencing (regular turns)
-//   • v20::CornerAssist          — 90° unmarked corners
-//   • RbState (V6.6)             — roundabout state machine (bias-only)
-//   • SignVoter (V6.6)           — sign commit + timeout
-//   • SignDetector (v2)          — 8-class YOLO detector
-//
-// Pipeline per frame:
-//   camera → TrtModel.Predict → mask
-//   SignDetector → SignVoter → SignCommit
-//   RbState: voter==roundabout → APPROACH → IN_CIRCLE → EXIT_PREP →
-//            EXIT_SEARCH (commits a RIGHT turn via LaneTurnController)
-//            → EXITING → NONE
-//   If rb_state==NONE and SignCommit is a turn class and LaneTurnController
-//   is IDLE, trigger LaneTurnController.start_turn(dir)
-//   LaneTurnController.update → TurnResult (steer_bias_px, floor, cap)
-//   CornerAssist.update (only if rb_state==NONE && turn_ctrl IDLE)
-//   v20::LaneFollower.step(mask, bias, execTurn, floor, cap)
-//   v20 angle → servo
+// main_run.cpp — UCR2026 Full Integrated + Heading-only Parking
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -50,6 +29,7 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <deque>       // ← NEW: for heading ring buffer
 
 // ============================================================
 // CONSTANTS
@@ -66,10 +46,10 @@ static constexpr int   SIGN_INTERVAL_FRAMES  = 1;
 static constexpr float SIGN_CONF_THRESH      = 0.70f;
 static constexpr float SIGN_NMS_THRESH       = 0.45f;
 static constexpr bool  DA_CHANNEL            = 1;
-static constexpr int   MAX_STEER_DEG         = 50;      // legacy fallback only
-static constexpr bool  INVERT_STEER          = true;    // legacy fallback only
+static constexpr int   MAX_STEER_DEG         = 50;
+static constexpr bool  INVERT_STEER          = true;
 
-// Servo calibration (V6.6 / Log 12 measured)
+// Servo calibration
 static constexpr float SERVO_LEFT_SLOPE    = 0.96f;
 static constexpr float SERVO_LEFT_OFFSET   = -6.2f;
 static constexpr float SERVO_RIGHT_SLOPE   = 0.71f;
@@ -77,7 +57,7 @@ static constexpr float SERVO_RIGHT_OFFSET  = 2.5f;
 static constexpr float MAX_REAL_ANGLE_DEG  = 30.0f;
 static constexpr int   MAX_SERVO_CMD       = 55;
 
-// Sign class indices (match SignDetector::CLASS_NAMES)
+// Sign class indices
 namespace sign_class {
     inline constexpr int CONSTRUCTION_AHEAD = 0;
     inline constexpr int NO_LEFT            = 1;
@@ -89,7 +69,7 @@ namespace sign_class {
     inline constexpr int TURN_RIGHT         = 7;
 }
 
-// Traffic light HSV classifier (V6.6)
+// Traffic light HSV
 namespace tl {
     inline constexpr int RED_H1_LO = 0,   RED_H1_HI = 10;
     inline constexpr int RED_H2_LO = 170, RED_H2_HI = 180;
@@ -101,33 +81,52 @@ namespace tl {
     inline constexpr float ROI_EXPAND   = 1.05f;
 }
 
-// Stop hangovers (seconds)
 static constexpr double PERSON_STOP_HANGOVER_S = 2.0;
 static constexpr double RED_LIGHT_HANGOVER_S   = 1.0;
 
-// Voter
 static constexpr int SIGN_VOTER_ACTIVATE_FRAMES = 2;
-static constexpr int SIGN_VOTER_TIMEOUT_DS      = 30;    // 30 deciseconds = 3.0 s
+static constexpr int SIGN_VOTER_TIMEOUT_DS      = 30;
 
-// Sign re-trigger block after a completed turn (V6.6 handled_sign)
 static constexpr double SIGN_BLOCK_SECONDS      = 4.0;
 
-// Roundabout timings (V6.6 tuned — seconds)
+// Roundabout timings
 static constexpr float  RB_BIAS_PX_RIGHT        = 28.0f;
 static constexpr float  RB_BIAS_PX_LEFT         = 20.0f;
 static constexpr float  RB_BIAS_EMA             = 0.30f;
-static constexpr double RB_MISSING_SIGN_S       = 2.0;   // was 16 ticks
-static constexpr double RB_CIRCLE_TIMEOUT_S     = 12.0;  // was 100 ticks
-static constexpr double RB_EXIT_SEARCH_TIMEOUT_S = 15.0;  // was 40 ticks
-static constexpr double RB_COOLDOWN_S           = 2.0;   // was 20 ticks
+static constexpr double RB_MISSING_SIGN_S       = 2.0;
+static constexpr double RB_CIRCLE_TIMEOUT_S     = 12.0;
+static constexpr double RB_EXIT_SEARCH_TIMEOUT_S = 15.0;
+static constexpr double RB_COOLDOWN_S           = 2.0;
 static constexpr float  RB_SPEED_MIN_CMS        = 20.0f;
 static constexpr float  RB_SPEED_MAX_CMS        = 30.0f;
+
+// ============================================================
+// PARKING CONSTANTS
+// ============================================================
+static constexpr int   PARK_HEADING_WINDOW         = 10;      // capture frames
+static constexpr float PARK_HEADING_KP             = 1.2f;    // P-gain for heading-hold
+static constexpr float PARK_HEADING_MAX_DEG        = 20.0f;   // clamp on P output
+static constexpr double PARK_CAPTURE_TIMEOUT_S     = 3.0;     // abort if no samples
+
+static constexpr float PARK_TOF_BLOCKED_MM         = 300.0f;
+static constexpr float PARK_TOF_HYST_MM            = 50.0f;
+
+static constexpr float PARK_CAPTURE_SPEED_CMS      = 15.0f;
+static constexpr float PARK_APPROACH_SPEED_CMS     = 10.0f;
+static constexpr float PARK_REVERSE_SPEED_CMS      = -8.0f;
+
+static constexpr float PARK_REVERSE_STEER_DEG      = 28.0f;
+static constexpr float PARK_TARGET_HEADING_DEG     = 45.0f;
+static constexpr float PARK_HEADING_TOL_DEG        = 3.0f;
+
+static constexpr double PARK_STOP_DWELL_S          = 0.5;
+static constexpr double PARK_REVERSE_TIMEOUT_S     = 4.0;
 
 volatile std::sig_atomic_t g_stopSignal = 0;
 static void SignalHandler(int) { g_stopSignal = 1; }
 
 // ============================================================
-// TRT MODEL (from main_run.cpp)
+// TRT MODEL
 // ============================================================
 static void CheckCuda(cudaError_t s, const char* op) {
     if (s != cudaSuccess)
@@ -273,7 +272,7 @@ private:
 };
 
 // ============================================================
-// ROUNDABOUT STATE (V6.6)
+// ROUNDABOUT STATE
 // ============================================================
 enum class RbState {
     NONE, APPROACH, IN_CIRCLE, EXIT_PREP, EXIT_SEARCH, EXITING
@@ -291,11 +290,44 @@ static const char* RbStateName(RbState s) {
 }
 
 // ============================================================
-// SIGN COMMIT (replaces v21::SignState)
+// PARKING STATE
+// ============================================================
+enum class ParkState {
+    NONE,
+    CAPTURE,        // collect heading samples, drive with near-band mask PID
+    SLOT_SEARCH,    // heading-hold, watch ToF for slot
+    SLOT_FOUND,     // keep driving forward until both sides blocked
+    WAIT_FULL_STOP, // 0.5s dwell
+    REVERSE_1,      // first arc
+    REVERSE_2,      // straighten
+    DONE
+};
+
+static const char* ParkStateName(ParkState s) {
+    switch (s) {
+        case ParkState::CAPTURE:        return "CAPTURE";
+        case ParkState::SLOT_SEARCH:    return "SLOT_SEARCH";
+        case ParkState::SLOT_FOUND:     return "SLOT_FOUND";
+        case ParkState::WAIT_FULL_STOP: return "STOP";
+        case ParkState::REVERSE_1:      return "REV_1";
+        case ParkState::REVERSE_2:      return "REV_2";
+        case ParkState::DONE:           return "DONE";
+        default:                        return "NONE";
+    }
+}
+
+static float normalizeAngleP(float a) {
+    while (a >  180.0f) a -= 360.0f;
+    while (a < -180.0f) a += 360.0f;
+    return a;
+}
+
+// ============================================================
+// SIGN COMMIT
 // ============================================================
 struct SignCommit {
     bool active   = false;
-    int  side     = 0;     // -1 left, +1 right, 0 none
+    int  side     = 0;
     int  class_id = -1;
 };
 
@@ -309,8 +341,6 @@ static SignCommit MakeSignCommit(int committed) {
         case TURN_RIGHT: s.active = true; s.side = +1; break;
         case NO_LEFT:    s.active = true; s.side = +1; break;
         case NO_RIGHT:   s.active = true; s.side = -1; break;
-        // CONSTRUCTION_AHEAD was already remapped to TURN_LEFT in main loop
-        // ROUNDABOUT, PARKING, TRAFFIC_LIGHT → inactive
         default:         s.active = false; s.side = 0; break;
     }
     return s;
@@ -361,7 +391,7 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
 }
 
 // ============================================================
-// SERVO CALIBRATION (V6.6)
+// SERVO CALIBRATION
 // ============================================================
 static float RealAngleToServo(float real_deg) {
     if (real_deg > 0.0f) return (real_deg - SERVO_LEFT_OFFSET) / SERVO_LEFT_SLOPE;
@@ -405,6 +435,14 @@ int main() {
     motor.SetSpeedCms(0.0f);
     servo.SetAngle(0);
 
+    // =========================================================
+    // TODO: instantiate your BNO055 IMU and ToF sensors here
+    // e.g.:
+    // BNO055 imu;  imu.Init();
+    // TofSensor tof_left;  tof_left.Init(0);
+    // TofSensor tof_right; tof_right.Init(1);
+    // =========================================================
+
     TrtModel roadModel;
     if (!roadModel.Init(ENGINE_PATH)) {
         std::cerr << "Road Model init failed\n"; return -1;
@@ -413,15 +451,13 @@ int main() {
     SignDetector signDetector;
     bool signReady = signDetector.Init(SIGN_ENGINE_PATH);
     if (!signReady) {
-        std::cerr << "[Main] Sign Detector init failed — turns/roundabout DISABLED\n";
+        std::cerr << "[Main] Sign Detector init failed — turns/roundabout/parking DISABLED\n";
     }
 
-    // Sign voter (V6.6) — tickIdx passed in deciseconds
     ucr::control::SignVoter voter(
         SIGN_VOTER_ACTIVATE_FRAMES,
         SIGN_VOTER_TIMEOUT_DS);
 
-    // v20 core
     v20::Config cfg;
     cfg.max_speed          = MAX_SPEED_CMS;
     cfg.min_speed          = MIN_SPEED_CMS;
@@ -456,6 +492,20 @@ int main() {
     double   last_red_seen_time    = -1e9;
     double   sign_block_until_time = -1.0;
 
+    // Parking state
+    ParkState park_state              = ParkState::NONE;
+    std::deque<float> park_heading_buf;
+    float     park_ref_heading        = 0.0f;
+    float     park_heading_0          = 0.0f;
+    int       park_side               = 0;
+    bool      left_blocked_h          = false;
+    bool      right_blocked_h         = false;
+    double    park_capture_elapsed    = 0.0;
+    double    park_stop_dwell_elapsed = 0.0;
+    double    park_reverse_elapsed    = 0.0;
+    float     park_angle_override     = 0.0f;
+    float     park_speed_override     = 0.0f;
+
     long     tickIdx          = 0;
     long     totalFrames      = 0;
     double   currentFps       = 0.0;
@@ -469,14 +519,13 @@ int main() {
     cv::Mat frame, mask;
     std::vector<SignObject> cachedSigns;
 
-    std::cout << "\n=== UCR2026: Full Integrated (v20 + RbState + SignVoter) ===\n"
+    std::cout << "\n=== UCR2026: Full Integrated (v20 + RbState + SignVoter + Parking) ===\n"
               << "Road: " << ENGINE_PATH << "\n"
               << "Sign: " << SIGN_ENGINE_PATH << (signReady ? "" : " (DISABLED)") << "\n"
               << "Speed: [" << MIN_SPEED_CMS << ", " << MAX_SPEED_CMS << "] cm/s\n"
-              << "Roundabout: bias R=" << RB_BIAS_PX_RIGHT
-              << " L=" << RB_BIAS_PX_LEFT
-              << " | missing_sign=" << RB_MISSING_SIGN_S << "s"
-              << " circle_timeout=" << RB_CIRCLE_TIMEOUT_S << "s\n"
+              << "Parking: heading-hold, window=" << PARK_HEADING_WINDOW
+              << " kp=" << PARK_HEADING_KP
+              << " tof_blk=" << PARK_TOF_BLOCKED_MM << "mm\n"
               << "Press 'q' or ESC to quit\n\n";
 
     while (!g_stopSignal) {
@@ -493,12 +542,12 @@ int main() {
         double dt_loop = std::chrono::duration<double>(tNowLoop - tPrevLoop).count();
         tPrevLoop = tNowLoop;
         if (dt_loop <= 0.0) dt_loop = 1.0 / 30.0;
-        if (dt_loop > 1.0) dt_loop = 1.0;   // clamp long stalls
+        if (dt_loop > 1.0)  dt_loop = 1.0;
         elapsed_total += dt_loop;
         totalFrames++;
 
         // -----------------------------------------------------
-        // 1. Sign detection + voter update
+        // 1. Sign detection + voter update (PARKING added)
         // -----------------------------------------------------
         if (signReady && (totalFrames % SIGN_INTERVAL_FRAMES) == 0) {
             cachedSigns = signDetector.Detect(frame, SIGN_CONF_THRESH, SIGN_NMS_THRESH);
@@ -508,12 +557,10 @@ int main() {
             for (auto& d : cachedSigns) {
                 if (d.confidence < SIGN_CONF_THRESH) continue;
 
-                // walking_person (defensive — not in current 8-class detector)
                 if (d.name == "walking_person" || d.class_id == 8) {
                     last_person_seen_time = elapsed_total;
                     continue;
                 }
-                // traffic_light
                 if (d.name == "traffic_light" || d.class_id == sign_class::TRAFFIC_LIGHT) {
                     if (ClassifyTrafficLight(frame, d.box) == LightColor::RED)
                         last_red_seen_time = elapsed_total;
@@ -521,20 +568,18 @@ int main() {
                         last_red_seen_time = -1e9;
                     continue;
                 }
-                // Remap construction_ahead → turn_left (V6.6)
                 int cls = d.class_id;
                 if (cls == sign_class::CONSTRUCTION_AHEAD) cls = sign_class::TURN_LEFT;
 
-                // Feed only turn-class + roundabout to the voter
-                if (cls == sign_class::TURN_LEFT  ||
-                    cls == sign_class::TURN_RIGHT ||
-                    cls == sign_class::NO_LEFT    ||
-                    cls == sign_class::NO_RIGHT   ||
-                    cls == sign_class::ROUNDABOUT) {
+                if (cls == sign_class::TURN_LEFT   ||
+                    cls == sign_class::TURN_RIGHT  ||
+                    cls == sign_class::NO_LEFT     ||
+                    cls == sign_class::NO_RIGHT    ||
+                    cls == sign_class::ROUNDABOUT  ||
+                    cls == sign_class::PARKING) {
                     classIds.push_back(cls);
                 }
             }
-            // tickIdx in deciseconds
             uint32_t ds = static_cast<uint32_t>(elapsed_total * 10.0);
             voter.Update(classIds, ds);
         }
@@ -555,7 +600,6 @@ int main() {
         const bool rb_committed =
             (voter.GetCommitted() == sign_class::ROUNDABOUT);
 
-        // Missing-sign accumulator (only used in APPROACH / EXIT_PREP)
         if (rb_state == RbState::APPROACH || rb_state == RbState::EXIT_PREP) {
             if (rb_visible_now) rb_missing_sign_ticks = 0;
             else                ++rb_missing_sign_ticks;
@@ -572,15 +616,13 @@ int main() {
                     rb_phase_start_time   = elapsed_total;
                 }
                 break;
-
             case RbState::APPROACH:
                 if (rb_missing_sign_ticks * dt_loop >= RB_MISSING_SIGN_S) {
                     rb_state = RbState::IN_CIRCLE;
-                    rb_enter_time      = elapsed_total;
+                    rb_enter_time       = elapsed_total;
                     rb_phase_start_time = elapsed_total;
                 }
                 break;
-
             case RbState::IN_CIRCLE: {
                 const bool timeout = (elapsed_total - rb_enter_time) >= RB_CIRCLE_TIMEOUT_S;
                 const bool rb_seen_again = rb_committed && rb_visible_now;
@@ -591,7 +633,6 @@ int main() {
                 }
                 break;
             }
-
             case RbState::EXIT_PREP:
                 if (rb_missing_sign_ticks * dt_loop >= RB_MISSING_SIGN_S) {
                     rb_state = RbState::EXIT_SEARCH;
@@ -599,9 +640,7 @@ int main() {
                     rb_phase_start_time  = elapsed_total;
                 }
                 break;
-
             case RbState::EXIT_SEARCH: {
-                // Trigger a RIGHT turn via turn_controller if not already running
                 if (turn_controller.state == v20::LaneTurnController::State::IDLE) {
                     turn_controller.start_turn("RIGHT", false);
                 }
@@ -618,7 +657,6 @@ int main() {
                 }
                 break;
             }
-
             case RbState::EXITING: {
                 const bool turn_done =
                     turn_controller.state == v20::LaneTurnController::State::IDLE;
@@ -626,14 +664,12 @@ int main() {
                     (elapsed_total - rb_exiting_start) >= RB_CIRCLE_TIMEOUT_S;
                 if (turn_done || safety_timeout) {
                     if (safety_timeout && !turn_done) {
-                        // Force-reset a stuck turn
                         turn_controller = v20::LaneTurnController{};
                         corner_assist.reset();
                     }
                     rb_state = RbState::NONE;
                     rb_cooldown_until = elapsed_total + RB_COOLDOWN_S;
                     voter.Reset();
-                    // Arm T-junction auto-detection after roundabout (V20 feature)
                     turn_controller.waiting_for_tjunction = true;
                     turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
                 }
@@ -642,22 +678,183 @@ int main() {
         }
 
         // -----------------------------------------------------
-        // 3. Build SignCommit + Rb bias
+        // 3. Sensor reads  (TODO: replace with actual reads)
         // -----------------------------------------------------
-        SignCommit signCommit = MakeSignCommit(voter.GetCommitted());
-
-        float rb_bias_px = 0.0f;
-        switch (rb_state) {
-            case RbState::APPROACH:    rb_bias_px = +RB_BIAS_PX_RIGHT; break;
-            case RbState::IN_CIRCLE:   rb_bias_px = -RB_BIAS_PX_LEFT;  break;
-            case RbState::EXIT_PREP:   rb_bias_px = +RB_BIAS_PX_RIGHT; break;
-            case RbState::EXIT_SEARCH: rb_bias_px = -RB_BIAS_PX_LEFT;  break;
-            case RbState::EXITING:     rb_bias_px =  0.0f;             break;
-            default:                   rb_bias_px =  0.0f;             break;
+        float heading_now   = 0.0f;
+        bool  heading_ok    = false;
+        float tof_left_mm   = -1.0f;
+        float tof_right_mm  = -1.0f;
+        {
+            // TODO: replace with real reads from your hardware.
+            // heading_now = imu.data.eulerDeg.y;
+            // heading_ok  = imu.isValid();
+            // tof_left_mm  = tof_left.GetRangeMm();
+            // tof_right_mm = tof_right.GetRangeMm();
         }
 
         // -----------------------------------------------------
-        // 4. Road inference
+        // 4. Parking state machine — entry + advance
+        // -----------------------------------------------------
+        // Entry: parking sign committed while nothing else active
+        if (park_state == ParkState::NONE &&
+            rb_state == RbState::NONE &&
+            turn_controller.state == v20::LaneTurnController::State::IDLE &&
+            !corner_assist.active() &&
+            voter.GetCommitted() == sign_class::PARKING) {
+            park_state = ParkState::CAPTURE;
+            park_heading_buf.clear();
+            park_capture_elapsed = 0.0;
+            std::printf("[PARK] Parking sign → CAPTURE\n");
+        }
+
+        // Default: overrides inactive
+        park_angle_override = 0.0f;
+        park_speed_override = 0.0f;
+
+        switch (park_state) {
+            case ParkState::CAPTURE: {
+                park_capture_elapsed += dt_loop;
+                if (heading_ok) {
+                    park_heading_buf.push_back(heading_now);
+                    if ((int)park_heading_buf.size() > PARK_HEADING_WINDOW)
+                        park_heading_buf.pop_front();
+                }
+                if ((int)park_heading_buf.size() >= PARK_HEADING_WINDOW) {
+                    std::vector<float> tmp(park_heading_buf.begin(), park_heading_buf.end());
+                    std::sort(tmp.begin(), tmp.end());
+                    park_ref_heading = tmp[tmp.size() / 2];  // median
+                    park_state = ParkState::SLOT_SEARCH;
+                    std::printf("[PARK] Reference captured: %.2f° → SLOT_SEARCH\n",
+                                park_ref_heading);
+                } else if (park_capture_elapsed >= PARK_CAPTURE_TIMEOUT_S) {
+                    if (park_heading_buf.empty()) {
+                        std::printf("[PARK] CAPTURE timeout, no samples → ABORT\n");
+                        park_state = ParkState::NONE;
+                    } else {
+                        std::vector<float> tmp(park_heading_buf.begin(), park_heading_buf.end());
+                        std::sort(tmp.begin(), tmp.end());
+                        park_ref_heading = tmp[tmp.size() / 2];
+                        park_state = ParkState::SLOT_SEARCH;
+                        std::printf("[PARK] CAPTURE timeout, using %zu samples: %.2f° → SLOT_SEARCH\n",
+                                    park_heading_buf.size(), park_ref_heading);
+                    }
+                }
+                // Steering during CAPTURE is handled by follower.step(park_mode=true) below.
+                break;
+            }
+            case ParkState::SLOT_SEARCH: {
+                if (tof_left_mm > 0 && tof_right_mm > 0) {
+                    bool lb = left_blocked_h
+                        ? (tof_left_mm  < PARK_TOF_BLOCKED_MM + PARK_TOF_HYST_MM)
+                        : (tof_left_mm  < PARK_TOF_BLOCKED_MM - PARK_TOF_HYST_MM);
+                    bool rb = right_blocked_h
+                        ? (tof_right_mm < PARK_TOF_BLOCKED_MM + PARK_TOF_HYST_MM)
+                        : (tof_right_mm < PARK_TOF_BLOCKED_MM - PARK_TOF_HYST_MM);
+                    left_blocked_h  = lb;
+                    right_blocked_h = rb;
+                    if (lb != rb) {
+                        park_side = lb ? -1 : +1;
+                        park_state = ParkState::SLOT_FOUND;
+                        std::printf("[PARK] Slot detected (%s) → SLOT_FOUND\n",
+                                    lb ? "LEFT" : "RIGHT");
+                    }
+                }
+                if (heading_ok) {
+                    float herr = normalizeAngleP(park_ref_heading - heading_now);
+                    double a = PARK_HEADING_KP * herr;
+                    a = std::clamp(a, -(double)PARK_HEADING_MAX_DEG, (double)PARK_HEADING_MAX_DEG);
+                    park_angle_override = (float)a;
+                }
+                park_speed_override = PARK_APPROACH_SPEED_CMS;
+                break;
+            }
+            case ParkState::SLOT_FOUND: {
+                if (tof_left_mm > 0 && tof_right_mm > 0) {
+                    bool lb = left_blocked_h
+                        ? (tof_left_mm  < PARK_TOF_BLOCKED_MM + PARK_TOF_HYST_MM)
+                        : (tof_left_mm  < PARK_TOF_BLOCKED_MM - PARK_TOF_HYST_MM);
+                    bool rb = right_blocked_h
+                        ? (tof_right_mm < PARK_TOF_BLOCKED_MM + PARK_TOF_HYST_MM)
+                        : (tof_right_mm < PARK_TOF_BLOCKED_MM - PARK_TOF_HYST_MM);
+                    left_blocked_h  = lb;
+                    right_blocked_h = rb;
+                    if (lb && rb) {
+                        park_heading_0 = heading_now;
+                        park_stop_dwell_elapsed = 0.0;
+                        park_state = ParkState::WAIT_FULL_STOP;
+                        std::printf("[PARK] Both blocked, heading_0=%.2f° → STOP\n",
+                                    park_heading_0);
+                    }
+                }
+                if (heading_ok) {
+                    float herr = normalizeAngleP(park_ref_heading - heading_now);
+                    double a = PARK_HEADING_KP * herr;
+                    a = std::clamp(a, -(double)PARK_HEADING_MAX_DEG, (double)PARK_HEADING_MAX_DEG);
+                    park_angle_override = (float)a;
+                }
+                park_speed_override = PARK_APPROACH_SPEED_CMS;
+                break;
+            }
+            case ParkState::WAIT_FULL_STOP: {
+                park_angle_override = 0.0f;
+                park_speed_override = 0.0f;
+                park_stop_dwell_elapsed += dt_loop;
+                if (park_stop_dwell_elapsed >= PARK_STOP_DWELL_S) {
+                    park_reverse_elapsed = 0.0;
+                    park_state = ParkState::REVERSE_1;
+                    std::printf("[PARK] Stopped → REVERSE_1 (side=%s)\n",
+                                park_side < 0 ? "LEFT" : "RIGHT");
+                }
+                break;
+            }
+            case ParkState::REVERSE_1: {
+                park_reverse_elapsed += dt_loop;
+                park_angle_override = (park_side < 0) ? -PARK_REVERSE_STEER_DEG
+                                                      :  PARK_REVERSE_STEER_DEG;
+                park_speed_override = PARK_REVERSE_SPEED_CMS;
+                if (heading_ok) {
+                    float d = std::abs(normalizeAngleP(heading_now - park_heading_0));
+                    if (d >= PARK_TARGET_HEADING_DEG) {
+                        park_state = ParkState::REVERSE_2;
+                        park_reverse_elapsed = 0.0;
+                        std::printf("[PARK] REVERSE_1 done (Δ=%.1f°) → REVERSE_2\n", d);
+                    }
+                }
+                if (park_reverse_elapsed >= PARK_REVERSE_TIMEOUT_S) {
+                    park_state = ParkState::REVERSE_2;
+                    park_reverse_elapsed = 0.0;
+                    std::printf("[PARK] REVERSE_1 timeout → REVERSE_2\n");
+                }
+                break;
+            }
+            case ParkState::REVERSE_2: {
+                park_reverse_elapsed += dt_loop;
+                park_angle_override = (park_side < 0) ?  PARK_REVERSE_STEER_DEG
+                                                      : -PARK_REVERSE_STEER_DEG;
+                park_speed_override = PARK_REVERSE_SPEED_CMS;
+                if (heading_ok) {
+                    float d = std::abs(normalizeAngleP(heading_now - park_heading_0));
+                    if (d <= PARK_HEADING_TOL_DEG) {
+                        park_state = ParkState::DONE;
+                        std::printf("[PARK] REVERSE_2 done (Δ=%.1f°) → DONE\n", d);
+                    }
+                }
+                if (park_reverse_elapsed >= PARK_REVERSE_TIMEOUT_S) {
+                    park_state = ParkState::DONE;
+                    std::printf("[PARK] REVERSE_2 timeout → DONE\n");
+                }
+                break;
+            }
+            case ParkState::DONE: {
+                park_angle_override = 0.0f;
+                park_speed_override = 0.0f;
+                break;
+            }
+            default: break;
+        }
+
+        // -----------------------------------------------------
+        // 5. Road inference
         // -----------------------------------------------------
         bool roadOK = roadModel.Predict(frame, mask);
 
@@ -668,15 +865,38 @@ int main() {
             v20::LaneTurnController::State::IDLE, 0.0, "NONE"};
         double applied_floor = 0.0;
         double applied_cap   = 0.0;
-        float  final_bias    = rb_bias_px;
-        bool   exec_turn     = (rb_state != RbState::NONE);
+        float  final_bias    = 0.0f;
+        bool   exec_turn     = false;
 
         std::vector<cv::Point> ui_left_pts, ui_right_pts;
         int ui_y1 = 0, ui_y2 = 0;
         int ui_lx1 = -1, ui_rx1 = -1, ui_lx2 = -1, ui_rx2 = -1;
         int ui_lx_bot = -1, ui_rx_bot = -1;
 
-        if (roadOK) {
+        const bool parking_active = (park_state != ParkState::NONE);
+
+        if (parking_active && park_state == ParkState::CAPTURE) {
+            // --- CAPTURE: use near-band mask PID for stability while sampling ---
+            if (roadOK) {
+                out = follower.step(mask, 0.0, false, 0.0, 0.0, /*park_mode=*/true);
+                speed = PARK_CAPTURE_SPEED_CMS;
+                // Also update previous_out so the first SLOT_SEARCH heading-hold has context
+                previous_out = out;
+            } else {
+                // Mask dropped during CAPTURE — hold last angle, stop
+                out.angle = 0.0;
+                speed = 0.0f;
+            }
+        } else if (parking_active) {
+            // --- SLOT_SEARCH onwards: pure heading-hold, mask ignored ---
+            out.angle = park_angle_override;
+            speed = park_speed_override;
+            out.valid = true;
+            // Keep previous_out matching so post-parking (if any) has sane baseline
+            previous_out.angle = out.angle;
+            previous_out.valid = true;
+        } else if (roadOK) {
+            // --- Normal flow: turn controller + follower ---
             const int h = mask.rows, w = mask.cols;
             const int y1 = static_cast<int>(h * 0.45);
             const int y2 = static_cast<int>(h * 0.65);
@@ -739,7 +959,8 @@ int main() {
             ui_right_pts = right_pts;
             ui_y1 = y1; ui_y2 = y2;
 
-            // --- Accept new sign trigger ONLY when not in roundabout ---
+            SignCommit signCommit = MakeSignCommit(voter.GetCommitted());
+
             if (rb_state == RbState::NONE &&
                 signCommit.active &&
                 turn_controller.state == v20::LaneTurnController::State::IDLE &&
@@ -750,18 +971,16 @@ int main() {
                 voter.Reset();
             }
 
-            // --- Turn controller update (always, so EXIT_SEARCH's turn progresses) ---
             turn_res = turn_controller.update(
                 left_pts, right_pts, dt_loop, previous_out.valid,
                 lx1, rx1, lx2, rx2, w,
-                signCommit.active
+                signCommit.active,
+                previous_out.near_e, previous_out.mid_e, previous_out.far_e
             );
 
-            // --- Floor / cap: turn_controller drives when running ---
             applied_floor = turn_res.steer_floor_deg;
             applied_cap   = turn_res.steer_cap_deg;
 
-            // --- CornerAssist only when both are idle and not in roundabout ---
             if (rb_state == RbState::NONE &&
                 turn_controller.state == v20::LaneTurnController::State::IDLE) {
                 double cf = corner_assist.update(
@@ -774,104 +993,110 @@ int main() {
                 corner_assist.reset();
             }
 
-            // --- Merge biases ---
-            // Outside EXITING, rb_bias drives when rb is active.
-            // turn_res.steer_bias_px drives the regular/exit turn.
+            float rb_bias_px = 0.0f;
+            switch (rb_state) {
+                case RbState::APPROACH:    rb_bias_px = +RB_BIAS_PX_RIGHT; break;
+                case RbState::IN_CIRCLE:   rb_bias_px = -RB_BIAS_PX_LEFT;  break;
+                case RbState::EXIT_PREP:   rb_bias_px = +RB_BIAS_PX_RIGHT; break;
+                case RbState::EXIT_SEARCH: rb_bias_px = -RB_BIAS_PX_LEFT;  break;
+                default:                   rb_bias_px =  0.0f;             break;
+            }
+            final_bias = rb_bias_px;
             if (turn_controller.state != v20::LaneTurnController::State::IDLE) {
                 final_bias += turn_res.steer_bias_px;
             }
             exec_turn = (rb_state != RbState::NONE) || turn_res.lock_opposite_err;
 
-            // --- Sign-block after a completed turn ---
             if (turn_res.state == v20::LaneTurnController::State::DONE) {
                 sign_block_until_time = elapsed_total + SIGN_BLOCK_SECONDS;
                 voter.Reset();
             }
 
-            // --- Follower step ---
             out = follower.step(mask, final_bias, exec_turn, applied_floor, applied_cap);
             previous_out = out;
 
-            // --- Speed ---
             speed = static_cast<float>(out.speed);
             if (rb_state != RbState::NONE && out.valid) {
                 speed = std::clamp(speed, RB_SPEED_MIN_CMS, RB_SPEED_MAX_CMS);
             }
-
-            // --- Stop overrides ---
-            const bool stopForPerson =
-                (elapsed_total - last_person_seen_time) <= PERSON_STOP_HANGOVER_S;
-            const bool stopForRedLight =
-                (elapsed_total - last_red_seen_time) <= RED_LIGHT_HANGOVER_S;
-            if (stopForPerson || stopForRedLight) speed = 0.0f;
-
-            // --- Soft-start ramp ---
-            const float max_delta = MAX_ACCEL_CMS2 * static_cast<float>(dt_loop);
-            if (speed > applied_speed)
-                applied_speed = std::min(speed, applied_speed + max_delta);
-            else
-                applied_speed = speed;
-
-            // --- Angle → servo (V6.6 calibration) ---
-            float desired_real_left = -static_cast<float>(out.angle);
-            desired_real_left = std::clamp(desired_real_left,
-                                           -MAX_REAL_ANGLE_DEG, MAX_REAL_ANGLE_DEG);
-            float servo_cmd = RealAngleToServo(desired_real_left);
-            servo_cmd = std::clamp(servo_cmd,
-                                   -static_cast<float>(MAX_SERVO_CMD),
-                                    static_cast<float>(MAX_SERVO_CMD));
-            final_angle = static_cast<int>(std::lround(servo_cmd));
-
-            motor.SetSpeedCms(applied_speed);
-            servo.SetAngle(final_angle);
-
-            ++tickIdx;
-
-            // 1 Hz debug
-            static auto lastLog = std::chrono::steady_clock::now();
-            auto tNow = std::chrono::steady_clock::now();
-            if (tNow - lastLog >= std::chrono::seconds(1)) {
-                const char* stopStr = stopForPerson   ? "STOP:person"
-                                    : stopForRedLight ? "STOP:red"
-                                    :                   "-";
-                std::printf(
-                    "[t=%ld] sign=%-11s(%d) rb=%-11s bias=%+5.1f "
-                    "turn=%-13s near=%6.1f mid=%6.1f far=%6.1f "
-                    "%-11s spd=%.1f pid=%.1f srv=%d\n",
-                    tickIdx,
-                    SignName(voter.GetCommitted()),
-                    voter.GetCommitted(),
-                    RbStateName(rb_state),
-                    final_bias,
-                    v20::LaneTurnController::State::EXECUTE == turn_res.state ? "EXEC" :
-                    v20::LaneTurnController::State::WAIT_CURVE == turn_res.state ? "WAIT_CURVE" :
-                    v20::LaneTurnController::State::WAIT_STRAIGHT == turn_res.state ? "WAIT_STRAIGHT" :
-                    v20::LaneTurnController::State::SETTLE == turn_res.state ? "SETTLE" :
-                    v20::LaneTurnController::State::DONE == turn_res.state ? "DONE" : "IDLE",
-                    out.near_e, out.mid_e, out.far_e,
-                    stopStr,
-                    applied_speed, out.angle, final_angle);
-                lastLog = tNow;
-            }
         } else {
-            // Road inference failed
+            // Normal path, mask lost
             previous_out = v20::LaneFollower::Output{};
             motor.SetSpeedCms(0.0f);
             servo.SetAngle(0);
             follower.resetTracking();
             applied_speed = 0.0f;
+            // FPS + UI
+            frameCount++;
+            auto tNow = std::chrono::high_resolution_clock::now();
+            double dt_fps = std::chrono::duration<double>(tNow - tPrev).count();
+            if (dt_fps > 0.5) { currentFps = frameCount / dt_fps; frameCount = 0; tPrev = tNow; }
+            if (SHOW_UI) {
+                cv::imshow("Lane Follower", frame);
+                int key = cv::waitKey(1) & 0xFF;
+                if (key == 27 || key == 'q') break;
+            }
+            continue;
+        }
+
+        // -----------------------------------------------------
+        // 6. Stop overrides, soft-start, servo, motor
+        // -----------------------------------------------------
+        if (!parking_active) {
+            const bool stopForPerson =
+                (elapsed_total - last_person_seen_time) <= PERSON_STOP_HANGOVER_S;
+            const bool stopForRedLight =
+                (elapsed_total - last_red_seen_time) <= RED_LIGHT_HANGOVER_S;
+            if (stopForPerson || stopForRedLight) speed = 0.0f;
+        }
+
+        const float max_delta = MAX_ACCEL_CMS2 * static_cast<float>(dt_loop);
+        if (speed > applied_speed)
+            applied_speed = std::min(speed, applied_speed + max_delta);
+        else
+            applied_speed = speed;
+
+        float desired_real_left = -static_cast<float>(out.angle);
+        desired_real_left = std::clamp(desired_real_left,
+                                       -MAX_REAL_ANGLE_DEG, MAX_REAL_ANGLE_DEG);
+        float servo_cmd = RealAngleToServo(desired_real_left);
+        servo_cmd = std::clamp(servo_cmd,
+                               -static_cast<float>(MAX_SERVO_CMD),
+                                static_cast<float>(MAX_SERVO_CMD));
+        final_angle = static_cast<int>(std::lround(servo_cmd));
+
+        motor.SetSpeedCms(applied_speed);
+        servo.SetAngle(final_angle);
+
+        ++tickIdx;
+
+        // 1 Hz debug
+        static auto lastLog = std::chrono::steady_clock::now();
+        auto tNow = std::chrono::steady_clock::now();
+        if (tNow - lastLog >= std::chrono::seconds(1)) {
+            std::printf(
+                "[t=%ld] sign=%-11s(%d) rb=%-11s park=%-11s "
+                "near=%6.1f hdg=%7.2f ref=%7.2f tofL=%5.1f tofR=%5.1f "
+                "spd=%.1f pid=%.1f srv=%d\n",
+                tickIdx,
+                SignName(voter.GetCommitted()),
+                voter.GetCommitted(),
+                RbStateName(rb_state),
+                ParkStateName(park_state),
+                out.near_e, heading_now, park_ref_heading,
+                tof_left_mm, tof_right_mm,
+                applied_speed, out.angle, final_angle);
+            lastLog = tNow;
         }
 
         // -----------------------------------------------------
         // FPS
         // -----------------------------------------------------
         frameCount++;
-        auto tNow = std::chrono::high_resolution_clock::now();
-        double dt_fps = std::chrono::duration<double>(tNow - tPrev).count();
-        if (dt_fps > 0.5) {
-            currentFps = frameCount / dt_fps;
-            frameCount = 0;
-            tPrev = tNow;
+        {
+            auto tF = std::chrono::high_resolution_clock::now();
+            double dt_fps = std::chrono::duration<double>(tF - tPrev).count();
+            if (dt_fps > 0.5) { currentFps = frameCount / dt_fps; frameCount = 0; tPrev = tF; }
         }
 
         // -----------------------------------------------------
@@ -880,105 +1105,66 @@ int main() {
         if (SHOW_UI) {
             cv::Mat overlay = frame.clone();
 
-            if (roadOK) {
+            if (roadOK && parking_active && park_state != ParkState::CAPTURE) {
+                // Skip mask overlay during pure heading-hold
+            } else if (roadOK) {
                 cv::Mat green(frame.size(), frame.type(), cv::Scalar(0, 255, 0));
                 cv::Mat blended;
                 cv::addWeighted(frame, 0.65, green, 0.35, 0, blended);
                 blended.copyTo(overlay, mask);
 
-                // Scanlines
                 if (ui_y1 > 0 && ui_y2 > 0) {
                     cv::line(overlay, cv::Point(0, ui_y1), cv::Point(frame.cols - 1, ui_y1),
                              cv::Scalar(0, 0, 255), 1);
                     cv::line(overlay, cv::Point(0, ui_y2), cv::Point(frame.cols - 1, ui_y2),
                              cv::Scalar(0, 0, 255), 1);
                 }
-
-                // Left / right boundary polylines
                 for (size_t i = 0; i + 1 < ui_left_pts.size(); ++i)
-                    cv::line(overlay, ui_left_pts[i], ui_left_pts[i + 1],
-                             cv::Scalar(255, 0, 0), 2);
+                    cv::line(overlay, ui_left_pts[i], ui_left_pts[i + 1], cv::Scalar(255, 0, 0), 2);
                 for (size_t i = 0; i + 1 < ui_right_pts.size(); ++i)
-                    cv::line(overlay, ui_right_pts[i], ui_right_pts[i + 1],
-                             cv::Scalar(255, 0, 0), 2);
-                for (const auto& p : ui_left_pts)
-                    cv::circle(overlay, p, 3, cv::Scalar(0, 255, 0), -1);
-                for (const auto& p : ui_right_pts)
-                    cv::circle(overlay, p, 3, cv::Scalar(0, 255, 0), -1);
+                    cv::line(overlay, ui_right_pts[i], ui_right_pts[i + 1], cv::Scalar(255, 0, 0), 2);
+                for (const auto& p : ui_left_pts) cv::circle(overlay, p, 3, cv::Scalar(0, 255, 0), -1);
+                for (const auto& p : ui_right_pts) cv::circle(overlay, p, 3, cv::Scalar(0, 255, 0), -1);
 
-                // Centerline dots
                 if (out.proc_width > 0 && out.proc_height > 0) {
                     float sx = float(frame.cols) / out.proc_width;
                     float sy = float(frame.rows) / out.proc_height;
                     for (size_t i = 0; i < out.centerline_pts.size(); i += 8) {
                         int cx = int(out.centerline_pts[i].first * sx);
                         int cy = int(out.centerline_pts[i].second * sy);
-                        cv::circle(overlay, cv::Point(cx, cy), 2,
-                                   cv::Scalar(0, 255, 255), -1);
+                        cv::circle(overlay, cv::Point(cx, cy), 2, cv::Scalar(0, 255, 255), -1);
                     }
                 }
-
-                // Desired path (magenta bezier)
-                int start_x = frame.cols / 2;
-                int start_y = frame.rows - 1;
-                int end_y   = static_cast<int>(frame.rows * 0.45);
-                float steer_norm = std::clamp(float(out.angle) / 25.0f, -1.0f, 1.0f);
-                float lateral_offset = steer_norm * frame.cols * 0.35f;
-                int end_x = std::clamp(int(start_x + lateral_offset), 0, frame.cols - 1);
-                int control_x = int(start_x + lateral_offset * 0.45f);
-                int control_y = int(frame.rows * 0.78f);
-                std::vector<cv::Point> path_points;
-                for (int i = 0; i <= 50; ++i) {
-                    float t = i / 50.0f;
-                    float x = std::pow(1 - t, 2) * start_x
-                            + 2 * (1 - t) * t * control_x
-                            + std::pow(t, 2) * end_x;
-                    float y = std::pow(1 - t, 2) * start_y
-                            + 2 * (1 - t) * t * control_y
-                            + std::pow(t, 2) * end_y;
-                    path_points.push_back(cv::Point(int(x), int(y)));
-                }
-                std::vector<std::vector<cv::Point>> pv = {path_points};
-                cv::polylines(overlay, pv, false, cv::Scalar(255, 0, 255), 2, cv::LINE_AA);
             }
 
-            // Sign detections
             for (const auto& s : cachedSigns) {
                 cv::rectangle(overlay, s.box, cv::Scalar(0, 255, 255), 2);
                 char label[64];
-                std::snprintf(label, sizeof(label), "%s %.2f",
-                              s.name.c_str(), s.confidence);
+                std::snprintf(label, sizeof(label), "%s %.2f", s.name.c_str(), s.confidence);
                 cv::putText(overlay, label, {s.box.x, std::max(12, s.box.y - 5)},
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                            cv::Scalar(0, 255, 255), 1);
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
             }
 
-            // HUD
-            char t1[200], t2[200], t3[200];
+            char t1[200], t2[200], t3[200], t4[200];
             std::snprintf(t1, sizeof(t1),
-                "FPS %.1f | spd %.1f/%.1f | pid %.1f | srv %d | bias %+.1f",
-                currentFps, applied_speed, speed, out.angle, final_angle, final_bias);
+                "FPS %.1f | spd %.1f/%.1f | pid %.1f | srv %d",
+                currentFps, applied_speed, speed, out.angle, final_angle);
             std::snprintf(t2, sizeof(t2),
-                "sign %s (%d) | rb %s | turn %s %s",
-                SignName(voter.GetCommitted()),
-                voter.GetCommitted(),
-                RbStateName(rb_state),
-                turn_res.direction.c_str(),
-                (turn_res.state == v20::LaneTurnController::State::IDLE ? "IDLE" :
-                 turn_res.state == v20::LaneTurnController::State::WAIT_CURVE ? "WAIT_CURVE" :
-                 turn_res.state == v20::LaneTurnController::State::WAIT_STRAIGHT ? "WAIT_STRAIGHT" :
-                 turn_res.state == v20::LaneTurnController::State::EXECUTE ? "EXECUTE" :
-                 turn_res.state == v20::LaneTurnController::State::SETTLE ? "SETTLE" : "DONE"));
-            const bool stopP = (elapsed_total - last_person_seen_time) <= PERSON_STOP_HANGOVER_S;
-            const bool stopR = (elapsed_total - last_red_seen_time)    <= RED_LIGHT_HANGOVER_S;
+                "sign %s (%d) | rb %s | park %s",
+                SignName(voter.GetCommitted()), voter.GetCommitted(),
+                RbStateName(rb_state), ParkStateName(park_state));
             std::snprintf(t3, sizeof(t3),
-                "near %.1f mid %.1f far %.1f | %s",
-                out.near_e, out.mid_e, out.far_e,
-                stopP ? "STOP:person" : stopR ? "STOP:red" : "-");
+                "hdg %.2f° ref %.2f° Δ%.2f°",
+                heading_now, park_ref_heading,
+                normalizeAngleP(heading_now - park_ref_heading));
+            std::snprintf(t4, sizeof(t4),
+                "tof L=%.0f R=%.0f (blk<%.0f) | near %.1f",
+                tof_left_mm, tof_right_mm, PARK_TOF_BLOCKED_MM, out.near_e);
 
-            cv::putText(overlay, t1, {10, 30},  cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 2);
-            cv::putText(overlay, t2, {10, 55},  cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 2);
-            cv::putText(overlay, t3, {10, 80},  cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 2);
+            cv::putText(overlay, t1, {10, 30}, cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 2);
+            cv::putText(overlay, t2, {10, 55}, cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 2);
+            cv::putText(overlay, t3, {10, 80}, cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 2);
+            cv::putText(overlay, t4, {10,105}, cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 2);
 
             cv::imshow("Lane Follower", overlay);
             const int key = cv::waitKey(1) & 0xFF;
