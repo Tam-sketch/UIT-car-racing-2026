@@ -423,6 +423,8 @@ static SignCommit MakeSignCommit(int committed) {
     return s;
 }
 
+enum class LightColor { NONE, RED, YELLOW, GREEN };
+
 static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox) {
     using namespace tl;
     const int cx = bbox.x + bbox.width / 2;
