@@ -402,27 +402,41 @@ enum class LightColor { NONE, RED, YELLOW, GREEN };
 
 static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox) {
     using namespace tl;
-    const int cx = bbox.x + bbox.width / 2;
-    const int cy = bbox.y + bbox.height / 2;
-    const int w  = static_cast<int>(bbox.width  * ROI_EXPAND);
-    const int h  = static_cast<int>(bbox.height * ROI_EXPAND);
+    if (bgr.empty()) return LightColor::NONE;
+
+    // 1. Clamp bbox strictly inside the image first
+    cv::Rect safe_bbox = bbox & cv::Rect(0, 0, bgr.cols, bgr.rows);
+    if (safe_bbox.width < 4 || safe_bbox.height < 4) return LightColor::NONE;
+
+    const int cx = safe_bbox.x + safe_bbox.width / 2;
+    const int cy = safe_bbox.y + safe_bbox.height / 2;
+    const int w  = static_cast<int>(safe_bbox.width  * ROI_EXPAND);
+    const int h  = static_cast<int>(safe_bbox.height * ROI_EXPAND);
+    
     const int x1 = std::max(0, cx - w / 2);
     const int y1 = std::max(0, cy - h / 2);
     const int x2 = std::min(bgr.cols, cx + w / 2);
     const int y2 = std::min(bgr.rows, cy + h / 2);
-    if (x2 - x1 < 4 || y2 - y1 < 4) return LightColor::NONE;
+    
+    // 2. Compute the actual true ROI dimensions
+    int roi_w = x2 - x1;
+    int roi_h = y2 - y1;
+    if (roi_w < 4 || roi_h < 4) return LightColor::NONE;
 
     cv::Mat hsv;
-    cv::cvtColor(bgr(cv::Rect(x1, y1, x2 - x1, y2 - y1)), hsv, cv::COLOR_BGR2HSV);
+    cv::cvtColor(bgr(cv::Rect(x1, y1, roi_w, roi_h)), hsv, cv::COLOR_BGR2HSV);
 
-    if (h > w * 1.5) {
+    // 3. Tall box (Whole traffic light) path: Use roi_w and roi_h, NOT w and h!
+    if (roi_h > roi_w * 1.5) {
         cv::Mat v_chan;
         cv::extractChannel(hsv, v_chan, 2);
 
-        int h_third = h / 3;
-        int top_lit = cv::countNonZero(v_chan(cv::Rect(0, 0, w, h_third)) > V_MIN);
-        int mid_lit = cv::countNonZero(v_chan(cv::Rect(0, h_third, w, h_third)) > V_MIN);
-        int bot_lit = cv::countNonZero(v_chan(cv::Rect(0, 2 * h_third, w, h_third)) > V_MIN);
+        int h_third = roi_h / 3;
+        if (h_third < 1) return LightColor::NONE;
+        
+        int top_lit = cv::countNonZero(v_chan(cv::Rect(0, 0, roi_w, h_third)) > V_MIN);
+        int mid_lit = cv::countNonZero(v_chan(cv::Rect(0, h_third, roi_w, h_third)) > V_MIN);
+        int bot_lit = cv::countNonZero(v_chan(cv::Rect(0, 2 * h_third, roi_w, h_third)) > V_MIN);
 
         if (TL_DEBUG) std::printf("[TL] SLICE r=%d y=%d g=%d\n", top_lit, mid_lit, bot_lit);
 
@@ -432,6 +446,7 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
         return LightColor::NONE;
     }
 
+    // 4. Single light path
     cv::Mat mRed1, mRed2, mRed;
     cv::inRange(hsv, cv::Scalar(RED_H1_LO, S_MIN, V_MIN), cv::Scalar(RED_H1_HI, S_MAX, 255), mRed1);
     cv::inRange(hsv, cv::Scalar(RED_H2_LO, S_MIN, V_MIN), cv::Scalar(RED_H2_HI, S_MAX, 255), mRed2);
@@ -446,10 +461,12 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
     cv::inRange(hsv, cv::Scalar(GRN_H_LO, S_MIN, V_MIN), cv::Scalar(GRN_H_HI, S_MAX, 255), mGrn);
     int nGrn = cv::countNonZero(mGrn);
 
+    // Near-white (blown-out) pixels
     cv::Mat mWhite;
     cv::inRange(hsv, cv::Scalar(0, 0, V_WHITE_MIN), cv::Scalar(180, S_WHITE_MAX, 255), mWhite);
     int nWhite = cv::countNonZero(mWhite);
 
+    // Add the white pixels to whichever color dominates the edges
     if (nRed > 0 && nRed >= nYel && nRed >= nGrn) nRed += nWhite;
     else if (nGrn > 0 && nGrn > nRed && nGrn >= nYel) nGrn += nWhite;
     else if (nYel > 0 && nYel > nRed && nYel > nGrn) nYel += nWhite;
