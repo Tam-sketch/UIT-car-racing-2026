@@ -1,7 +1,7 @@
 // ============================================================
 // NavigationBrain.h
 // ============================================================
-//1
+//3
 #pragma once
 
 #include <opencv2/opencv.hpp>
@@ -234,6 +234,11 @@ public:
     bool ApproachingRedLight() const { return tl_approaching_red_; }
     const std::string& TrafficLightColor() const { return tl_color_; }
     const TrafficLightMetrics& GetTLMetrics() const { return tl_metrics_; }
+
+    void SetLatchedSign(const std::string& name) {
+        latched_sign_ = name;
+        latch_cooldown_frames_ = LATCH_DURATION_FRAMES;
+    }
 
     void BlockSign(const std::string& name, int frames) {
         blocked_sign_ = name;
