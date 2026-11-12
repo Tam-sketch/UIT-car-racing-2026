@@ -1,7 +1,7 @@
 // ============================================================
 // LaneFollowerV20.h
 // ============================================================
-//3
+//4
 #pragma once
 
 #ifdef LANEV20_USE_SHIM
@@ -436,11 +436,15 @@ public:
     };
 
     // ---------------- GÓC QUÀNH T-JUNCTION / NGÃ RẼ THƯỜNG ----------------
-    double TURN_STEER_DEG      = 33.0;   // Góc sàn khi quành theo biển / T-junction (33 độ theo yêu cầu)
-    double TURN_INIT_DEG       = 18.0;   // Khởi điểm góc sàn ngay frame bắt đầu EXECUTE để lên 33 độ nhanh hơn
-    double TURN_RAMP_DEG_PER_S = 115.0;  // Tăng tốc độ quay góc nhanh hơn (~19 độ/frame ở 6 FPS)
+    static constexpr double DEFAULT_TURN_STEER_DEG = 35.0;   // Góc sàn rẽ chuẩn 35 độ
+    static constexpr double DEFAULT_TURN_INIT_DEG  = 22.0;   // Khởi điểm góc sàn ngay frame đầu EXECUTE
+    static constexpr double DEFAULT_TURN_BIAS_PX   = 40.0;   // Bias kéo mạnh vào làn rẽ 40px
+
+    double TURN_STEER_DEG      = DEFAULT_TURN_STEER_DEG;
+    double TURN_INIT_DEG       = DEFAULT_TURN_INIT_DEG;
+    double TURN_RAMP_DEG_PER_S = 120.0;  // Tăng tốc độ quay góc nhanh hơn (~20 độ/frame ở 6 FPS)
     double MIN_TURN_TIME       = 0.8;
-    double TURN_BIAS_PX        = 38.0;
+    double TURN_BIAS_PX        = DEFAULT_TURN_BIAS_PX;
     double turn_floor_current  = 0.0;
 
     // =========================================================================
@@ -545,6 +549,8 @@ public:
     State       state          = State::IDLE;
     std::string direction      = "NONE";
     double      turn_elapsed   = 0.0;
+    double      wait_curve_elapsed    = 0.0;
+    double      wait_straight_elapsed = 0.0;
     bool        curve_detected = false;
     bool        completed      = false;
 
@@ -606,7 +612,7 @@ public:
         far_swept          = false;
         straight_frames    = 0;
         turn_bias_current  = dir_sign * TURN_BIAS_PX;
-        turn_floor_current = 0.0;
+        turn_floor_current = dir_sign * TURN_INIT_DEG;
     }
 
     void start_turn(const std::string& dir, bool is_roundabout = false, bool unmarked_tjunction = false) {
@@ -615,17 +621,26 @@ public:
         if ((state == State::WAIT_CURVE || state == State::WAIT_STRAIGHT) &&
             direction == dir && is_roundabout_mode == is_roundabout && is_unmarked_tjunction == unmarked_tjunction) return;
 
-        direction          = dir;
-        state              = State::WAIT_CURVE;
-        turn_elapsed       = 0.0;
-        aligned_frames     = 0;
-        straight_frames    = 0;
-        turn_bias_current  = 0.0;
-        turn_floor_current = 0.0;
-        settle_start_floor = 0.0;
-        far_swept          = false;
-        curve_detected     = false;
-        completed          = false;
+        direction             = dir;
+        state                 = State::WAIT_CURVE;
+        turn_elapsed          = 0.0;
+        wait_curve_elapsed    = 0.0;
+        wait_straight_elapsed = 0.0;
+        aligned_frames        = 0;
+        straight_frames       = 0;
+        turn_bias_current     = 0.0;
+        turn_floor_current    = 0.0;
+        settle_start_floor    = 0.0;
+        far_swept             = false;
+        curve_detected        = false;
+        completed             = false;
+
+        // Reset về thông số rẽ mạnh mặc định (đặc biệt sau khi thoát roundabout)
+        if (!is_roundabout) {
+            TURN_STEER_DEG = DEFAULT_TURN_STEER_DEG;
+            TURN_INIT_DEG  = DEFAULT_TURN_INIT_DEG;
+            TURN_BIAS_PX   = DEFAULT_TURN_BIAS_PX;
+        }
 
         is_roundabout_mode      = is_roundabout;
         is_unmarked_tjunction   = unmarked_tjunction;
@@ -1050,34 +1065,55 @@ public:
 
         if (state == State::WAIT_CURVE) {
             straight_frames = 0;
+            wait_curve_elapsed += dt;
+
+            // Kiểm tra xem làn đường có bắt đầu bẻ lái theo hướng rẽ hay chưa
+            bool side_turning = false;
+            if (direction == "RIGHT") {
+                side_turning = (rx2 >= 0 && rx2 < img_w - 75) || (far_rx >= 0 && far_rx < img_w - 110);
+            } else if (direction == "LEFT") {
+                side_turning = (lx2 > 75) || (far_lx > 110);
+            }
+
             const bool trigger_wait_straight = is_unmarked_tjunction
                 ? junction_opened
-                : (dev >= CURVE_THRESHOLD || junction_opened);
+                : (dev >= (has_active_sign ? 15.0 : CURVE_THRESHOLD) || 
+                   junction_opened || 
+                   side_turning ||
+                   (has_active_sign && wait_curve_elapsed >= 0.85));
+
             if (trigger_wait_straight) {
                 curve_detected  = true;
                 state           = State::WAIT_STRAIGHT;
+                wait_straight_elapsed = 0.0;
                 straight_frames = 1; // Khởi điểm ngay 1 frame khi miệng ngã rẽ đã mở
                 res.straight_frames = straight_frames;
-                std::cout << "[TURN] >> JUNCTION DETECTED (dev: " << dev << ", opened: " << junction_opened << ")\n";
+                std::cout << "[TURN] >> JUNCTION DETECTED (dev: " << dev << ", opened: " << junction_opened 
+                          << ", side_turning: " << side_turning << ", wait: " << wait_curve_elapsed << "s)\n";
             }
         }
         else if (state == State::WAIT_STRAIGHT) {
-            const bool valid_straight_dev = (dev >= 0.0 && dev <= STRAIGHT_THRESHOLD) ||
+            wait_straight_elapsed += dt;
+            const bool valid_straight_dev = (dev >= 0.0 && dev <= (has_active_sign ? 18.0 : STRAIGHT_THRESHOLD)) ||
                                             (is_unmarked_tjunction && tjunction_wall_ahead);
-            // Khi ngã rẽ đã mở và xuất hiện độ lệch góc cua (dev vọt lên) hoặc đường mở rộng:
-            // đó chính là đỉnh góc rẽ, không reset straight_frames nếu đã tích lũy được frame thẳng trước đó!
-            const bool junction_apex_reached = junction_opened && (dev >= 25.0 || mid_width >= 330);
-            if ((valid_straight_dev && junction_opened && (!pts_stuck_on_border || mid_width >= 350 || tjunction_wall_ahead)) ||
-                (straight_frames >= 1 && junction_apex_reached)) {
+            const bool junction_apex_reached = junction_opened && (dev >= 20.0 || mid_width >= 320);
+
+            const bool can_count_straight = has_active_sign
+                ? (valid_straight_dev || junction_apex_reached || wait_straight_elapsed >= 0.4)
+                : ((valid_straight_dev && junction_opened && (!pts_stuck_on_border || mid_width >= 350 || tjunction_wall_ahead)) ||
+                   (straight_frames >= 1 && junction_apex_reached));
+
+            if (can_count_straight) {
                 straight_frames++;
             } else {
                 straight_frames = 0;
             }
 
-            // Ở tốc độ ~4 FPS, 2 frame thẳng (~0.5s) là thời điểm vàng để bẻ lái chính xác vào ngã rẽ
+            // Ở tốc độ ~4 FPS, 2 frame thẳng (~0.5s) hoặc timeout 1.1s là chuyển EXECUTE bẻ lái ngay!
             const int req_straight = 2;
+            const bool force_exec_timeout = has_active_sign && (wait_straight_elapsed >= 1.1);
 
-            if (straight_frames >= req_straight) {
+            if (straight_frames >= req_straight || force_exec_timeout) {
                 if (is_unmarked_tjunction) {
                     t_junction_count++;
                     tjunction_count_locked = true;  // Khóa: không đếm liên tục, chờ DONE mới mở
@@ -1095,7 +1131,8 @@ public:
                 res.steer_bias_px     = turn_bias_current;
                 res.steer_floor_deg   = turn_floor_current;
                 res.lock_opposite_err = true;
-                std::cout << "[TURN] >>> EXECUTING TURN (Verified straight " << req_straight << " frames)\n";
+                std::cout << "[TURN] >>> EXECUTING TURN (dir=" << direction << ", floor=" << TURN_STEER_DEG 
+                          << " deg, bias=" << TURN_BIAS_PX << " px, forced=" << force_exec_timeout << ")\n";
             }
         }
         else if (state == State::EXECUTE) {
@@ -1856,6 +1893,9 @@ Output step(const cv::Mat& roadMask, double totalBiasPx = 0.0, bool isExecutingT
         speed_ = 0.65 * speed_ + 0.35 * target;
     } else {
         invalid_frames_++;
+        if (!isExecutingTurn && std::abs(turnFloorDeg) <= 0.5) {
+            lastAngle_ *= 0.80; // Giảm chấn góc lái khi mất mask lúc đi thẳng / xuống cầu
+        }
         angle = lastAngle_;
         if (invalid_frames_ > 5) {
             speed_ = 0.0;
