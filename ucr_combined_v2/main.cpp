@@ -1,22 +1,5 @@
 // ============================================================
-// main_run.cpp — UCR2026 Full Integrated + Heading-only Parking
-// ============================================================
-// 2026-11-12 changes:
-//  - Wired BNO055 IMU and TOF sensors
-//  - EXIT_SEARCH bias flipped from LEFT to RIGHT (R1)
-//  - RB_BIAS_EMA applied (R2)
-//  - EXIT_SEARCH force-execute after RB_EXIT_FORCE_EXEC_S (R3)
-//  - waiting_for_tjunction cleared on roundabout entry (R4)
-//  - PARK_HEADING_SIGN applied to both heading-hold P loops
-// 2026-11-12 (2-pass):
-//  - rb_pass_count: Pass 1 = LEFT exit, Pass 2 = RIGHT exit
-//  - EXIT_SEARCH turn params override (floor=16°, bias=18px)
-//  - EXITING resets rb_bias_smoothed (hard reset)
-// 2026-11-12 (P0/P1 fixes):
-//  - [P0] Snapshot & restore TURN_STEER_DEG/TURN_BIAS_PX across roundabout
-//  - [P0] Parking reverse: 28→38° steer, 4→6s timeout, servo settle
-//  - [P1] HEADING_SIGN applied to raw axis; PARK_HEADING_SIGN only to P-ctrl
-//  - [P1] MAX_REAL_ANGLE_DEG 30→45, PARK_HEADING_KP 1.2→2.2, WIN 10→4
+// main_run.cpp — UCR2026 Full Integrated (Parking & Obstacle from chinh.cpp)
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -74,16 +57,16 @@ static constexpr float SERVO_LEFT_SLOPE    = 0.96f;
 static constexpr float SERVO_LEFT_OFFSET   = -6.2f;
 static constexpr float SERVO_RIGHT_SLOPE   = 0.71f;
 static constexpr float SERVO_RIGHT_OFFSET  = 2.5f;
-static constexpr float MAX_REAL_ANGLE_DEG  = 45.0f;   // [P1] was 30 — allow 38° reverse arcs
+static constexpr float MAX_REAL_ANGLE_DEG  = 45.0f;   // Allow 45° reverse arcs for parking
 static constexpr int   MAX_SERVO_CMD       = 55;
 
 // Rear-facing ToF sensor slots
 static constexpr int TOF_IDX_REAR_LEFT  = 1;
 static constexpr int TOF_IDX_REAR_RIGHT = 3;
+static constexpr int TOF_IDX_LEFT       = 1;
+static constexpr int TOF_IDX_RIGHT      = 3;
 
-// Heading source (BNO055 eulerDeg.x is yaw on this mount)
-// HEADING_SIGN flips the RAW axis only. PARK_HEADING_SIGN (below) flips
-// the parking P-controller error sign. Do NOT mix the two roles.
+// Heading source
 static constexpr float HEADING_SIGN = 1.0f;
 
 // Sign class indices
@@ -100,28 +83,23 @@ namespace sign_class {
 }
 
 // Traffic light HSV
-// Traffic light HSV
 namespace tl {
     inline constexpr int RED_H1_LO = 0,   RED_H1_HI = 10;
     inline constexpr int RED_H2_LO = 170, RED_H2_HI = 180;
     inline constexpr int YEL_H_LO  = 15,  YEL_H_HI  = 35;
     inline constexpr int GRN_H_LO  = 40,  GRN_H_HI  = 90;
 
-    // Saturation bounds for the saturated-color path.
-    // OpenCV 8-bit S is 0-255. 500 was a bug that matched ZERO pixels.
     inline constexpr int S_MIN     = 150;
     inline constexpr int S_MAX     = 255;
-    inline constexpr int V_MIN     = 220; // Slightly relaxed to catch dimmer lights
+    inline constexpr int V_MIN     = 220;
 
-    // Near-white (blown-out) path
-    // The center of a close light drops to S ~ 10-50 and V ~ 255.
     inline constexpr int S_WHITE_MAX = 50;
     inline constexpr int V_WHITE_MIN = 220;
     inline constexpr int MIN_WHITE_PIXELS = 10;
 
     inline constexpr int MIN_LIT_PIXELS = 10;
     inline constexpr float ROI_EXPAND   = 1.05f;
-    inline constexpr bool TL_DEBUG      = false; // Set true to see HSV counts in console
+    inline constexpr bool TL_DEBUG      = false;
 }
 
 static constexpr double PERSON_STOP_HANGOVER_S = 2.0;
@@ -144,37 +122,77 @@ static constexpr double RB_COOLDOWN_S            = 2.0;
 static constexpr float  RB_SPEED_MIN_CMS         = 20.0f;
 static constexpr float  RB_SPEED_MAX_CMS         = 30.0f;
 
-// Roundabout exit turn params (gentler than regular turn)
+// Roundabout exit turn params
 static constexpr float  RB_EXIT_TURN_FLOOR_DEG   = 26.0f;
 static constexpr float  RB_EXIT_TURN_BIAS_PX     = 30.0f;
 
 // ============================================================
-// PARKING CONSTANTS
+// PARKING & OBSTACLE CONFIGURATION (From chinh.cpp)
 // ============================================================
-static constexpr int   PARK_HEADING_WINDOW         = 4;       // [P1] was 10 — less tilt
-static constexpr float PARK_HEADING_KP             = 2.2f;    // [P1] was 1.2 — faster
-static constexpr float PARK_HEADING_MAX_DEG        = 25.0f;   // [P1] was 20
-static constexpr double PARK_CAPTURE_TIMEOUT_S     = 3.0;
+static constexpr float PARK_TOF_BLOCKED_MM          = 350.0f; // Ngưỡng mm (< 350mm coi là bị block)
+static constexpr float PARK_APPROACH_SPEED          = 13.0f;  // Tốc độ tiến trong bãi đỗ (cm/s)
+static constexpr float PARK_REVERSE_SPEED           = -10.0f; // Tốc độ lùi chậm (cm/s)
+static constexpr float PARK_MAX_STEER_DEG           = 45.0f;  // Góc bẻ lái khi lùi (độ bánh xe)
+static constexpr float PARK_TARGET_DELTA_DEG        = 50.0f;  // Lệch 50 độ ở REVERSE_1
+static constexpr float PARK_ALIGN_TOL_DEG           = 3.0f;   // Dung sai +-3 độ ở REVERSE_2
+static constexpr double PARK_STOP_DWELL_S           = 0.5;    // Thời gian dừng hẳn trước khi lùi (s)
 
-static constexpr float PARK_TOF_BLOCKED_MM         = 300.0f;
-static constexpr float PARK_TOF_HYST_MM            = 50.0f;
+static constexpr int   PARK_CORRIDOR_EXTRA_MARGIN_PX = 18;    // Mở rộng lề mỗi bên thêm 18px
+static constexpr float PARK_CORRIDOR_FAR_RATIO       = 0.68f; // Tỉ lệ thu hẹp phối cảnh
+static constexpr float PARK_STEER_TRIM_DEG           = +2.5f; // Bù sai số lệch trái
+static constexpr float PARK_HEADING_KP               = 0.90f; // Hệ số P giữ hướng thẳng
+static constexpr float PARK_HEADING_MAX_CORR_DEG     = 8.0f;  // Giới hạn góc can thiệp
 
-static constexpr float PARK_CAPTURE_SPEED_CMS      = 15.0f;
-static constexpr float PARK_APPROACH_SPEED_CMS     = 10.0f;
-static constexpr float PARK_REVERSE_SPEED_CMS      = -8.0f;
+enum class ParkingState {
+    IDLE = 0,
+    APPROACH,
+    SLOT1_WAIT_BLOCKED,
+    SLOT2_SEARCH_FREE,
+    SLOT3_WAIT_BLOCKED,
+    WAIT_FULL_STOP,
+    REVERSE_1,
+    REVERSE_2,
+    DONE
+};
 
-static constexpr float PARK_REVERSE_STEER_DEG      = 38.0f;   // [P0] was 28 — ≈12.5°/s
-static constexpr float PARK_TARGET_HEADING_DEG     = 45.0f;
-static constexpr float PARK_HEADING_TOL_DEG        = 3.0f;
+static const char* ParkingStateStr(ParkingState s) {
+    switch (s) {
+        case ParkingState::IDLE:               return "IDLE";
+        case ParkingState::APPROACH:           return "APPROACH";
+        case ParkingState::SLOT1_WAIT_BLOCKED: return "SLOT1_BLOCKED";
+        case ParkingState::SLOT2_SEARCH_FREE:  return "SLOT2_FREE_SEARCH";
+        case ParkingState::SLOT3_WAIT_BLOCKED: return "SLOT3_BLOCKED_STOP";
+        case ParkingState::WAIT_FULL_STOP:     return "WAIT_STOP";
+        case ParkingState::REVERSE_1:          return "REVERSE_1_TURN45";
+        case ParkingState::REVERSE_2:          return "REVERSE_2_ALIGN";
+        case ParkingState::DONE:               return "DONE";
+        default:                               return "UNKNOWN";
+    }
+}
 
-static constexpr double PARK_STOP_DWELL_S          = 0.5;
-static constexpr double PARK_REVERSE_TIMEOUT_S     = 6.0;     // [P0] was 4.0 — headroom
-static constexpr double PARK_REVERSE_SETTLE_S      = 0.4;     // [P0] NEW — servo settle
+// Cấu trúc hành lang 2 tia chéo thẳng tuyệt đối theo góc camera cho Parking
+struct ParkingCorridor {
+    bool latched = false;
+    int y_bot = 299;
+    int y_far = 135;
 
-// Parking P-controller sign flip (independent of HEADING_SIGN above).
-// Leave +1 unless the car steers AWAY from straight during SLOT_SEARCH
-// even though hdg / ref display correctly.
-static constexpr float PARK_HEADING_SIGN           = +1.0f;
+    int x_left_bot = 40;
+    int x_left_far = 85;
+    int x_right_bot = 440;
+    int x_right_far = 395;
+
+    int get_left_x(int y) const {
+        if (y_bot == y_far) return x_left_bot;
+        double t = static_cast<double>(y_bot - y) / static_cast<double>(y_bot - y_far);
+        return static_cast<int>(std::lround(x_left_bot + t * (x_left_far - x_left_bot)));
+    }
+
+    int get_right_x(int y) const {
+        if (y_bot == y_far) return x_right_bot;
+        double t = static_cast<double>(y_bot - y) / static_cast<double>(y_bot - y_far);
+        return static_cast<int>(std::lround(x_right_bot + t * (x_right_far - x_right_bot)));
+    }
+};
 
 // ============================================================
 // TELEMETRY (UCR 2026 competition requirement)
@@ -350,57 +368,14 @@ static const char* RbStateName(RbState s) {
     }
 }
 
-// ============================================================
-// PARKING STATE
-// ============================================================
-enum class ParkState {
-    NONE, CAPTURE, SLOT_SEARCH, SLOT_FOUND, WAIT_FULL_STOP,
-    REVERSE_1, REVERSE_2, DONE
-};
-
-static const char* ParkStateName(ParkState s) {
-    switch (s) {
-        case ParkState::CAPTURE:        return "CAPTURE";
-        case ParkState::SLOT_SEARCH:    return "SLOT_SEARCH";
-        case ParkState::SLOT_FOUND:     return "SLOT_FOUND";
-        case ParkState::WAIT_FULL_STOP: return "STOP";
-        case ParkState::REVERSE_1:      return "REV_1";
-        case ParkState::REVERSE_2:      return "REV_2";
-        case ParkState::DONE:           return "DONE";
-        default:                        return "NONE";
-    }
-}
-
 static float normalizeAngleP(float a) {
     while (a >  180.0f) a -= 360.0f;
     while (a < -180.0f) a += 360.0f;
     return a;
 }
 
-// Shift `angle` by a multiple of 360 so that `angle - ref` ∈ (-180, 180].
-static float unwrapNear(float ref, float angle) {
-    float d = angle - ref;
-    while (d >  180.0f) d -= 360.0f;
-    while (d < -180.0f) d += 360.0f;
-    return ref + d;
-}
-
-// Wrap-safe median of heading samples (deg). Result in [0, 360).
-static float medianHeadingDeg(const std::vector<float>& samples) {
-    if (samples.empty()) return 0.0f;
-    const float ref = samples.front();
-    std::vector<float> unwrapped;
-    unwrapped.reserve(samples.size());
-    for (float s : samples) unwrapped.push_back(unwrapNear(ref, s));
-    std::sort(unwrapped.begin(), unwrapped.end());
-    float median = unwrapped[unwrapped.size() / 2];
-    while (median <    0.0f) median += 360.0f;
-    while (median >= 360.0f) median -= 360.0f;
-    return median;
-}
-
 // ============================================================
-// SIGN COMMIT
+// SIGN COMMIT & LIGHT COLOR
 // ============================================================
 struct SignCommit {
     bool active   = false;
@@ -440,16 +415,9 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
     cv::Mat hsv;
     cv::cvtColor(bgr(cv::Rect(x1, y1, x2 - x1, y2 - y1)), hsv, cv::COLOR_BGR2HSV);
 
-    // =========================================================================
-    // PATH 1: WHOLE TRAFFIC LIGHT DETECTED (Tall bounding box)
-    // If the box is tall, it contains all 3 lights. We split it into 3 horizontal
-    // slices (Top=Red, Mid=Yellow, Bot=Green) and find the brightest one.
-    // This perfectly handles the blown-out white core: a lit bulb will have a
-    // massive V (brightness) value compared to the unlit bulbs.
-    // =========================================================================
     if (h > w * 1.5) {
         cv::Mat v_chan;
-        cv::extractChannel(hsv, v_chan, 2); // Extract V channel
+        cv::extractChannel(hsv, v_chan, 2);
 
         int h_third = h / 3;
         int top_lit = cv::countNonZero(v_chan(cv::Rect(0, 0, w, h_third)) > V_MIN);
@@ -458,18 +426,12 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
 
         if (TL_DEBUG) std::printf("[TL] SLICE r=%d y=%d g=%d\n", top_lit, mid_lit, bot_lit);
 
-        // Require the lit slice to be significantly brighter than the others
         if (top_lit >= MIN_LIT_PIXELS && top_lit > mid_lit * 1.5 && top_lit > bot_lit * 1.5) return LightColor::RED;
         if (mid_lit >= MIN_LIT_PIXELS && mid_lit > top_lit * 1.5 && mid_lit > bot_lit * 1.5) return LightColor::YELLOW;
         if (bot_lit >= MIN_LIT_PIXELS && bot_lit > top_lit * 1.5 && bot_lit > mid_lit * 1.5) return LightColor::GREEN;
         return LightColor::NONE;
     }
 
-    // =========================================================================
-    // PATH 2: SINGLE LIGHT DETECTED (Square-ish bounding box)
-    // Counts saturated colors and blown-out white pixels. White pixels are
-    // added to the dominant color to boost the count.
-    // =========================================================================
     cv::Mat mRed1, mRed2, mRed;
     cv::inRange(hsv, cv::Scalar(RED_H1_LO, S_MIN, V_MIN), cv::Scalar(RED_H1_HI, S_MAX, 255), mRed1);
     cv::inRange(hsv, cv::Scalar(RED_H2_LO, S_MIN, V_MIN), cv::Scalar(RED_H2_HI, S_MAX, 255), mRed2);
@@ -484,12 +446,10 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
     cv::inRange(hsv, cv::Scalar(GRN_H_LO, S_MIN, V_MIN), cv::Scalar(GRN_H_HI, S_MAX, 255), mGrn);
     int nGrn = cv::countNonZero(mGrn);
 
-    // Near-white (blown-out) pixels
     cv::Mat mWhite;
     cv::inRange(hsv, cv::Scalar(0, 0, V_WHITE_MIN), cv::Scalar(180, S_WHITE_MAX, 255), mWhite);
     int nWhite = cv::countNonZero(mWhite);
 
-    // Add the white pixels to whichever color dominates the edges
     if (nRed > 0 && nRed >= nYel && nRed >= nGrn) nRed += nWhite;
     else if (nGrn > 0 && nGrn > nRed && nGrn >= nYel) nGrn += nWhite;
     else if (nYel > 0 && nYel > nRed && nYel > nGrn) nYel += nWhite;
@@ -549,24 +509,16 @@ int main() {
     motor.SetSpeedCms(0.0f);
     servo.SetAngle(0);
 
-    // =========================================================
-    // BNO055 IMU  (non-fatal: parking disabled if it fails)
-    // =========================================================
     BNO055 imu;
     bool imu_ok = imu.initialize(std::chrono::milliseconds(1000));
     if (!imu_ok) {
-        std::cerr << "[IMU] init FAILED: " << imu.lastError()
-                  << " (parking DISABLED)\n";
+        std::cerr << "[IMU] init FAILED: " << imu.lastError() << "\n";
     }
 
-    // =========================================================
-    // TOF cluster  (non-fatal: parking disabled if it fails)
-    // =========================================================
     sensor::TOF tof;
     bool tof_ok = tof.Init("/dev/i2c-1");
     if (!tof_ok) {
-        std::cerr << "[TOF] init FAILED: " << tof.LastError()
-                  << " (parking DISABLED)\n";
+        std::cerr << "[TOF] init FAILED: " << tof.LastError() << "\n";
     }
 
     TrtModel roadModel;
@@ -577,23 +529,13 @@ int main() {
     SignDetector signDetector;
     bool signReady = signDetector.Init(SIGN_ENGINE_PATH);
     if (!signReady) {
-        std::cerr << "[Main] Sign Detector init failed — turns/roundabout/parking DISABLED\n";
+        std::cerr << "[Main] Sign Detector init failed\n";
     }
 
-    // Telemetry
     telemetry::Helper telem;
     const bool telem_ready = telem.Init(TELEMETRY_SERVER_IP, TELEMETRY_PORT, TELEMETRY_CAR_ID);
-    if (!telem_ready) {
-        std::cerr << "[TELEM] Init FAILED (bad IP or socket) — telemetry DISABLED\n";
-    } else {
-        std::cout << "[TELEM] Init OK → " << TELEMETRY_SERVER_IP
-                  << ":" << TELEMETRY_PORT
-                  << " car='" << TELEMETRY_CAR_ID << "'\n";
-    }
 
-    ucr::control::SignVoter voter(
-        SIGN_VOTER_ACTIVATE_FRAMES,
-        SIGN_VOTER_TIMEOUT_DS);
+    ucr::control::SignVoter voter(SIGN_VOTER_ACTIVATE_FRAMES, SIGN_VOTER_TIMEOUT_DS);
 
     v20::Config cfg;
     cfg.max_speed          = MAX_SPEED_CMS;
@@ -613,12 +555,9 @@ int main() {
     v20::LaneFollower       follower(cfg);
     v20::LaneTurnController turn_controller;
     v20::CornerAssist       corner_assist;
+    v20::ObstacleAvoidanceController obstacle_controller;
     v20::LaneFollower::Output previous_out;
 
-    // [P0] Snapshot default turn params — they get overridden for the
-    // roundabout exit and must be restored after EXITING so subsequent
-    // 90° turns (loop-back T-junction, sign-driven turns) use aggressive
-    // defaults (32°, 35px) not the gentle exit params (16°, 18px).
     const double DEFAULT_TURN_STEER_DEG = turn_controller.TURN_STEER_DEG;
     const double DEFAULT_TURN_BIAS_PX   = turn_controller.TURN_BIAS_PX;
 
@@ -627,33 +566,34 @@ int main() {
     RbState  rb_state_prev         = RbState::NONE;
     float    rb_bias_smoothed      = 0.0f;
     double   rb_enter_time         = 0.0;
-    double   rb_phase_start_time   = 0.0;
     double   rb_exit_search_start  = 0.0;
     double   rb_exiting_start      = 0.0;
     double   rb_cooldown_until     = 0.0;
     int      rb_missing_sign_ticks = 0;
-    double   last_rb_visible_time  = -1e9;
-    int      rb_pass_count         = 0;   // 0=idle, 1=pass 1, 2=pass 2
+    int      rb_pass_count         = 0;
 
     double   last_person_seen_time = -1e9;
     double   last_red_seen_time    = -1e9;
     double   sign_block_until_time = -1.0;
-
     int      active_turn_sign_class = -1;
 
-    // Parking state
-    ParkState park_state              = ParkState::NONE;
-    std::deque<float> park_heading_buf;
-    float     park_ref_heading        = 0.0f;
-    float     park_heading_0          = 0.0f;
-    int       park_side               = 0;
-    bool      left_blocked_h          = false;
-    bool      right_blocked_h         = false;
-    double    park_capture_elapsed    = 0.0;
-    double    park_stop_dwell_elapsed = 0.0;
-    double    park_reverse_elapsed    = 0.0;
-    float     park_angle_override     = 0.0f;
-    float     park_speed_override     = 0.0f;
+    // Parking State (From chinh.cpp)
+    ParkingState park_state = ParkingState::IDLE;
+    ParkingCorridor park_corridor;
+    int park_free_side = -1;
+    float park_heading_0 = 0.0f;
+    float park_straight_heading = 0.0f;
+    double park_dwell_time = 0.0;
+    double park_reverse_elapsed = 0.0;
+    int slot1_confirm_cnt = 0;
+    int slot2_confirm_cnt = 0;
+    int slot3_confirm_cnt = 0;
+    float slot1_tof_left = -1.0f, slot1_tof_right = -1.0f;
+    float slot2_tof_left = -1.0f, slot2_tof_right = -1.0f;
+    float slot3_tof_left = -1.0f, slot3_tof_right = -1.0f;
+    float tof_left = -1.0f, tof_right = -1.0f;
+    float current_heading = 0.0f;
+    bool heading_ok = false;
 
     long     tickIdx          = 0;
     long     totalFrames      = 0;
@@ -668,24 +608,7 @@ int main() {
     cv::Mat frame, mask;
     std::vector<SignObject> cachedSigns;
 
-    std::cout << "\n=== UCR2026: Full Integrated (v20 + RbState + SignVoter + Parking) ===\n"
-              << "Road: " << ENGINE_PATH << "\n"
-              << "Sign: " << SIGN_ENGINE_PATH << (signReady ? "" : " (DISABLED)") << "\n"
-              << "IMU:  " << (imu_ok ? "OK" : "FAILED — parking disabled") << "\n"
-              << "TOF:  " << (tof_ok ? "OK" : "FAILED — parking disabled") << "\n"
-              << "TELEM:" << (telem_ready ? " OK" : " DISABLED")
-              << " → " << TELEMETRY_SERVER_IP << ":" << TELEMETRY_PORT << "\n"
-              << "Speed: [" << MIN_SPEED_CMS << ", " << MAX_SPEED_CMS << "] cm/s\n"
-              << "Roundabout: 2-pass exit floor=" << RB_EXIT_TURN_FLOOR_DEG
-              << "° bias=" << RB_EXIT_TURN_BIAS_PX << "px (restored after EXITING)\n"
-              << "Parking: heading-hold, window=" << PARK_HEADING_WINDOW
-              << " kp=" << PARK_HEADING_KP
-              << " rev_steer=" << PARK_REVERSE_STEER_DEG
-              << "° settle=" << PARK_REVERSE_SETTLE_S << "s"
-              << " tof_blk=" << PARK_TOF_BLOCKED_MM << "mm"
-              << " HEADING_SIGN=" << (HEADING_SIGN > 0 ? "+1" : "-1")
-              << " PARK_HEADING_SIGN=" << (PARK_HEADING_SIGN > 0 ? "+1" : "-1") << "\n"
-              << "Press 'q' or ESC to quit\n\n";
+    std::cout << "\n=== UCR2026: Auto Run (Full Integrated) ===\n";
 
     while (!g_stopSignal) {
         camera.GetFrame(frame);
@@ -709,9 +632,7 @@ int main() {
         bool red_seen_this_frame    = false;
         bool green_seen_this_frame  = false;
 
-        // -----------------------------------------------------
         // 1. Sign detection + voter update
-        // -----------------------------------------------------
         if (signReady && (totalFrames % SIGN_INTERVAL_FRAMES) == 0) {
             cachedSigns = signDetector.Detect(frame, SIGN_CONF_THRESH, SIGN_NMS_THRESH);
 
@@ -755,9 +676,7 @@ int main() {
             voter.Update(classIds, ds);
         }
 
-        // -----------------------------------------------------
         // 2. RbState progression
-        // -----------------------------------------------------
         bool rb_visible_now = false;
         for (const auto& d : cachedSigns) {
             if ((d.name == "roundabout" || d.class_id == sign_class::ROUNDABOUT) &&
@@ -766,10 +685,8 @@ int main() {
                 break;
             }
         }
-        if (rb_visible_now) last_rb_visible_time = elapsed_total;
 
-        const bool rb_committed =
-            (voter.GetCommitted() == sign_class::ROUNDABOUT);
+        const bool rb_committed = (voter.GetCommitted() == sign_class::ROUNDABOUT);
 
         if (rb_state == RbState::APPROACH || rb_state == RbState::EXIT_PREP) {
             if (rb_visible_now) rb_missing_sign_ticks = 0;
@@ -778,17 +695,13 @@ int main() {
 
         switch (rb_state) {
             case RbState::NONE:
-                if (rb_committed &&
-                    elapsed_total >= rb_cooldown_until &&
+                if (rb_committed && elapsed_total >= rb_cooldown_until &&
                     turn_controller.state == v20::LaneTurnController::State::IDLE &&
                     !corner_assist.active()) {
                     rb_pass_count++;
                     if (rb_pass_count > 2) rb_pass_count = 2;
-                    std::printf("[RB] === Starting pass %d/2 ===\n", rb_pass_count);
-
                     rb_state = RbState::APPROACH;
                     rb_missing_sign_ticks = 0;
-                    rb_phase_start_time   = elapsed_total;
                     rb_bias_smoothed      = 0.0f;
                     turn_controller.waiting_for_tjunction   = false;
                     turn_controller.tjunction_cooldown      = 0.0;
@@ -799,7 +712,6 @@ int main() {
                 if (rb_missing_sign_ticks * dt_loop >= RB_MISSING_SIGN_S) {
                     rb_state = RbState::IN_CIRCLE;
                     rb_enter_time       = elapsed_total;
-                    rb_phase_start_time = elapsed_total;
                 }
                 break;
             case RbState::IN_CIRCLE: {
@@ -808,7 +720,6 @@ int main() {
                 if (timeout || rb_seen_again) {
                     rb_state = RbState::EXIT_PREP;
                     rb_missing_sign_ticks = 0;
-                    rb_phase_start_time   = elapsed_total;
                 }
                 break;
             }
@@ -816,7 +727,6 @@ int main() {
                 if (rb_missing_sign_ticks * dt_loop >= RB_MISSING_SIGN_S) {
                     rb_state = RbState::EXIT_SEARCH;
                     rb_exit_search_start = elapsed_total;
-                    rb_phase_start_time  = elapsed_total;
                 }
                 break;
             case RbState::EXIT_SEARCH: {
@@ -824,12 +734,6 @@ int main() {
                     const char* exit_dir = (rb_pass_count == 1) ? "LEFT" : "RIGHT";
                     turn_controller.TURN_STEER_DEG = RB_EXIT_TURN_FLOOR_DEG;
                     turn_controller.TURN_BIAS_PX   = RB_EXIT_TURN_BIAS_PX;
-
-                    std::printf("[RB] Pass %d/2 EXIT_SEARCH → start_turn(%s) floor=%.0f° bias=%.0fpx\n",
-                                rb_pass_count, exit_dir,
-                                turn_controller.TURN_STEER_DEG,
-                                turn_controller.TURN_BIAS_PX);
-
                     turn_controller.start_turn(exit_dir, false);
                 }
                 const double in_exit = elapsed_total - rb_exit_search_start;
@@ -837,56 +741,36 @@ int main() {
                     (turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE ||
                      turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT)) {
                     turn_controller.force_execute_now();
-                    std::printf("[RB] EXIT_SEARCH force-execute at %.1fs\n", in_exit);
                 }
-                const bool moved_on =
-                    turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT ||
-                    turn_controller.state == v20::LaneTurnController::State::EXECUTE    ||
-                    turn_controller.state == v20::LaneTurnController::State::SETTLE;
+                const bool moved_on = (turn_controller.state != v20::LaneTurnController::State::IDLE &&
+                                       turn_controller.state != v20::LaneTurnController::State::WAIT_CURVE);
                 const bool timed_out = in_exit >= RB_EXIT_SEARCH_TIMEOUT_S;
                 if (moved_on || timed_out) {
                     rb_state = RbState::EXITING;
                     rb_exiting_start = elapsed_total;
-                    rb_phase_start_time = elapsed_total;
                 }
                 break;
             }
             case RbState::EXITING: {
-                const bool turn_done =
-                    turn_controller.state == v20::LaneTurnController::State::IDLE;
-                const bool safety_timeout =
-                    (elapsed_total - rb_exiting_start) >= RB_CIRCLE_TIMEOUT_S;
+                const bool turn_done = turn_controller.state == v20::LaneTurnController::State::IDLE;
+                const bool safety_timeout = (elapsed_total - rb_exiting_start) >= RB_CIRCLE_TIMEOUT_S;
                 if (turn_done || safety_timeout) {
                     if (safety_timeout && !turn_done) {
                         turn_controller = v20::LaneTurnController{};
                         corner_assist.reset();
                     }
-
-                    // [P0] Restore default aggressive turn params so subsequent
-                    // 90° turns (loop-back T-junction, sign turns) are not
-                    // limited to the gentle roundabout-exit values.
                     turn_controller.TURN_STEER_DEG = DEFAULT_TURN_STEER_DEG;
                     turn_controller.TURN_BIAS_PX   = DEFAULT_TURN_BIAS_PX;
-
                     rb_state = RbState::NONE;
                     rb_bias_smoothed = 0.0f;
 
                     if (rb_pass_count == 1) {
                         turn_controller.waiting_for_tjunction = true;
                         turn_controller.tjunction_cooldown = 8.0;
-                        std::printf("[RB] Pass 1 done — armed T-junction for loop-back "
-                                    "(turn defaults restored: %.0f° / %.0fpx)\n",
-                                    turn_controller.TURN_STEER_DEG,
-                                    turn_controller.TURN_BIAS_PX);
                     } else {
                         turn_controller.waiting_for_tjunction = false;
-                        std::printf("[RB] Pass 2 done — roundabout sequence COMPLETE "
-                                    "(turn defaults restored: %.0f° / %.0fpx)\n",
-                                    turn_controller.TURN_STEER_DEG,
-                                    turn_controller.TURN_BIAS_PX);
                         rb_pass_count = 0;
                     }
-
                     rb_cooldown_until = elapsed_total + RB_COOLDOWN_S;
                     voter.Reset();
                     active_turn_sign_class = -1;
@@ -895,283 +779,141 @@ int main() {
             }
         }
 
-        if (rb_state != rb_state_prev) {
-            std::printf("[RB] %-10s -> %-10s t=%.2f sign=%s bias=%.1f pass=%d\n",
-                        RbStateName(rb_state_prev), RbStateName(rb_state),
-                        elapsed_total, SignName(voter.GetCommitted()),
-                        rb_bias_smoothed, rb_pass_count);
-            rb_state_prev = rb_state;
-        }
-
-        // -----------------------------------------------------
         // 3. Sensor reads
-        // -----------------------------------------------------
-        float heading_now   = 0.0f;
-        bool  heading_ok    = false;
-        float tof_left_mm   = -1.0f;
-        float tof_right_mm  = -1.0f;
-
+        heading_ok = false;
         if (imu_ok) {
             BNO055::Data imu_data;
             if (imu.read(imu_data)) {
-                // [P1] HEADING_SIGN flips the raw axis only. PARK_HEADING_SIGN
-                // (further below) flips the P-controller error sign — the two
-                // are independent so either can be adjusted without breaking
-                // the other.
-                heading_now = HEADING_SIGN * static_cast<float>(imu_data.eulerDeg.x);
-                heading_ok  = true;
+                current_heading = HEADING_SIGN * static_cast<float>(imu_data.eulerDeg.x);
+                heading_ok = true;
             }
         }
 
+        tof_left = -1.0f;
+        tof_right = -1.0f;
         if (tof_ok) {
             sensor::TOFReadings readings;
             tof.Read(readings, std::chrono::milliseconds(50));
-            if (readings[TOF_IDX_REAR_LEFT].valid &&
-                readings[TOF_IDX_REAR_LEFT].distanceMm > 0)
-                tof_left_mm  = static_cast<float>(
-                    readings[TOF_IDX_REAR_LEFT].distanceMm);
-            if (readings[TOF_IDX_REAR_RIGHT].valid &&
-                readings[TOF_IDX_REAR_RIGHT].distanceMm > 0)
-                tof_right_mm = static_cast<float>(
-                    readings[TOF_IDX_REAR_RIGHT].distanceMm);
+            if (readings[TOF_IDX_LEFT].valid && readings[TOF_IDX_LEFT].distanceMm > 0)
+                tof_left = static_cast<float>(readings[TOF_IDX_LEFT].distanceMm);
+            if (readings[TOF_IDX_RIGHT].valid && readings[TOF_IDX_RIGHT].distanceMm > 0)
+                tof_right = static_cast<float>(readings[TOF_IDX_RIGHT].distanceMm);
         }
 
-        // -----------------------------------------------------
-        // 4. Parking state machine
-        // -----------------------------------------------------
-        if (park_state == ParkState::NONE &&
-            rb_state == RbState::NONE &&
-            turn_controller.state == v20::LaneTurnController::State::IDLE &&
-            !corner_assist.active() &&
-            voter.GetCommitted() == sign_class::PARKING) {
-            park_state = ParkState::CAPTURE;
-            park_heading_buf.clear();
-            park_capture_elapsed = 0.0;
-            std::printf("[PARK] Parking sign → CAPTURE\n");
-        }
-
-        park_angle_override = 0.0f;
-        park_speed_override = 0.0f;
-
-        switch (park_state) {
-            case ParkState::CAPTURE: {
-                park_capture_elapsed += dt_loop;
-                if (heading_ok) {
-                    park_heading_buf.push_back(heading_now);
-                    if ((int)park_heading_buf.size() > PARK_HEADING_WINDOW)
-                        park_heading_buf.pop_front();
-                }
-                if ((int)park_heading_buf.size() >= PARK_HEADING_WINDOW) {
-                    std::vector<float> samples(park_heading_buf.begin(),
-                                               park_heading_buf.end());
-                    park_ref_heading = medianHeadingDeg(samples);
-                    park_state = ParkState::SLOT_SEARCH;
-                    std::printf("[PARK] Reference captured: %.2f° → SLOT_SEARCH\n",
-                                park_ref_heading);
-                } else if (park_capture_elapsed >= PARK_CAPTURE_TIMEOUT_S) {
-                    if (park_heading_buf.empty()) {
-                        std::printf("[PARK] CAPTURE timeout, no samples → ABORT\n");
-                        park_state = ParkState::NONE;
-                    } else {
-                        std::vector<float> samples(park_heading_buf.begin(),
-                                                   park_heading_buf.end());
-                        park_ref_heading = medianHeadingDeg(samples);
-                        park_state = ParkState::SLOT_SEARCH;
-                        std::printf("[PARK] CAPTURE timeout, using %zu samples: %.2f° → SLOT_SEARCH\n",
-                                    park_heading_buf.size(), park_ref_heading);
-                    }
-                }
-                break;
-            }
-            case ParkState::SLOT_SEARCH: {
-                if (tof_left_mm > 0 && tof_right_mm > 0) {
-                    bool lb = left_blocked_h
-                        ? (tof_left_mm  < PARK_TOF_BLOCKED_MM + PARK_TOF_HYST_MM)
-                        : (tof_left_mm  < PARK_TOF_BLOCKED_MM - PARK_TOF_HYST_MM);
-                    bool rb = right_blocked_h
-                        ? (tof_right_mm < PARK_TOF_BLOCKED_MM + PARK_TOF_HYST_MM)
-                        : (tof_right_mm < PARK_TOF_BLOCKED_MM - PARK_TOF_HYST_MM);
-                    left_blocked_h  = lb;
-                    right_blocked_h = rb;
-                    if (lb != rb) {
-                        park_side = lb ? -1 : +1;
-                        park_state = ParkState::SLOT_FOUND;
-                        std::printf("[PARK] Slot detected (%s) → SLOT_FOUND\n",
-                                    lb ? "LEFT" : "RIGHT");
-                    }
-                }
-                if (heading_ok) {
-                    float herr = PARK_HEADING_SIGN * normalizeAngleP(park_ref_heading - heading_now);
-                    double a = PARK_HEADING_KP * herr;
-                    a = std::clamp(a, -(double)PARK_HEADING_MAX_DEG, (double)PARK_HEADING_MAX_DEG);
-                    park_angle_override = (float)a;
-                }
-                park_speed_override = PARK_APPROACH_SPEED_CMS;
-                break;
-            }
-            case ParkState::SLOT_FOUND: {
-                if (tof_left_mm > 0 && tof_right_mm > 0) {
-                    bool lb = left_blocked_h
-                        ? (tof_left_mm  < PARK_TOF_BLOCKED_MM + PARK_TOF_HYST_MM)
-                        : (tof_left_mm  < PARK_TOF_BLOCKED_MM - PARK_TOF_HYST_MM);
-                    bool rb = right_blocked_h
-                        ? (tof_right_mm < PARK_TOF_BLOCKED_MM + PARK_TOF_HYST_MM)
-                        : (tof_right_mm < PARK_TOF_BLOCKED_MM - PARK_TOF_HYST_MM);
-                    left_blocked_h  = lb;
-                    right_blocked_h = rb;
-                    if (lb && rb) {
-                        park_heading_0 = heading_now;
-                        park_stop_dwell_elapsed = 0.0;
-                        park_state = ParkState::WAIT_FULL_STOP;
-                        std::printf("[PARK] Both blocked, heading_0=%.2f° → STOP\n",
-                                    park_heading_0);
-                    }
-                }
-                if (heading_ok) {
-                    float herr = PARK_HEADING_SIGN * normalizeAngleP(park_ref_heading - heading_now);
-                    double a = PARK_HEADING_KP * herr;
-                    a = std::clamp(a, -(double)PARK_HEADING_MAX_DEG, (double)PARK_HEADING_MAX_DEG);
-                    park_angle_override = (float)a;
-                }
-                park_speed_override = PARK_APPROACH_SPEED_CMS;
-                break;
-            }
-            case ParkState::WAIT_FULL_STOP: {
-                park_angle_override = 0.0f;
-                park_speed_override = 0.0f;
-                park_stop_dwell_elapsed += dt_loop;
-                if (park_stop_dwell_elapsed >= PARK_STOP_DWELL_S) {
-                    park_reverse_elapsed = 0.0;
-                    park_state = ParkState::REVERSE_1;
-                    std::printf("[PARK] Stopped → REVERSE_1 (side=%s)\n",
-                                park_side < 0 ? "LEFT" : "RIGHT");
-                }
-                break;
-            }
-            case ParkState::REVERSE_1: {
-                park_reverse_elapsed += dt_loop;
-                park_angle_override = (park_side < 0) ? -PARK_REVERSE_STEER_DEG
-                                                      :  PARK_REVERSE_STEER_DEG;
-
-                // [P0] Servo-settle: hold speed 0 until the servo has had
-                // time to swing to the commanded angle, so the reverse arc
-                // starts with wheels already turned (previously the first
-                // ~0.3s of reversing happened mid-swing, shrinking the arc).
-                if (park_reverse_elapsed < PARK_REVERSE_SETTLE_S) {
-                    park_speed_override = 0.0f;
-                } else {
-                    park_speed_override = PARK_REVERSE_SPEED_CMS;
-                    if (heading_ok) {
-                        float d = std::abs(normalizeAngleP(heading_now - park_heading_0));
-                        if (d >= PARK_TARGET_HEADING_DEG) {
-                            park_state = ParkState::REVERSE_2;
-                            park_reverse_elapsed = 0.0;
-                            std::printf("[PARK] REVERSE_1 done (Δ=%.1f°) → REVERSE_2\n", d);
-                        }
-                    }
-                }
-                if (park_reverse_elapsed >= PARK_REVERSE_TIMEOUT_S) {
-                    float d_actual = heading_ok
-                        ? std::abs(normalizeAngleP(heading_now - park_heading_0))
-                        : -1.0f;
-                    std::printf("[PARK] REVERSE_1 TIMEOUT (Δ=%.1f°) → REVERSE_2\n", d_actual);
-                    park_state = ParkState::REVERSE_2;
-                    park_reverse_elapsed = 0.0;
-                }
-                break;
-            }
-            case ParkState::REVERSE_2: {
-                park_reverse_elapsed += dt_loop;
-                park_angle_override = (park_side < 0) ?  PARK_REVERSE_STEER_DEG
-                                                      : -PARK_REVERSE_STEER_DEG;
-
-                if (park_reverse_elapsed < PARK_REVERSE_SETTLE_S) {
-                    park_speed_override = 0.0f;
-                } else {
-                    park_speed_override = PARK_REVERSE_SPEED_CMS;
-                    if (heading_ok) {
-                        float d = std::abs(normalizeAngleP(heading_now - park_heading_0));
-                        if (d <= PARK_HEADING_TOL_DEG) {
-                            park_state = ParkState::DONE;
-                            std::printf("[PARK] REVERSE_2 done (Δ=%.1f°) → DONE\n", d);
-                        }
-                    }
-                }
-                if (park_reverse_elapsed >= PARK_REVERSE_TIMEOUT_S) {
-                    float d_actual = heading_ok
-                        ? std::abs(normalizeAngleP(heading_now - park_heading_0))
-                        : -1.0f;
-                    std::printf("[PARK] REVERSE_2 TIMEOUT (Δ=%.1f°) → DONE\n", d_actual);
-                    park_state = ParkState::DONE;
-                }
-                break;
-            }
-            case ParkState::DONE: {
-                park_angle_override = 0.0f;
-                park_speed_override = 0.0f;
-                break;
-            }
-            default: break;
-        }
-
-        // -----------------------------------------------------
-        // 5. Road inference
-        // -----------------------------------------------------
+        // 4. Road inference & Core logic
         bool roadOK = roadModel.Predict(frame, mask);
-
         v20::LaneFollower::Output out;
         float speed = MIN_SPEED_CMS;
         int   final_angle = 0;
-        v20::LaneTurnController::TurnResult turn_res{
-            v20::LaneTurnController::State::IDLE, 0.0, "NONE"};
+        v20::LaneTurnController::TurnResult turn_res{v20::LaneTurnController::State::IDLE, 0.0, "NONE"};
+        v20::ObstacleAvoidanceController::ObstacleResult obs_res;
         double applied_floor = 0.0;
-        double applied_cap   = 0.0;
-        float  final_bias    = 0.0f;
-        bool   exec_turn     = false;
+        bool parking_active = (park_state != ParkingState::IDLE);
 
         std::vector<cv::Point> ui_left_pts, ui_right_pts;
         int ui_y1 = 0, ui_y2 = 0;
-        int ui_lx1 = -1, ui_rx1 = -1, ui_lx2 = -1, ui_rx2 = -1;
-        int ui_lx_bot = -1, ui_rx_bot = -1;
 
-        const bool parking_active = (park_state != ParkState::NONE);
+        if (roadOK) {
+            int h = mask.rows, w = mask.cols;
+            int y1 = static_cast<int>(h * 0.45);
+            int y2 = static_cast<int>(h * 0.65);
+            int y_bottom = h - 1;
 
-        if (parking_active && park_state == ParkState::CAPTURE) {
-            if (roadOK) {
-                out = follower.step(mask, 0.0, false, 0.0, 0.0, /*park_mode=*/true);
-                speed = PARK_CAPTURE_SPEED_CMS;
-                previous_out = out;
-            } else {
-                out.angle = 0.0;
-                speed = 0.0f;
+            // --- PARKING: INIT & CORRIDOR LATCH ---
+            if (voter.GetCommitted() == sign_class::PARKING && park_state == ParkingState::IDLE) {
+                park_state = ParkingState::APPROACH;
+                slot1_confirm_cnt = 0; slot2_confirm_cnt = 0; slot3_confirm_cnt = 0;
+                if (heading_ok) park_straight_heading = current_heading;
             }
-        } else if (parking_active) {
-            out.angle = park_angle_override;
-            speed = park_speed_override;
-            out.valid = true;
-            previous_out.angle = out.angle;
-            previous_out.valid = true;
-        } else if (roadOK) {
-            const int h = mask.rows, w = mask.cols;
-            const int y1 = static_cast<int>(h * 0.45);
-            const int y2 = static_cast<int>(h * 0.65);
-            const int y_bottom = h - 1;
 
+            if (parking_active && !park_corridor.latched) {
+                auto get_raw_bounds = [&](const cv::Mat& m, int y_row, int& lx, int& rx) {
+                    lx = -1; rx = -1;
+                    if (m.empty() || y_row < 0 || y_row >= m.rows) return;
+                    const uchar* row = m.ptr<uchar>(y_row);
+                    int start = -1; int best_len = -1;
+                    for (int x = 0; x <= m.cols; x++) {
+                        bool on = (x < m.cols) && (row[x] > 0);
+                        if (on && start < 0) start = x;
+                        if (!on && start >= 0) {
+                            int end_x = x - 1; int len = x - start;
+                            if (len > 15 && len > best_len) { best_len = len; lx = start; rx = end_x; }
+                            start = -1;
+                        }
+                    }
+                };
+
+                int raw_lx1 = -1, raw_rx1 = -1, raw_lx_bot = -1, raw_rx_bot = -1;
+                get_raw_bounds(mask, y1, raw_lx1, raw_rx1);
+                get_raw_bounds(mask, y_bottom, raw_lx_bot, raw_rx_bot);
+
+                int clx_bot = (raw_lx_bot > 5 && raw_lx_bot < w / 2 - 10) ? raw_lx_bot : 50;
+                int crx_bot = (raw_rx_bot > w / 2 + 10 && raw_rx_bot < w - 6) ? raw_rx_bot : (w - 51);
+
+                int center_bot = (clx_bot + crx_bot) / 2;
+                int half_w_bot = std::max((crx_bot - clx_bot) / 2 + PARK_CORRIDOR_EXTRA_MARGIN_PX, 185);
+                int half_w_far = static_cast<int>(half_w_bot * PARK_CORRIDOR_FAR_RATIO);
+
+                park_corridor.x_left_bot  = std::clamp(center_bot - half_w_bot, 5, w / 2 - 25);
+                park_corridor.x_right_bot = std::clamp(center_bot + half_w_bot, w / 2 + 25, w - 6);
+                park_corridor.x_left_far  = std::clamp(center_bot - half_w_far, 10, w / 2 - 15);
+                park_corridor.x_right_far = std::clamp(center_bot + half_w_far, w / 2 + 15, w - 11);
+                park_corridor.y_bot       = y_bottom;
+                park_corridor.y_far       = y1;
+                park_corridor.latched     = true;
+                if (heading_ok) park_straight_heading = current_heading;
+            }
+
+            // Mask out everything outside the corridor
+            cv::Mat active_mask = mask;
+            cv::Mat park_mask;
+            if (parking_active && park_corridor.latched) {
+                park_mask = mask.clone();
+                for (int y = 0; y < park_mask.rows; ++y) {
+                    int xl = std::clamp(park_corridor.get_left_x(y), 0, park_mask.cols);
+                    int xr = std::clamp(park_corridor.get_right_x(y), 0, park_mask.cols);
+                    uchar* ptr = park_mask.ptr<uchar>(y);
+                    if (xl > 0) std::memset(ptr, 0, xl);
+                    if (xr < park_mask.cols) std::memset(ptr + xr, 0, park_mask.cols - xr);
+                }
+                active_mask = park_mask;
+            }
+
+            const int pref_side = turn_controller.get_preferred_side();
             auto get_mask_boundaries = [&](int y_row, int& lx, int& rx) {
                 lx = -1; rx = -1;
                 if (y_row < 0 || y_row >= h) return;
-                const uchar* row = mask.ptr<uchar>(y_row);
-                int start = -1, best_len = -1;
+                const uchar* row = active_mask.ptr<uchar>(y_row);
+                int start = -1; int best_len = -1;
+                bool has_pref = false;
+                const int half_w = w / 2;
                 for (int x = 0; x <= w; x++) {
                     bool on = (x < w) && (row[x] > 0);
                     if (on && start < 0) start = x;
                     if (!on && start >= 0) {
-                        int len = x - start;
-                        if (len > best_len) { best_len = len; lx = start; rx = x - 1; }
+                        int end_x = x - 1; int len = x - start;
+                        if (len > 15) {
+                            const int seg_center = (start + end_x) / 2;
+                            bool is_pref = (pref_side < 0 && seg_center <= half_w) || (pref_side > 0 && seg_center >= half_w);
+                            bool take = false;
+                            if (pref_side != 0) {
+                                if (is_pref && !has_pref) take = true;
+                                else if (is_pref && has_pref) {
+                                    if (pref_side < 0 && start < lx) take = true;
+                                    if (pref_side > 0 && end_x > rx) take = true;
+                                } else if (!has_pref && len > best_len) take = true;
+                            } else if (len > best_len) take = true;
+
+                            if (take) {
+                                best_len = len; lx = start; rx = end_x;
+                                if (is_pref) has_pref = true;
+                            }
+                        }
                         start = -1;
                     }
                 }
             };
+
             auto find_edge_corner_points = [&](int sy, int ey, bool is_left) {
                 std::vector<cv::Point> pts;
                 bool touching = false;
@@ -1191,8 +933,6 @@ int main() {
             get_mask_boundaries(y1, lx1, rx1);
             get_mask_boundaries(y2, lx2, rx2);
             get_mask_boundaries(y_bottom, lx_bot, rx_bot);
-            ui_lx1 = lx1; ui_rx1 = rx1; ui_lx2 = lx2; ui_rx2 = rx2;
-            ui_lx_bot = lx_bot; ui_rx_bot = rx_bot;
 
             std::vector<cv::Point> left_pts, right_pts;
             if (lx1 != -1) left_pts.push_back(cv::Point(lx1, y1));
@@ -1205,78 +945,235 @@ int main() {
             if (rx2 != -1) right_pts.push_back(cv::Point(rx2, y2));
             if (rx_bot != -1) right_pts.push_back(cv::Point(rx_bot, y_bottom));
 
-            std::sort(left_pts.begin(), left_pts.end(),
-                      [](const cv::Point& a, const cv::Point& b){ return a.y < b.y; });
-            std::sort(right_pts.begin(), right_pts.end(),
-                      [](const cv::Point& a, const cv::Point& b){ return a.y < b.y; });
+            std::sort(left_pts.begin(), left_pts.end(), [](const cv::Point& a, const cv::Point& b){ return a.y < b.y; });
+            std::sort(right_pts.begin(), right_pts.end(), [](const cv::Point& a, const cv::Point& b){ return a.y < b.y; });
+            left_pts.erase(std::unique(left_pts.begin(), left_pts.end()), left_pts.end());
+            right_pts.erase(std::unique(right_pts.begin(), right_pts.end()), right_pts.end());
 
-            ui_left_pts  = left_pts;
-            ui_right_pts = right_pts;
+            ui_left_pts = left_pts; ui_right_pts = right_pts;
             ui_y1 = y1; ui_y2 = y2;
 
+            const bool hazard_stop = ((elapsed_total - last_person_seen_time) <= PERSON_STOP_HANGOVER_S) ||
+                                     ((elapsed_total - last_red_seen_time) <= RED_LIGHT_HANGOVER_S);
+
+            // --- TURN / SIGN ACCEPTANCE ---
             SignCommit signCommit = MakeSignCommit(voter.GetCommitted());
+            const bool can_accept_sign = !parking_active && (rb_state == RbState::NONE) && !corner_assist.active() &&
+                (turn_controller.state == v20::LaneTurnController::State::IDLE ||
+                 ((turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE ||
+                   turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT) &&
+                  signCommit.active && active_turn_sign_class != signCommit.class_id));
 
-            if (rb_state == RbState::NONE &&
-                signCommit.active &&
-                turn_controller.state == v20::LaneTurnController::State::IDLE &&
-                !corner_assist.active() &&
-                elapsed_total >= sign_block_until_time) {
-                std::string dir = (signCommit.side == -1) ? "LEFT" : "RIGHT";
-                turn_controller.start_turn(dir, false);
-                active_turn_sign_class = signCommit.class_id;
-                voter.Reset();
+            if (can_accept_sign && elapsed_total >= sign_block_until_time) {
+                if (signCommit.active) {
+                    std::string dir = (signCommit.side == -1) ? "LEFT" : "RIGHT";
+                    turn_controller.start_turn(dir, false);
+                    active_turn_sign_class = signCommit.class_id;
+                    voter.Reset();
+                }
             }
 
-            turn_res = turn_controller.update(
-                left_pts, right_pts, dt_loop, previous_out.valid,
-                lx1, rx1, lx2, rx2, w,
-                signCommit.active
-            );
+            if (!parking_active && !hazard_stop) {
+                turn_res = turn_controller.update(left_pts, right_pts, dt_loop, previous_out.valid,
+                                                  lx1, rx1, lx2, rx2, w, signCommit.active);
+            } else {
+                if (turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE ||
+                    turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT) {
+                    turn_controller.straight_frames = 0;
+                }
+                turn_res.state = turn_controller.state;
+                turn_res.direction = turn_controller.direction;
+                turn_res.straight_frames = turn_controller.straight_frames;
+                turn_res.t_junction_count = turn_controller.t_junction_count;
+            }
 
-            applied_floor = turn_res.steer_floor_deg;
-            applied_cap   = turn_res.steer_cap_deg;
-
-            if (rb_state == RbState::NONE &&
-                turn_controller.state == v20::LaneTurnController::State::IDLE) {
-                double cf = corner_assist.update(
+            // --- OBSTACLE AVOIDANCE ---
+            const bool turn_active_or_armed = (turn_controller.state != v20::LaneTurnController::State::IDLE) ||
+                                              (rb_state != RbState::NONE) || (signCommit.active) || (active_turn_sign_class != -1);
+            if (!parking_active && !hazard_stop && !turn_active_or_armed) {
+                obs_res = obstacle_controller.update(active_mask, left_pts, right_pts,
                     lx1, rx1, lx2, rx2, lx_bot, rx_bot, w, dt_loop,
-                    signCommit.active,
-                    previous_out.near_e, previous_out.mid_e, previous_out.far_e
-                );
-                if (std::abs(cf) > std::abs(applied_floor)) applied_floor = cf;
-            } else if (rb_state != RbState::NONE) {
-                corner_assist.reset();
+                    previous_out.near_e, previous_out.mid_e, previous_out.far_e);
+            } else {
+                obstacle_controller.reset();
             }
 
-            // ---- Roundabout bias table (EMA-smoothed) ----
+            // --- ROUNDABOUT BIAS ---
             float rb_bias_px = 0.0f;
-            switch (rb_state) {
-                case RbState::APPROACH:    rb_bias_px = +RB_BIAS_PX_RIGHT; break;
-                case RbState::IN_CIRCLE:   rb_bias_px = -RB_BIAS_PX_LEFT;  break;
-                case RbState::EXIT_PREP:   rb_bias_px = +RB_BIAS_PX_RIGHT; break;
-                case RbState::EXIT_SEARCH: rb_bias_px = 0.0f;              break;
-                default:                   rb_bias_px =  0.0f;             break;
+            if (rb_state != RbState::NONE) {
+                corner_assist.reset();
+                switch (rb_state) {
+                    case RbState::APPROACH:    rb_bias_px = +RB_BIAS_PX_RIGHT; break;
+                    case RbState::IN_CIRCLE:   rb_bias_px = -RB_BIAS_PX_LEFT;  break;
+                    case RbState::EXIT_PREP:   rb_bias_px = +RB_BIAS_PX_RIGHT; break;
+                    case RbState::EXIT_SEARCH: rb_bias_px = 0.0f;              break;
+                    default:                   rb_bias_px = 0.0f;              break;
+                }
+                rb_bias_smoothed = (1.0f - RB_BIAS_EMA) * rb_bias_smoothed + RB_BIAS_EMA * rb_bias_px;
+            } else {
+                rb_bias_smoothed = 0.0f;
             }
-            rb_bias_smoothed = (1.0f - RB_BIAS_EMA) * rb_bias_smoothed + RB_BIAS_EMA * rb_bias_px;
-            final_bias = rb_bias_smoothed;
-            if (turn_controller.state != v20::LaneTurnController::State::IDLE) {
-                final_bias += turn_res.steer_bias_px;
-            }
-            exec_turn = (rb_state != RbState::NONE) || turn_res.lock_opposite_err;
 
+            // --- AGGREGATE BIAS & FLOOR ---
+            double effective_bias      = (rb_state != RbState::NONE) ? rb_bias_smoothed : turn_res.steer_bias_px;
+            double effective_floor     = turn_res.steer_floor_deg;
+            int    effective_pref_side = turn_controller.get_preferred_side();
+            bool   effective_is_turn   = (rb_state != RbState::NONE) || turn_res.lock_opposite_err;
+
+            if (rb_state != RbState::NONE) {
+                if (turn_controller.state != v20::LaneTurnController::State::IDLE) {
+                    effective_bias += turn_res.steer_bias_px;
+                }
+            } else if (!parking_active && obstacle_controller.active()) {
+                effective_bias      = obs_res.steer_bias_px;
+                effective_floor     = obs_res.steer_floor_deg;
+                effective_pref_side = obs_res.preferred_side;
+                effective_is_turn   = true;
+            } else {
+                const bool allow_corner_assist = !parking_active && !hazard_stop && (
+                    (turn_controller.state == v20::LaneTurnController::State::IDLE) ||
+                    (turn_controller.is_unmarked_tjunction && turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE &&
+                     !turn_res.junction_opened && !(lx2 >= 0 && lx2 <= 15 && rx2 >= w - 15)));
+                if (allow_corner_assist) {
+                    const double cf = corner_assist.update(lx1, rx1, lx2, rx2, lx_bot, rx_bot, w, dt_loop,
+                        (signCommit.active), previous_out.near_e, previous_out.mid_e, previous_out.far_e);
+                    if (std::abs(cf) > std::abs(effective_floor)) effective_floor = cf;
+                } else if (!hazard_stop) {
+                    corner_assist.reset();
+                }
+            }
+            applied_floor = effective_floor;
+
+            // --- PARKING STATE MACHINE UPDATE ---
+            const bool is_left_blocked  = (tof_left > 0.0f && tof_left < PARK_TOF_BLOCKED_MM);
+            const bool is_right_blocked = (tof_right > 0.0f && tof_right < PARK_TOF_BLOCKED_MM);
+            const bool is_left_free     = (tof_left < 0.0f || tof_left >= PARK_TOF_BLOCKED_MM);
+            const bool is_right_free    = (tof_right < 0.0f || tof_right >= PARK_TOF_BLOCKED_MM);
+
+            if (parking_active) {
+                switch (park_state) {
+                    case ParkingState::APPROACH:
+                    case ParkingState::SLOT1_WAIT_BLOCKED: {
+                        if (is_left_blocked && is_right_blocked) {
+                            slot1_confirm_cnt++;
+                            if (slot1_confirm_cnt >= 2) {
+                                slot1_tof_left  = tof_left;
+                                slot1_tof_right = tof_right;
+                                park_state = ParkingState::SLOT2_SEARCH_FREE;
+                            }
+                        } else slot1_confirm_cnt = 0;
+                        break;
+                    }
+                    case ParkingState::SLOT2_SEARCH_FREE: {
+                        if (is_left_free && is_right_blocked) {
+                            slot2_confirm_cnt++;
+                            if (slot2_confirm_cnt >= 2) {
+                                park_free_side = -1;
+                                slot2_tof_left = tof_left; slot2_tof_right = tof_right;
+                                park_state = ParkingState::SLOT3_WAIT_BLOCKED;
+                            }
+                        } else if (is_right_free && is_left_blocked) {
+                            slot2_confirm_cnt++;
+                            if (slot2_confirm_cnt >= 2) {
+                                park_free_side = 1;
+                                slot2_tof_left = tof_left; slot2_tof_right = tof_right;
+                                park_state = ParkingState::SLOT3_WAIT_BLOCKED;
+                            }
+                        } else slot2_confirm_cnt = 0;
+                        break;
+                    }
+                    case ParkingState::SLOT3_WAIT_BLOCKED: {
+                        if (is_left_blocked && is_right_blocked) {
+                            slot3_confirm_cnt++;
+                            if (slot3_confirm_cnt >= 2) {
+                                slot3_tof_left  = tof_left;
+                                slot3_tof_right = tof_right;
+                                if (heading_ok) park_heading_0 = current_heading;
+                                park_dwell_time = 0.0;
+                                park_state = ParkingState::WAIT_FULL_STOP;
+                            }
+                        } else slot3_confirm_cnt = 0;
+                        break;
+                    }
+                    case ParkingState::WAIT_FULL_STOP: {
+                        park_dwell_time += dt_loop;
+                        if (heading_ok) park_heading_0 = current_heading;
+                        if (park_dwell_time >= PARK_STOP_DWELL_S) {
+                            park_state = ParkingState::REVERSE_1;
+                            park_reverse_elapsed = 0.0;
+                        }
+                        break;
+                    }
+                    case ParkingState::REVERSE_1: {
+                        park_reverse_elapsed += dt_loop;
+                        float delta_h = std::abs(normalizeAngleP(current_heading - park_heading_0));
+                        if (delta_h >= PARK_TARGET_DELTA_DEG || park_reverse_elapsed >= 7.0) {
+                            park_state = ParkingState::REVERSE_2;
+                            park_reverse_elapsed = 0.0;
+                        }
+                        break;
+                    }
+                    case ParkingState::REVERSE_2: {
+                        park_reverse_elapsed += dt_loop;
+                        float delta_h = std::abs(normalizeAngleP(current_heading - park_heading_0));
+                        if (delta_h <= PARK_ALIGN_TOL_DEG || park_reverse_elapsed >= 7.0) {
+                            park_state = ParkingState::DONE;
+                        }
+                        break;
+                    }
+                    default: break;
+                }
+            }
+
+            // --- EXECUTE LANE FOLLOWER ---
+            out = follower.step(
+                active_mask,
+                effective_bias,
+                effective_is_turn,
+                applied_floor,
+                turn_res.steer_cap_deg,
+                effective_pref_side,
+                obs_res.lock_obstacle_dir,
+                obs_res.obstacle_side
+            );
+            previous_out = out;
+            
             if (turn_res.state == v20::LaneTurnController::State::DONE) {
                 sign_block_until_time = elapsed_total + SIGN_BLOCK_SECONDS;
                 voter.Reset();
                 active_turn_sign_class = -1;
             }
 
-            out = follower.step(mask, final_bias, exec_turn, applied_floor, applied_cap);
-            previous_out = out;
-
-            speed = static_cast<float>(out.speed);
-            if (rb_state != RbState::NONE && out.valid) {
-                speed = std::clamp(speed, RB_SPEED_MIN_CMS, RB_SPEED_MAX_CMS);
+            // --- FINAL SPEED & ANGLE ---
+            if (parking_active) {
+                if (park_state == ParkingState::WAIT_FULL_STOP || park_state == ParkingState::DONE) {
+                    speed = 0.0f;
+                    out.angle = 0.0f;
+                } else if (park_state == ParkingState::REVERSE_1) {
+                    speed = PARK_REVERSE_SPEED;
+                    out.angle = (park_free_side < 0) ? -PARK_MAX_STEER_DEG : PARK_MAX_STEER_DEG;
+                } else if (park_state == ParkingState::REVERSE_2) {
+                    speed = PARK_REVERSE_SPEED;
+                    out.angle = (park_free_side < 0) ? PARK_MAX_STEER_DEG : -PARK_MAX_STEER_DEG;
+                } else {
+                    speed = PARK_APPROACH_SPEED;
+                    float heading_corr = 0.0f;
+                    if (heading_ok) {
+                        float h_err = normalizeAngleP(current_heading - park_straight_heading);
+                        heading_corr = std::clamp(-PARK_HEADING_KP * h_err, -PARK_HEADING_MAX_CORR_DEG, PARK_HEADING_MAX_CORR_DEG);
+                    }
+                    out.angle = std::clamp(out.angle + PARK_STEER_TRIM_DEG + heading_corr, -16.0, 16.0);
+                }
+            } else if (hazard_stop) {
+                speed = 0.0f;
+                out.angle = 0.0f;
+            } else {
+                speed = static_cast<float>(out.speed);
+                if (rb_state != RbState::NONE && out.valid) {
+                    speed = std::clamp(speed, RB_SPEED_MIN_CMS, RB_SPEED_MAX_CMS);
+                }
             }
+
         } else {
             previous_out = v20::LaneFollower::Output{};
             motor.SetSpeedCms(0.0f);
@@ -1295,17 +1192,7 @@ int main() {
             continue;
         }
 
-        // -----------------------------------------------------
-        // 6. Stop overrides, soft-start, servo, motor
-        // -----------------------------------------------------
-        if (!parking_active) {
-            const bool stopForPerson =
-                (elapsed_total - last_person_seen_time) <= PERSON_STOP_HANGOVER_S;
-            const bool stopForRedLight =
-                (elapsed_total - last_red_seen_time) <= RED_LIGHT_HANGOVER_S;
-            if (stopForPerson || stopForRedLight) speed = 0.0f;
-        }
-
+        // 6. Output Soft-start, Servo, Motor
         const float max_delta = MAX_ACCEL_CMS2 * static_cast<float>(dt_loop);
         if (speed > applied_speed)
             applied_speed = std::min(speed, applied_speed + max_delta);
@@ -1313,27 +1200,22 @@ int main() {
             applied_speed = speed;
 
         float desired_real_left = -static_cast<float>(out.angle);
-        desired_real_left = std::clamp(desired_real_left,
-                                       -MAX_REAL_ANGLE_DEG, MAX_REAL_ANGLE_DEG);
+        desired_real_left = std::clamp(desired_real_left, -MAX_REAL_ANGLE_DEG, MAX_REAL_ANGLE_DEG);
         float servo_cmd = RealAngleToServo(desired_real_left);
-        servo_cmd = std::clamp(servo_cmd,
-                               -static_cast<float>(MAX_SERVO_CMD),
-                                static_cast<float>(MAX_SERVO_CMD));
+        servo_cmd = std::clamp(servo_cmd, -static_cast<float>(MAX_SERVO_CMD), static_cast<float>(MAX_SERVO_CMD));
         final_angle = static_cast<int>(std::lround(servo_cmd));
 
         motor.SetSpeedCms(applied_speed);
         servo.SetAngle(final_angle);
 
-        // -----------------------------------------------------
-        // Telemetry (UCR 2026)
-        // -----------------------------------------------------
+        // --- TELEMETRY ---
         if (telem_ready) {
             telemetry::StateInputs ti;
             ti.pedestrian_detected  = person_seen_this_frame;
             ti.red_light_detected   = red_seen_this_frame;
             ti.green_light_detected = green_seen_this_frame;
             ti.in_roundabout        = (rb_state != RbState::NONE);
-            ti.parking_active       = (park_state != ParkState::NONE);
+            ti.parking_active       = (park_state != ParkingState::IDLE);
             ti.bridge_active        = false;
             ti.active_sign_class    = active_turn_sign_class;
             ti.last_seen_sign_class = voter.GetCommitted();
@@ -1346,24 +1228,16 @@ int main() {
 
         ++tickIdx;
 
-        // 1 Hz debug
+        // 1 Hz debug print
         static auto lastLog = std::chrono::steady_clock::now();
         auto tNow = std::chrono::steady_clock::now();
         if (tNow - lastLog >= std::chrono::seconds(1)) {
             std::printf(
-                "[t=%ld] sign=%-11s(%d) rb=%-11s(p%d) park=%-11s "
-                "near=%6.1f hdg=%7.2f ref=%7.2f tofL=%5.1f tofR=%5.1f "
+                "[t=%ld] sign=%-11s rb=%-11s park=%-11s near=%6.1f hdg=%7.2f tofL=%5.1f tofR=%5.1f "
                 "spd=%.1f pid=%.1f srv=%d telem=%d(%s)\n",
-                tickIdx,
-                SignName(voter.GetCommitted()),
-                voter.GetCommitted(),
-                RbStateName(rb_state),
-                rb_pass_count,
-                ParkStateName(park_state),
-                out.near_e, heading_now, park_ref_heading,
-                tof_left_mm, tof_right_mm,
-                applied_speed, out.angle, final_angle,
-                telem_ready ? telem.CurrentState() : -1,
+                tickIdx, SignName(voter.GetCommitted()), RbStateName(rb_state),
+                ParkingStateStr(park_state), out.near_e, current_heading, tof_left, tof_right,
+                applied_speed, out.angle, final_angle, telem_ready ? telem.CurrentState() : -1,
                 telem_ready ? telemetry::VehicleStateName(telem.CurrentState()) : "OFF");
             lastLog = tNow;
         }
@@ -1376,65 +1250,54 @@ int main() {
             if (dt_fps > 0.5) { currentFps = frameCount / dt_fps; frameCount = 0; tPrev = tF; }
         }
 
-        // UI
+        // --- UI ---
         if (SHOW_UI) {
             cv::Mat overlay = frame.clone();
 
-            if (roadOK && parking_active && park_state != ParkState::CAPTURE) {
-                // Skip mask overlay during pure heading-hold
-            } else if (roadOK) {
+            if (roadOK) {
                 cv::Mat green(frame.size(), frame.type(), cv::Scalar(0, 255, 0));
                 cv::Mat blended;
                 cv::addWeighted(frame, 0.65, green, 0.35, 0, blended);
                 blended.copyTo(overlay, mask);
 
+                // Parking Corridor
+                if (parking_active && park_corridor.latched) {
+                    cv::line(overlay, cv::Point(park_corridor.x_left_bot, park_corridor.y_bot),
+                                      cv::Point(park_corridor.x_left_far, park_corridor.y_far),
+                                      cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+                    cv::line(overlay, cv::Point(park_corridor.x_right_bot, park_corridor.y_bot),
+                                      cv::Point(park_corridor.x_right_far, park_corridor.y_far),
+                                      cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+                }
+
                 if (ui_y1 > 0 && ui_y2 > 0) {
-                    cv::line(overlay, cv::Point(0, ui_y1), cv::Point(frame.cols - 1, ui_y1),
-                             cv::Scalar(0, 0, 255), 1);
-                    cv::line(overlay, cv::Point(0, ui_y2), cv::Point(frame.cols - 1, ui_y2),
-                             cv::Scalar(0, 0, 255), 1);
+                    cv::line(overlay, cv::Point(0, ui_y1), cv::Point(frame.cols - 1, ui_y1), cv::Scalar(0, 0, 255), 1);
+                    cv::line(overlay, cv::Point(0, ui_y2), cv::Point(frame.cols - 1, ui_y2), cv::Scalar(0, 0, 255), 1);
                 }
                 for (size_t i = 0; i + 1 < ui_left_pts.size(); ++i)
                     cv::line(overlay, ui_left_pts[i], ui_left_pts[i + 1], cv::Scalar(255, 0, 0), 2);
                 for (size_t i = 0; i + 1 < ui_right_pts.size(); ++i)
                     cv::line(overlay, ui_right_pts[i], ui_right_pts[i + 1], cv::Scalar(255, 0, 0), 2);
-                for (const auto& p : ui_left_pts) cv::circle(overlay, p, 3, cv::Scalar(0, 255, 0), -1);
-                for (const auto& p : ui_right_pts) cv::circle(overlay, p, 3, cv::Scalar(0, 255, 0), -1);
 
-                if (out.proc_width > 0 && out.proc_height > 0) {
-                    float sx = float(frame.cols) / out.proc_width;
-                    float sy = float(frame.rows) / out.proc_height;
-                    for (size_t i = 0; i < out.centerline_pts.size(); i += 8) {
-                        int cx = int(out.centerline_pts[i].first * sx);
-                        int cy = int(out.centerline_pts[i].second * sy);
-                        cv::circle(overlay, cv::Point(cx, cy), 2, cv::Scalar(0, 255, 255), -1);
+                // Obstacle UI
+                if (obstacle_controller.active()) {
+                    if (obs_res.y_cut > 0) {
+                        cv::line(overlay, cv::Point(0, obs_res.y_cut), cv::Point(frame.cols - 1, obs_res.y_cut),
+                                 cv::Scalar(0, 140, 255), 2, cv::LINE_AA);
+                    }
+                    if (obs_res.state == v20::ObstacleAvoidanceController::State::DODGE) {
+                        std::string dodge_text = (obs_res.dodge_dir < 0) ? ">> DODGE LEFT <<" : ">> DODGE RIGHT <<";
+                        cv::putText(overlay, dodge_text, cv::Point(static_cast<int>(frame.cols * 0.12), 110),
+                                    cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 165, 255), 2, cv::LINE_AA);
                     }
                 }
             }
 
-            for (const auto& s : cachedSigns) {
-                cv::rectangle(overlay, s.box, cv::Scalar(0, 255, 255), 2);
-                char label[64];
-                std::snprintf(label, sizeof(label), "%s %.2f", s.name.c_str(), s.confidence);
-                cv::putText(overlay, label, {s.box.x, std::max(12, s.box.y - 5)},
-                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 255), 1);
-            }
-
             char t1[200], t2[200], t3[200], t4[200];
-            std::snprintf(t1, sizeof(t1),
-                "FPS %.1f | spd %.1f/%.1f | pid %.1f | srv %d",
-                currentFps, applied_speed, speed, out.angle, final_angle);
-            std::snprintf(t2, sizeof(t2),
-                "sign %s (%d) | rb %s (pass %d/2) | park %s",
-                SignName(voter.GetCommitted()), voter.GetCommitted(),
-                RbStateName(rb_state), rb_pass_count, ParkStateName(park_state));
-            std::snprintf(t3, sizeof(t3),
-                "hdg %.2f° ref %.2f° Δ%.2f°",
-                heading_now, park_ref_heading,
-                normalizeAngleP(heading_now - park_ref_heading));
-            std::snprintf(t4, sizeof(t4),
-                "tof L=%.0f R=%.0f (blk<%.0f) | near %.1f",
-                tof_left_mm, tof_right_mm, PARK_TOF_BLOCKED_MM, out.near_e);
+            std::snprintf(t1, sizeof(t1), "FPS %.1f | spd %.1f/%.1f | pid %.1f | srv %d", currentFps, applied_speed, speed, out.angle, final_angle);
+            std::snprintf(t2, sizeof(t2), "sign %s | rb %s | park %s", SignName(voter.GetCommitted()), RbStateName(rb_state), ParkingStateStr(park_state));
+            std::snprintf(t3, sizeof(t3), "hdg %.2f | tof L=%.0f R=%.0f", current_heading, tof_left, tof_right);
+            std::snprintf(t4, sizeof(t4), "near %.1f | obs %s", out.near_e, obstacle_controller.active() ? obs_res.state_str.c_str() : "NONE");
 
             cv::putText(overlay, t1, {10, 30}, cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 2);
             cv::putText(overlay, t2, {10, 55}, cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0, 255, 0), 2);
