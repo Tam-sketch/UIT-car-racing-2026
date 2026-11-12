@@ -25,6 +25,7 @@
 #include "perception/SignDetector.h"
 #include "sensor/BNO055.h"
 #include "sensor/TOF.h"
+#include "TelemetryHelper.h"   // ← add this line
 
 #include <opencv2/opencv.hpp>
 #include <NvInfer.h>
@@ -152,6 +153,15 @@ static constexpr double PARK_STOP_DWELL_S          = 0.5;
 static constexpr double PARK_REVERSE_TIMEOUT_S     = 4.0;
 
 static constexpr float PARK_HEADING_SIGN           = +1.0f;
+
+// ============================================================
+// TELEMETRY (UCR 2026 competition requirement)
+//   - Change TELEMETRY_SERVER_IP if the venue server differs.
+//   - TELEMETRY_CAR_ID must be ≤ 15 ASCII chars, no accents.
+// ============================================================
+static constexpr const char* TELEMETRY_SERVER_IP = "192.168.1.100";
+static constexpr int         TELEMETRY_PORT      = 9999;
+static constexpr const char* TELEMETRY_CAR_ID    = "UCR2026";
 
 volatile std::sig_atomic_t g_stopSignal = 0;
 static void SignalHandler(int) { g_stopSignal = 1; }
@@ -526,6 +536,18 @@ int main() {
         std::cerr << "[Main] Sign Detector init failed — turns/roundabout/parking DISABLED\n";
     }
 
+    // Telemetry: fire-and-forget UDP. Bad IP / no network is non-fatal —
+    // the helper just stops sending.
+    telemetry::Helper telem;
+    const bool telem_ready = telem.Init(TELEMETRY_SERVER_IP, TELEMETRY_PORT, TELEMETRY_CAR_ID);
+    if (!telem_ready) {
+        std::cerr << "[TELEM] Init FAILED (bad IP or socket) — telemetry DISABLED\n";
+    } else {
+        std::cout << "[TELEM] Init OK → " << TELEMETRY_SERVER_IP
+                  << ":" << TELEMETRY_PORT
+                  << " car='" << TELEMETRY_CAR_ID << "'\n";
+    }
+
     ucr::control::SignVoter voter(
         SIGN_VOTER_ACTIVATE_FRAMES,
         SIGN_VOTER_TIMEOUT_DS);
@@ -567,6 +589,10 @@ int main() {
     double   last_red_seen_time    = -1e9;
     double   sign_block_until_time = -1.0;
 
+    // Telemetry-only (not used for control): the sign that started the
+    // currently-running turn, so state survives voter.Reset().
+    int      active_turn_sign_class = -1;
+
     // Parking state
     ParkState park_state              = ParkState::NONE;
     std::deque<float> park_heading_buf;
@@ -599,6 +625,8 @@ int main() {
               << "Sign: " << SIGN_ENGINE_PATH << (signReady ? "" : " (DISABLED)") << "\n"
               << "IMU:  " << (imu_ok ? "OK" : "FAILED — parking disabled") << "\n"
               << "TOF:  " << (tof_ok ? "OK" : "FAILED — parking disabled") << "\n"
+              << "TELEM:" << (telem_ready ? " OK" : " DISABLED")
+              << " → " << TELEMETRY_SERVER_IP << ":" << TELEMETRY_PORT << "\n"
               << "Speed: [" << MIN_SPEED_CMS << ", " << MAX_SPEED_CMS << "] cm/s\n"
               << "Roundabout: 2-pass (P1=LEFT, P2=RIGHT) exit floor="
               << RB_EXIT_TURN_FLOOR_DEG << "° bias=" << RB_EXIT_TURN_BIAS_PX << "px\n"
@@ -626,6 +654,12 @@ int main() {
         elapsed_total += dt_loop;
         totalFrames++;
 
+        // Per-frame detection flags for telemetry. The tracker adds its own
+        // hangover (2 s person, 1 s lights), so pass raw "saw it this frame".
+        bool person_seen_this_frame = false;
+        bool red_seen_this_frame    = false;
+        bool green_seen_this_frame  = false;
+
         // -----------------------------------------------------
         // 1. Sign detection + voter update
         // -----------------------------------------------------
@@ -638,16 +672,24 @@ int main() {
                 if (d.confidence < SIGN_CONF_THRESH) continue;
 
                 if (d.name == "walking_person" || d.class_id == sign_class::WALKING_PERSON) {
-                    last_person_seen_time = elapsed_total;
+                    last_person_seen_time  = elapsed_total;
+                    person_seen_this_frame = true;
                     continue;
                 }
                 if (d.name == "traffic_light" || d.class_id == sign_class::TRAFFIC_LIGHT) {
-                    if (ClassifyTrafficLight(frame, d.box) == LightColor::RED)
-                        last_red_seen_time = elapsed_total;
-                    else
+                    const LightColor lc = ClassifyTrafficLight(frame, d.box);
+                    if (lc == LightColor::RED) {
+                        last_red_seen_time  = elapsed_total;
+                        red_seen_this_frame = true;
+                    } else {
                         last_red_seen_time = -1e9;
+                    }
+                    if (lc == LightColor::GREEN) {
+                        green_seen_this_frame = true;
+                    }
                     continue;
                 }
+
                 int cls = d.class_id;
                 if (cls == sign_class::CONSTRUCTION_AHEAD) cls = sign_class::TURN_LEFT;
 
@@ -793,6 +835,7 @@ int main() {
 
                     rb_cooldown_until = elapsed_total + RB_COOLDOWN_S;
                     voter.Reset();
+                    active_turn_sign_class = -1;
                 }
                 break;
             }
@@ -1111,6 +1154,7 @@ int main() {
                 elapsed_total >= sign_block_until_time) {
                 std::string dir = (signCommit.side == -1) ? "LEFT" : "RIGHT";
                 turn_controller.start_turn(dir, false);
+                active_turn_sign_class = signCommit.class_id;   // telemetry
                 voter.Reset();
             }
 
@@ -1154,6 +1198,7 @@ int main() {
             if (turn_res.state == v20::LaneTurnController::State::DONE) {
                 sign_block_until_time = elapsed_total + SIGN_BLOCK_SECONDS;
                 voter.Reset();
+                active_turn_sign_class = -1;   // telemetry
             }
 
             out = follower.step(mask, final_bias, exec_turn, applied_floor, applied_cap);
@@ -1210,6 +1255,37 @@ int main() {
         motor.SetSpeedCms(applied_speed);
         servo.SetAngle(final_angle);
 
+        // -----------------------------------------------------
+        // Telemetry (UCR 2026): build StateInputs from this frame
+        // and hand off to the helper. Internal rate limiter drops
+        // calls until 50 ms have elapsed, so calling every loop
+        // is correct — no extra timing needed here.
+        // -----------------------------------------------------
+        if (telem_ready) {
+            telemetry::StateInputs ti;
+            ti.pedestrian_detected  = person_seen_this_frame;
+            ti.red_light_detected   = red_seen_this_frame;
+            ti.green_light_detected = green_seen_this_frame;
+            ti.in_roundabout        = (rb_state != RbState::NONE);
+            ti.parking_active       = (park_state != ParkState::NONE);
+            ti.bridge_active        = false;   // no bridge state in this codebase
+            ti.active_sign_class    = active_turn_sign_class;
+            ti.last_seen_sign_class = voter.GetCommitted();
+            // Sign class IDs already match the defaults in StateInputs:
+            //   turn_left=6, turn_right=7, no_left=1, no_right=2,
+            //   construction=0, roundabout=4, parking=3.
+
+            const double now_telem_s = std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            telem.TrackInputs(ti, now_telem_s);
+            // Send applied_speed (what the motor actually received) and
+            // final_angle (servo command in degrees, ±55). If the server
+            // team wants "real-world steering degrees" instead, use
+            // static_cast<int>(std::lround(out.angle)) — the PID output,
+            // positive = right, bounded ±50.
+            telem.Tick(frame, applied_speed, final_angle, now_telem_s);
+        }
+
         ++tickIdx;
 
         // 1 Hz debug
@@ -1219,16 +1295,17 @@ int main() {
             std::printf(
                 "[t=%ld] sign=%-11s(%d) rb=%-11s(p%d) park=%-11s "
                 "near=%6.1f hdg=%7.2f ref=%7.2f tofL=%5.1f tofR=%5.1f "
-                "spd=%.1f pid=%.1f srv=%d\n",
+                "spd=%.1f pid=%.1f srv=%d telem=%d(%s)\n",
                 tickIdx,
                 SignName(voter.GetCommitted()),
                 voter.GetCommitted(),
                 RbStateName(rb_state),
-                rb_pass_count,
                 ParkStateName(park_state),
                 out.near_e, heading_now, park_ref_heading,
                 tof_left_mm, tof_right_mm,
-                applied_speed, out.angle, final_angle);
+                applied_speed, out.angle, final_angle,
+                telem_ready ? telem.CurrentState() : -1,
+                telem_ready ? telemetry::VehicleStateName(telem.CurrentState()) : "OFF");
             lastLog = tNow;
         }
 
