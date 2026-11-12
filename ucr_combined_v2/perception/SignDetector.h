@@ -1,5 +1,5 @@
 // ============================================================
-// SignDetector.h — TensorRT Traffic Sign Detector (YOLOv8 Engine)
+// ObjectDetector.h — TensorRT Object & Traffic Sign Detector (YOLOv8 Engine)
 // ============================================================
 #pragma once
 
@@ -16,32 +16,41 @@
 #include <algorithm>
 #include <memory>
 
-struct SignObject {
+struct DetectObject {
     int class_id = -1;
     std::string name;
     float confidence = 0.0f;
     cv::Rect box;
 };
 
-class SignDetector {
+class ObjectDetector {
 public:
+    // QUAN TRỌNG: Cập nhật danh sách này ĐÚNG THỨ TỰ (index 0, 1, 2...) 
+    // như trong file data.yaml lúc bạn train model mới.
     inline static const std::vector<std::string> CLASS_NAMES = {
-        "construction_ahead", "no_left", "no_right", "parking",
-        "roundabout", "traffic_light", "turn_left", "turn_right"
+        "construction_ahead", 
+        "no_left", 
+        "no_right", 
+        "parking",
+        "roundabout", 
+        "traffic_light", 
+        "turn_left", 
+        "turn_right",
+        "walking_person" // <-- Thêm người đi bộ và các class khác vào đây
     };
 
-    SignDetector() = default;
+    ObjectDetector() = default;
 
-    ~SignDetector() {
+    ~ObjectDetector() {
         Cleanup();
     }
 
     bool Init(const std::string& enginePath) {
         try {
-            std::cout << "[SignDetector] Loading Engine: " << enginePath << "\n";
+            std::cout << "[ObjectDetector] Loading Engine: " << enginePath << "\n";
             std::ifstream file(enginePath, std::ios::binary);
             if (!file) {
-                std::cerr << "[SignDetector] Cannot open engine file: " << enginePath << "\n";
+                std::cerr << "[ObjectDetector] Cannot open engine file: " << enginePath << "\n";
                 return false;
             }
 
@@ -84,18 +93,18 @@ public:
             }
 
             cudaStreamCreate(&stream_);
-            std::cout << "[SignDetector] Engine Ready! Input size: " 
+            std::cout << "[ObjectDetector] Engine Ready! Input size: " 
                       << inputWidth_ << "x" << inputHeight_ << "\n";
             return true;
         } catch (const std::exception& e) {
-            std::cerr << "[SignDetector Error] " << e.what() << "\n";
+            std::cerr << "[ObjectDetector Error] " << e.what() << "\n";
             Cleanup();
             return false;
         }
     }
 
-    std::vector<SignObject> Detect(const cv::Mat& frame, float confThresh = 0.70f, float nmsThresh = 0.45f) {
-        std::vector<SignObject> results;
+    std::vector<DetectObject> Detect(const cv::Mat& frame, float confThresh = 0.70f, float nmsThresh = 0.45f) {
+        std::vector<DetectObject> results;
         if (frame.empty() || !context_ || !stream_) return results;
 
         // 1. Preprocess ảnh theo chuẩn RGB 1/255.0
@@ -115,6 +124,13 @@ public:
 
         // 3. Postprocess YOLOv8 output: [1, 4 + num_classes, num_boxes]
         int num_classes = static_cast<int>(CLASS_NAMES.size());
+        
+        // Kiểm tra an toàn: Đảm bảo output size khớp với cấu trúc model
+        if (outputData_.empty() || outputData_.size() % (4 + num_classes) != 0) {
+             std::cerr << "[ObjectDetector] Cảnh báo: Kích thước output không khớp với số lượng class khai báo!\n";
+             return results;
+        }
+
         int num_boxes = static_cast<int>(outputData_.size()) / (4 + num_classes);
 
         std::vector<cv::Rect> boxes;
@@ -164,7 +180,7 @@ public:
         cv::dnn::NMSBoxes(boxes, confidences, confThresh, nmsThresh, indices);
 
         for (int idx : indices) {
-            SignObject obj;
+            DetectObject obj;
             obj.class_id = class_ids[idx];
             obj.name = CLASS_NAMES[class_ids[idx]];
             obj.confidence = confidences[idx];
@@ -175,16 +191,19 @@ public:
         return results;
     }
 
-    void Draw(cv::Mat& frame, const std::vector<SignObject>& signs) {
-        for (const auto& s : signs) {
-            cv::rectangle(frame, s.box, cv::Scalar(0, 255, 0), 2);
-            std::string text = s.name + " " + std::to_string(s.confidence).substr(0, 4);
+    void Draw(cv::Mat& frame, const std::vector<DetectObject>& objects) {
+        for (const auto& obj : objects) {
+            // Đổi màu box nếu là người đi bộ (ví dụ: Đỏ cho người đi bộ, Xanh cho biển báo)
+            cv::Scalar color = (obj.name == "walking_person") ? cv::Scalar(0, 0, 255) : cv::Scalar(0, 255, 0);
+
+            cv::rectangle(frame, obj.box, color, 2);
+            std::string text = obj.name + " " + std::to_string(obj.confidence).substr(0, 4);
             int baseline = 0;
             cv::Size sz = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
-            int y_text = std::max(s.box.y, sz.height + 5);
-            cv::rectangle(frame, cv::Point(s.box.x, y_text - sz.height - 5),
-                          cv::Point(s.box.x + sz.width, y_text), cv::Scalar(0, 255, 0), cv::FILLED);
-            cv::putText(frame, text, cv::Point(s.box.x, y_text - 3),
+            int y_text = std::max(obj.box.y, sz.height + 5);
+            cv::rectangle(frame, cv::Point(obj.box.x, y_text - sz.height - 5),
+                          cv::Point(obj.box.x + sz.width, y_text), color, cv::FILLED);
+            cv::putText(frame, text, cv::Point(obj.box.x, y_text - 3),
                         cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
         }
     }
@@ -209,7 +228,7 @@ private:
     public:
         void log(Severity severity, const char* msg) noexcept override {
             if (severity <= Severity::kWARNING) {
-                std::cerr << "[TRT-Sign] " << msg << "\n";
+                std::cerr << "[TRT-Detector] " << msg << "\n";
             }
         }
     } logger_;
@@ -220,7 +239,10 @@ private:
     cudaStream_t stream_ = nullptr;
 
     std::vector<void*> buffers_;
-    std::vector<float> inputData_, outputData_;
+    std::vector< float > inputData_, outputData_;
     int inputIndex_ = -1, outputIndex_ = -1;
     int inputWidth_ = 0, inputHeight_ = 0;
 };
+
+using SignObject   = DetectObject;
+using SignDetector = ObjectDetector;
