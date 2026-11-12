@@ -46,7 +46,7 @@
 // CONSTANTS
 // ============================================================
 static const std::string ENGINE_PATH      = "/home/car4/Downloads/road/kga3.engine";
-static const std::string SIGN_ENGINE_PATH = "/home/car4/Downloads/sign/huy_sign.engine";
+static const std::string SIGN_ENGINE_PATH = "/home/car4/Downloads/sign/signv4.engine";
 
 // Speed / control
 static constexpr float MAX_SPEED_CMS         = 30.0f;
