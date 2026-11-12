@@ -843,6 +843,7 @@ int main() {
                     previous_out.near_e, previous_out.mid_e, previous_out.far_e,
                     lx_bot, rx_bot
                 );
+                turn_controller.feed_heading(current_heading, heading_ok);
             } else {
                 // Khi đang dừng chờ đèn đỏ / người đi bộ: giữ sẵn trạng thái chờ rẽ của biển báo,
                 // đồng thời giữ straight_frames = 0 để khi đèn xanh xe tiến thẳng đủ 3 frame mới bắt đầu quành
