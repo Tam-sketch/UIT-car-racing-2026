@@ -168,7 +168,7 @@ static constexpr float PARK_HEADING_SIGN           = +1.0f;
 // ============================================================
 static constexpr const char* TELEMETRY_SERVER_IP = "192.168.1.100";
 static constexpr int         TELEMETRY_PORT      = 9999;
-static constexpr const char* TELEMETRY_CAR_ID    = "UCR2026";
+static constexpr const char* TELEMETRY_CAR_ID    = "MAYCAY";
 
 volatile std::sig_atomic_t g_stopSignal = 0;
 static void SignalHandler(int) { g_stopSignal = 1; }
