@@ -1,7 +1,7 @@
 // ============================================================
 // main_run.cpp — UCR2026 Full Integrated (LaneFollower + SignDetector + NavigationBrain)
 // ============================================================
-//3
+//4
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
 #include "hardware/Servo.h"
@@ -176,11 +176,11 @@ struct ParkingCorridor {
 };
 
 static constexpr float PARK_TOF_BLOCKED_MM          = 350.0f; // Ngưỡng mm (< 350mm coi là bị block)
-static constexpr float PARK_APPROACH_SPEED          = 10.0f;  // Tốc độ tiến trong bãi đỗ (cm/s)
-static constexpr float PARK_REVERSE_SPEED           = -8.0f;  // Tốc độ lùi chậm (cm/s)
+static constexpr float PARK_APPROACH_SPEED          = 13.0f;  // Tốc độ tiến trong bãi đỗ (cm/s)
+static constexpr float PARK_REVERSE_SPEED           = -10.0f;  // Tốc độ lùi chậm (cm/s)
 static constexpr float PARK_MAX_STEER_DEG           = 45.0f;  // Góc bẻ lái khi lùi (độ bánh xe)
 static constexpr float PARK_TARGET_DELTA_DEG        = 50.0f;  // Lệch 45 độ ở REVERSE_1
-static constexpr float PARK_ALIGN_TOL_DEG           = 4.0f;   // Dung sai +-3 độ ở REVERSE_2
+static constexpr float PARK_ALIGN_TOL_DEG           = 0.0f;   // Dung sai +-3 độ ở REVERSE_2
 static constexpr double PARK_STOP_DWELL_S           = 0.5;    // Thời gian dừng hẳn trước khi lùi (s)
 static constexpr int   TOF_IDX_LEFT                 = 1;      // TOF 1: cảm biến bên trái xe
 static constexpr int   TOF_IDX_RIGHT                = 3;      // TOF 3: cảm biến bên phải xe
