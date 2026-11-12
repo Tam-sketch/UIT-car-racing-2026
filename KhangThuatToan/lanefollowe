@@ -480,8 +480,8 @@ public:
     double RB_S6_BIAS_PX        = 20.0;  // Bias âm (-20px) giữ làn vòng quanh đảo
     double RB_S6_FLOOR_DEG      = 18.0;  // Góc sàn giữ TRÁI (-18 độ) ôm theo đường cong của đảo
     double RB_S6_CAP_DEG        = 28.0;  // Trần góc trái tối đa (-28 độ)
-    double RB_S6_MIN_TIME       = 0.40;  // Thời gian tối thiểu ở Pha 6 trước khi bắt Nhánh 2 (s)
-    double RB_S6_MAX_TIME       = 0.95;  // Thời gian tối đa ở Pha 6 trước khi chuyển sang rẽ phải ra Nhánh 2 (s)
+    double RB_S6_MIN_TIME       = 0.80;  // Thời gian tối thiểu ở Pha 6 trước khi bắt Nhánh 2 (s)
+    double RB_S6_MAX_TIME       = 1.5;  // Thời gian tối đa ở Pha 6 trước khi chuyển sang rẽ phải ra Nhánh 2 (s)
 
     // --- PHA 7 (S7_EXIT_TURN_RIGHT): Bẻ PHẢI thoát ra Nhánh thứ 2 ---
     double RB_S7_BIAS_PX        = 26.0;  // Bias dương (+26px) kéo vào nhánh ra bên phải
