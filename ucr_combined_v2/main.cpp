@@ -1,5 +1,6 @@
 // ============================================================
 // main_run.cpp — UCR2026 Full Integrated (Parking & Obstacle from chinh.cpp)
+// + Roundabout logic ported from roundabout.cpp (unconditional T-junction arm)
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -57,7 +58,7 @@ static constexpr float SERVO_LEFT_SLOPE    = 0.96f;
 static constexpr float SERVO_LEFT_OFFSET   = -6.2f;
 static constexpr float SERVO_RIGHT_SLOPE   = 0.71f;
 static constexpr float SERVO_RIGHT_OFFSET  = 2.5f;
-static constexpr float MAX_REAL_ANGLE_DEG  = 45.0f;   // Allow 45° reverse arcs for parking
+static constexpr float MAX_REAL_ANGLE_DEG  = 45.0f;
 static constexpr int   MAX_SERVO_CMD       = 55;
 
 // Rear-facing ToF sensor slots
@@ -110,12 +111,12 @@ static constexpr int SIGN_VOTER_TIMEOUT_DS      = 30;
 
 static constexpr double SIGN_BLOCK_SECONDS      = 4.0;
 
-// Roundabout timings
+// Roundabout timings (updated from roundabout.cpp)
 static constexpr float  RB_BIAS_PX_RIGHT         = 25.0f;
-static constexpr float  RB_BIAS_PX_LEFT          = 24.0f;
+static constexpr float  RB_BIAS_PX_LEFT          = 22.0f;
 static constexpr float  RB_BIAS_EMA              = 0.30f;
 static constexpr double RB_MISSING_SIGN_S        = 2.0;
-static constexpr double RB_CIRCLE_TIMEOUT_S      = 12.0;
+static constexpr double RB_CIRCLE_TIMEOUT_S      = 8.0;
 static constexpr double RB_EXIT_SEARCH_TIMEOUT_S = 15.0;
 static constexpr double RB_EXIT_FORCE_EXEC_S     = 1.5;
 static constexpr double RB_COOLDOWN_S            = 2.0;
@@ -129,19 +130,19 @@ static constexpr float  RB_EXIT_TURN_BIAS_PX     = 30.0f;
 // ============================================================
 // PARKING & OBSTACLE CONFIGURATION (From chinh.cpp)
 // ============================================================
-static constexpr float PARK_TOF_BLOCKED_MM          = 350.0f; // Ngưỡng mm (< 350mm coi là bị block)
-static constexpr float PARK_APPROACH_SPEED          = 13.0f;  // Tốc độ tiến trong bãi đỗ (cm/s)
-static constexpr float PARK_REVERSE_SPEED           = -10.0f; // Tốc độ lùi chậm (cm/s)
-static constexpr float PARK_MAX_STEER_DEG           = 45.0f;  // Góc bẻ lái khi lùi (độ bánh xe)
-static constexpr float PARK_TARGET_DELTA_DEG        = 50.0f;  // Lệch 50 độ ở REVERSE_1
-static constexpr float PARK_ALIGN_TOL_DEG           = 3.0f;   // Dung sai +-3 độ ở REVERSE_2
-static constexpr double PARK_STOP_DWELL_S           = 0.5;    // Thời gian dừng hẳn trước khi lùi (s)
+static constexpr float PARK_TOF_BLOCKED_MM          = 350.0f;
+static constexpr float PARK_APPROACH_SPEED          = 13.0f;
+static constexpr float PARK_REVERSE_SPEED           = -10.0f;
+static constexpr float PARK_MAX_STEER_DEG           = 45.0f;
+static constexpr float PARK_TARGET_DELTA_DEG        = 50.0f;
+static constexpr float PARK_ALIGN_TOL_DEG           = 3.0f;
+static constexpr double PARK_STOP_DWELL_S           = 0.5;
 
-static constexpr int   PARK_CORRIDOR_EXTRA_MARGIN_PX = 18;    // Mở rộng lề mỗi bên thêm 18px
-static constexpr float PARK_CORRIDOR_FAR_RATIO       = 0.68f; // Tỉ lệ thu hẹp phối cảnh
-static constexpr float PARK_STEER_TRIM_DEG           = +2.5f; // Bù sai số lệch trái
-static constexpr float PARK_HEADING_KP               = 0.90f; // Hệ số P giữ hướng thẳng
-static constexpr float PARK_HEADING_MAX_CORR_DEG     = 8.0f;  // Giới hạn góc can thiệp
+static constexpr int   PARK_CORRIDOR_EXTRA_MARGIN_PX = 18;
+static constexpr float PARK_CORRIDOR_FAR_RATIO       = 0.68f;
+static constexpr float PARK_STEER_TRIM_DEG           = +2.5f;
+static constexpr float PARK_HEADING_KP               = 0.90f;
+static constexpr float PARK_HEADING_MAX_CORR_DEG     = 8.0f;
 
 enum class ParkingState {
     IDLE = 0,
@@ -170,7 +171,6 @@ static const char* ParkingStateStr(ParkingState s) {
     }
 }
 
-// Cấu trúc hành lang 2 tia chéo thẳng tuyệt đối theo góc camera cho Parking
 struct ParkingCorridor {
     bool latched = false;
     int y_bot = 299;
@@ -195,7 +195,7 @@ struct ParkingCorridor {
 };
 
 // ============================================================
-// TELEMETRY (UCR 2026 competition requirement)
+// TELEMETRY
 // ============================================================
 static constexpr const char* TELEMETRY_SERVER_IP = "192.168.1.100";
 static constexpr int         TELEMETRY_PORT      = 9999;
@@ -404,7 +404,6 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
     using namespace tl;
     if (bgr.empty()) return LightColor::NONE;
 
-    // 1. Clamp bbox strictly inside the image first
     cv::Rect safe_bbox = bbox & cv::Rect(0, 0, bgr.cols, bgr.rows);
     if (safe_bbox.width < 4 || safe_bbox.height < 4) return LightColor::NONE;
 
@@ -412,13 +411,12 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
     const int cy = safe_bbox.y + safe_bbox.height / 2;
     const int w  = static_cast<int>(safe_bbox.width  * ROI_EXPAND);
     const int h  = static_cast<int>(safe_bbox.height * ROI_EXPAND);
-    
+
     const int x1 = std::max(0, cx - w / 2);
     const int y1 = std::max(0, cy - h / 2);
     const int x2 = std::min(bgr.cols, cx + w / 2);
     const int y2 = std::min(bgr.rows, cy + h / 2);
-    
-    // 2. Compute the actual true ROI dimensions
+
     int roi_w = x2 - x1;
     int roi_h = y2 - y1;
     if (roi_w < 4 || roi_h < 4) return LightColor::NONE;
@@ -426,14 +424,13 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
     cv::Mat hsv;
     cv::cvtColor(bgr(cv::Rect(x1, y1, roi_w, roi_h)), hsv, cv::COLOR_BGR2HSV);
 
-    // 3. Tall box (Whole traffic light) path: Use roi_w and roi_h, NOT w and h!
     if (roi_h > roi_w * 1.5) {
         cv::Mat v_chan;
         cv::extractChannel(hsv, v_chan, 2);
 
         int h_third = roi_h / 3;
         if (h_third < 1) return LightColor::NONE;
-        
+
         int top_lit = cv::countNonZero(v_chan(cv::Rect(0, 0, roi_w, h_third)) > V_MIN);
         int mid_lit = cv::countNonZero(v_chan(cv::Rect(0, h_third, roi_w, h_third)) > V_MIN);
         int bot_lit = cv::countNonZero(v_chan(cv::Rect(0, 2 * h_third, roi_w, h_third)) > V_MIN);
@@ -446,7 +443,6 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
         return LightColor::NONE;
     }
 
-    // 4. Single light path
     cv::Mat mRed1, mRed2, mRed;
     cv::inRange(hsv, cv::Scalar(RED_H1_LO, S_MIN, V_MIN), cv::Scalar(RED_H1_HI, S_MAX, 255), mRed1);
     cv::inRange(hsv, cv::Scalar(RED_H2_LO, S_MIN, V_MIN), cv::Scalar(RED_H2_HI, S_MAX, 255), mRed2);
@@ -461,12 +457,10 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
     cv::inRange(hsv, cv::Scalar(GRN_H_LO, S_MIN, V_MIN), cv::Scalar(GRN_H_HI, S_MAX, 255), mGrn);
     int nGrn = cv::countNonZero(mGrn);
 
-    // Near-white (blown-out) pixels
     cv::Mat mWhite;
     cv::inRange(hsv, cv::Scalar(0, 0, V_WHITE_MIN), cv::Scalar(180, S_WHITE_MAX, 255), mWhite);
     int nWhite = cv::countNonZero(mWhite);
 
-    // Add the white pixels to whichever color dominates the edges
     if (nRed > 0 && nRed >= nYel && nRed >= nGrn) nRed += nWhite;
     else if (nGrn > 0 && nGrn > nRed && nGrn >= nYel) nGrn += nWhite;
     else if (nYel > 0 && nYel > nRed && nYel > nGrn) nYel += nWhite;
@@ -781,13 +775,13 @@ int main() {
                     rb_state = RbState::NONE;
                     rb_bias_smoothed = 0.0f;
 
-                    if (rb_pass_count == 1) {
-                        turn_controller.waiting_for_tjunction = true;
-                        turn_controller.tjunction_cooldown = 8.0;
-                    } else {
-                        turn_controller.waiting_for_tjunction = false;
-                        rb_pass_count = 0;
-                    }
+                    // [roundabout.cpp] Arm T-junction after BOTH rb1 and rb2 exits.
+                    //   rb1 exit → T-junction 1 (LEFT)
+                    //   rb2 exit → T-junction 2 (RIGHT)
+                    // turn_controller will fire it and return to IDLE → PID resumes.
+                    turn_controller.waiting_for_tjunction = true;
+                    turn_controller.tjunction_cooldown = 8.0;
+
                     rb_cooldown_until = elapsed_total + RB_COOLDOWN_S;
                     voter.Reset();
                     active_turn_sign_class = -1;
@@ -1154,7 +1148,7 @@ int main() {
                 obs_res.obstacle_side
             );
             previous_out = out;
-            
+
             if (turn_res.state == v20::LaneTurnController::State::DONE) {
                 sign_block_until_time = elapsed_total + SIGN_BLOCK_SECONDS;
                 voter.Reset();
@@ -1277,7 +1271,6 @@ int main() {
                 cv::addWeighted(frame, 0.65, green, 0.35, 0, blended);
                 blended.copyTo(overlay, mask);
 
-                // Parking Corridor
                 if (parking_active && park_corridor.latched) {
                     cv::line(overlay, cv::Point(park_corridor.x_left_bot, park_corridor.y_bot),
                                       cv::Point(park_corridor.x_left_far, park_corridor.y_far),
@@ -1296,7 +1289,6 @@ int main() {
                 for (size_t i = 0; i + 1 < ui_right_pts.size(); ++i)
                     cv::line(overlay, ui_right_pts[i], ui_right_pts[i + 1], cv::Scalar(255, 0, 0), 2);
 
-                // Obstacle UI
                 if (obstacle_controller.active()) {
                     if (obs_res.y_cut > 0) {
                         cv::line(overlay, cv::Point(0, obs_res.y_cut), cv::Point(frame.cols - 1, obs_res.y_cut),
