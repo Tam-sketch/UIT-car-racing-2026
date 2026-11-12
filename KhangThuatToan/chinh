@@ -10,6 +10,10 @@
 #include "SignDetector.h"
 #include "NavigationBrain.h"
 
+// Thư viện cảm biến TOF và BNO055 (IMU)
+#include "sensor/TOF.h"
+#include "sensor/BNO055.h"
+
 #include <opencv2/opencv.hpp>
 #include <NvInfer.h>
 #include <cuda_runtime_api.h>
@@ -42,6 +46,55 @@ static constexpr float MIN_SPEED_CMS        = 22.0f;
 static constexpr int   SIGN_INTERVAL_FRAMES = 1;
 static constexpr int   SIGN_BLOCK_FRAMES    = 40; 
 static constexpr double LANE_BIAS_RIGHT_PX = 7.0; 
+
+// ============================================================
+// PARKING CONFIGURATION & STATE MACHINE
+// ============================================================
+enum class ParkingState {
+    IDLE = 0,
+    APPROACH,            // Đi giữa 2 scanline cố định tiếp cận bãi đỗ
+    SLOT1_WAIT_BLOCKED,  // Chờ cả 2 bên (TOF1 & TOF3) bị block ở ô 1
+    SLOT2_SEARCH_FREE,   // Chờ tìm thấy ô trống (1 bên free, 1 bên block)
+    SLOT3_WAIT_BLOCKED,  // Chạy tiếp đến khi cả 2 bên bị block ở ô 3 -> DỪNG
+    WAIT_FULL_STOP,      // Dừng hẳn xe, lưu heading_0
+    REVERSE_1,           // Bẻ lái tối đa về phía ô trống, lùi đến khi lệch 45 độ
+    REVERSE_2,           // Bẻ lái hướng ngược lại, lùi đến khi heading về ban đầu +- 3 độ
+    DONE                 // Đỗ xe hoàn thành, dừng xe
+};
+
+static const char* ParkingStateStr(ParkingState s) {
+    switch (s) {
+        case ParkingState::IDLE:               return "IDLE";
+        case ParkingState::APPROACH:           return "APPROACH";
+        case ParkingState::SLOT1_WAIT_BLOCKED: return "SLOT1_BLOCKED";
+        case ParkingState::SLOT2_SEARCH_FREE:  return "SLOT2_FREE_SEARCH";
+        case ParkingState::SLOT3_WAIT_BLOCKED: return "SLOT3_BLOCKED_STOP";
+        case ParkingState::WAIT_FULL_STOP:     return "WAIT_STOP";
+        case ParkingState::REVERSE_1:          return "REVERSE_1_TURN45";
+        case ParkingState::REVERSE_2:          return "REVERSE_2_ALIGN";
+        case ParkingState::DONE:               return "DONE";
+        default:                               return "UNKNOWN";
+    }
+}
+
+static inline float normalizeAngle(float angle) {
+    while (angle >  180.0f) angle -= 360.0f;
+    while (angle < -180.0f) angle += 360.0f;
+    return angle;
+}
+
+// Các thông số cấu hình riêng cho Parking
+static constexpr int   PARK_SCANLINE_LEFT_X   = 100;    // Scanline cố định bên trái (bỏ qua mask ngoài này)
+static constexpr int   PARK_SCANLINE_RIGHT_X  = 380;    // Scanline cố định bên phải (bỏ qua mask ngoài này)
+static constexpr float PARK_TOF_BLOCKED_MM    = 350.0f; // Ngưỡng mm (< 350mm coi là bị block)
+static constexpr float PARK_APPROACH_SPEED    = 10.0f;  // Tốc độ tiến trong bãi đỗ (cm/s)
+static constexpr float PARK_REVERSE_SPEED     = -8.0f;  // Tốc độ lùi chậm (cm/s)
+static constexpr float PARK_MAX_STEER_DEG     = 45.0f;  // Góc bẻ lái khi lùi (độ bánh xe)
+static constexpr float PARK_TARGET_DELTA_DEG  = 50.0f;  // Lệch 45 độ ở REVERSE_1
+static constexpr float PARK_ALIGN_TOL_DEG     = 4.0f;   // Dung sai +-3 độ ở REVERSE_2
+static constexpr double PARK_STOP_DWELL_S     = 0.5;    // Thời gian dừng hẳn trước khi lùi (s)
+static constexpr int   TOF_IDX_LEFT           = 1;      // TOF 1: cảm biến bên trái xe
+static constexpr int   TOF_IDX_RIGHT          = 3;      // TOF 3: cảm biến bên phải xe
 
 volatile std::sig_atomic_t g_stopSignal = 0;
 static void SignalHandler(int) { g_stopSignal = 1; }
@@ -225,6 +278,7 @@ public:
                  "Obs_State,Obs_Side,Obs_Y_Cut,Obs_Dist_Px,Obs_Near_Cut,Obs_Pass_Count,"
                  "TJ_Count,TJ_Detected,"
                  "TL_Color,TL_Stop,TL_Top_B,TL_Mid_B,TL_Bot_B,TL_Diff,"
+                 "Park_State,Park_Side,TOF_L,TOF_R,Heading,Heading_0,Delta_H,"
                  "Left_Pts,Right_Pts,IsValid\n";
         file_.flush();
         return true;
@@ -277,6 +331,15 @@ public:
         int tlMidB,
         int tlBotB,
         int tlDiff,
+
+        // --- PARKING TELEMETRY ---
+        const std::string& parkState,
+        int parkSide,
+        float tofLeft,
+        float tofRight,
+        float heading,
+        float heading0,
+        float deltaH,
 
         const std::vector<cv::Point>& leftPts,
         const std::vector<cv::Point>& rightPts
@@ -339,6 +402,14 @@ public:
             << tlMidB << ","
             << tlBotB << ","
             << tlDiff << ","
+            // --- THÔNG SỐ PARKING ---
+            << parkState << ","
+            << parkSide << ","
+            << std::fixed << std::setprecision(1) << tofLeft << ","
+            << tofRight << ","
+            << heading << ","
+            << heading0 << ","
+            << deltaH << ","
             << "\"" << writePoints(leftPts) << "\","
             << "\"" << writePoints(rightPts) << "\","
             << (out.valid ? 1 : 0)
@@ -374,6 +445,22 @@ int main() {
     }
     motor.SetSpeedCms(0.0f);
     servo.SetAngle(0);
+
+    // --- Khởi tạo cảm biến TOF & BNO055 (IMU) ---
+    sensor::TOF tof;
+    bool tof_ok = tof.Init("/dev/i2c-1");
+    if (!tof_ok) {
+        std::cerr << "[Main] TOF init failed (/dev/i2c-1)\n";
+    }
+
+    BNO055 bno;
+    bool imu_ok = bno.initialize(std::chrono::milliseconds(1000));
+    if (!imu_ok) {
+        std::cerr << "[Main] BNO055 init failed\n";
+    }
+
+    sensor::TOFReadings tof_readings;
+    BNO055::Data bno_data;
 
     TrtModel roadModel;
     if (!roadModel.Init(ENGINE_PATH)) {
@@ -412,6 +499,22 @@ int main() {
     std::string handled_sign = "NONE";
     v20::LaneFollower::Output previous_out;
 
+    // --- Biến trạng thái Parking (Hành lang & Ô đỗ) ---
+    ParkingState park_state = ParkingState::IDLE;
+    int park_free_side = -1; // -1: LEFT trống, +1: RIGHT trống
+    float park_heading_0 = 0.0f;
+    double park_dwell_time = 0.0;
+    double park_reverse_elapsed = 0.0;
+    int slot1_confirm_cnt = 0;
+    int slot2_confirm_cnt = 0;
+    int slot3_confirm_cnt = 0;
+    float slot1_tof_left = -1.0f, slot1_tof_right = -1.0f;
+    float slot2_tof_left = -1.0f, slot2_tof_right = -1.0f;
+    float slot3_tof_left = -1.0f, slot3_tof_right = -1.0f;
+    float tof_left = -1.0f, tof_right = -1.0f;
+    float current_heading = 0.0f;
+    bool heading_ok = false;
+
     RunFileLogger runLogger;
     if (runLogger.Init()) {
         std::cout << "[Logger] Writing extended telemetry to: " << runLogger.GetFilename() << "\n";
@@ -445,6 +548,25 @@ int main() {
 
         totalFrames++;
 
+        // --- ĐỌC CẢM BIẾN TOF & BNO055 (IMU) ---
+        tof_left = -1.0f;
+        tof_right = -1.0f;
+        if (tof_ok && tof.Read(tof_readings, std::chrono::milliseconds(10))) {
+            if (tof_readings[TOF_IDX_LEFT].valid && tof_readings[TOF_IDX_LEFT].distanceMm > 0) {
+                tof_left = static_cast<float>(tof_readings[TOF_IDX_LEFT].distanceMm);
+            }
+            if (tof_readings[TOF_IDX_RIGHT].valid && tof_readings[TOF_IDX_RIGHT].distanceMm > 0) {
+                tof_right = static_cast<float>(tof_readings[TOF_IDX_RIGHT].distanceMm);
+            }
+        }
+
+        current_heading = 0.0f;
+        heading_ok = false;
+        if (imu_ok && bno.read(bno_data)) {
+            current_heading = static_cast<float>(bno_data.eulerDeg.x);
+            heading_ok = true;
+        }
+
         if (totalFrames % SIGN_INTERVAL_FRAMES == 0) {
             cachedSigns = signDetector.Detect(frame, 0.55f);
             navBrain.UpdateSign(cachedSigns);
@@ -461,6 +583,7 @@ int main() {
         v20::LaneTurnController::TurnResult turn_res{v20::LaneTurnController::State::IDLE, 0.0, "NONE"};
         v20::ObstacleAvoidanceController::ObstacleResult obs_res;
         double applied_floor = 0.0;
+        bool parking_active = (park_state != ParkingState::IDLE);
         // --- UI DATA EXPORT VARIABLES ---
         std::vector<cv::Point> ui_left_pts, ui_right_pts;
         int ui_y1 = 0, ui_y2 = 0;
@@ -468,7 +591,35 @@ int main() {
         if (roadOK) {
             dec = navBrain.Process(mask, follower.speed());
 
-            int h = mask.rows, w = mask.cols;
+            // -------------------------------------------------------------
+            // QUẢN LÝ TRẠNG THÁI PARKING & KẺ 2 SCANLINE CỐ ĐỊNH CẮT MASK
+            // -------------------------------------------------------------
+            if (dec.active_sign == "parking") {
+                parking_active = true;
+            }
+            if (dec.active_sign == "parking" && park_state == ParkingState::IDLE) {
+                park_state = ParkingState::APPROACH;
+                slot1_confirm_cnt = 0;
+                slot2_confirm_cnt = 0;
+                slot3_confirm_cnt = 0;
+                std::cout << "[PARK] >>> PARKING SIGN CONFIRMED -> ACTIVATING PARKING MODE <<<\n";
+            }
+
+            // Bỏ qua tất cả các pixel mask nằm ngoài 2 scanline cố định khi vào bãi đỗ
+            cv::Mat active_mask = mask;
+            cv::Mat park_mask;
+            if (parking_active) {
+                park_mask = mask.clone();
+                if (PARK_SCANLINE_LEFT_X > 0 && PARK_SCANLINE_LEFT_X < park_mask.cols) {
+                    park_mask(cv::Rect(0, 0, PARK_SCANLINE_LEFT_X, park_mask.rows)).setTo(0);
+                }
+                if (PARK_SCANLINE_RIGHT_X > 0 && PARK_SCANLINE_RIGHT_X < park_mask.cols) {
+                    park_mask(cv::Rect(PARK_SCANLINE_RIGHT_X, 0, park_mask.cols - PARK_SCANLINE_RIGHT_X, park_mask.rows)).setTo(0);
+                }
+                active_mask = park_mask;
+            }
+
+            int h = active_mask.rows, w = active_mask.cols;
             int y1 = static_cast<int>(h * 0.45);
             int y2 = static_cast<int>(h * 0.65);
             int y_bottom = h - 1;
@@ -477,7 +628,7 @@ int main() {
             auto get_mask_boundaries = [&](int y_row, int& lx, int& rx) {
                 lx = -1; rx = -1;
                 if (y_row < 0 || y_row >= h) return;
-                const uchar* row = mask.ptr<uchar>(y_row);
+                const uchar* row = active_mask.ptr<uchar>(y_row);
                 int start = -1; int best_len = -1;
                 bool has_pref = false;
                 const int half_w = w / 2;
@@ -558,9 +709,9 @@ int main() {
             ui_y1 = y1; 
             ui_y2 = y2;
 
-            // Không nhận lệnh rẽ/roundabout khi đang ôm cua 90° (biển vẫn được latch, xử lý ngay sau khi ôm cua xong)
-            // Cho phép ghi đè nếu đang ở WAIT_CURVE hoặc WAIT_STRAIGHT (chưa thực sự đánh lái EXECUTE) mà chốt được biển mới (ví dụ no_left từ xa -> no_right khi lại gần)
-            const bool can_accept_sign = !corner_assist.active() &&
+            // Không nhận lệnh rẽ/roundabout khi đang trong chế độ parking hoặc đang ôm cua 90°
+            // Cho phép ghi đè nếu đang ở WAIT_CURVE hoặc WAIT_STRAIGHT (chưa thực sự đánh lái EXECUTE) mà chốt được biển mới
+            const bool can_accept_sign = !parking_active && !corner_assist.active() &&
                 (turn_controller.state == v20::LaneTurnController::State::IDLE ||
                  ((turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE ||
                    turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT) &&
@@ -586,7 +737,7 @@ int main() {
             // (xe đứng yên nên mask không đổi -> không được đếm frame thẳng ảo hay chạy hết timeout rẽ).
             // Biển đã chốt vẫn được giữ, khi được đi sẽ tiếp tục chờ frame thẳng rồi mới quành như cũ.
             const bool hazard_stop = navBrain.HazardStop();
-            if (!hazard_stop) {
+            if (!parking_active && !hazard_stop) {
                 turn_res = turn_controller.update(
                     left_pts, right_pts, dt_loop, previous_out.valid,
                     lx1, rx1, lx2, rx2, w,
@@ -614,14 +765,14 @@ int main() {
             const bool turn_in_progress = (turn_controller.state == v20::LaneTurnController::State::EXECUTE ||
                                            turn_controller.state == v20::LaneTurnController::State::SETTLE ||
                                            turn_controller.is_roundabout_mode);
-            if (!hazard_stop && !turn_in_progress) {
+            if (!parking_active && !hazard_stop && !turn_in_progress) {
                 obs_res = obstacle_controller.update(
-                    mask, left_pts, right_pts,
+                    active_mask, left_pts, right_pts,
                     lx1, rx1, lx2, rx2, lx_bot, rx_bot,
                     w, dt_loop,
                     previous_out.near_e, previous_out.mid_e, previous_out.far_e
                 );
-            } else if (turn_in_progress) {
+            } else if (turn_in_progress || parking_active) {
                 obstacle_controller.reset();
             }
 
@@ -631,13 +782,13 @@ int main() {
             int    effective_pref_side = turn_controller.get_preferred_side();
             bool   effective_is_turn   = turn_res.lock_opposite_err;
 
-            if (obstacle_controller.active()) {
+            if (!parking_active && obstacle_controller.active()) {
                 effective_bias      = obs_res.steer_bias_px;
                 effective_floor     = obs_res.steer_floor_deg;
                 effective_pref_side = obs_res.preferred_side;
                 effective_is_turn   = true;
             } else {
-                const bool allow_corner_assist = !hazard_stop && (
+                const bool allow_corner_assist = !parking_active && !hazard_stop && (
                     (turn_controller.state == v20::LaneTurnController::State::IDLE) ||
                     (turn_controller.is_unmarked_tjunction &&
                      turn_controller.state == v20::LaneTurnController::State::WAIT_CURVE &&
@@ -656,8 +807,133 @@ int main() {
             }
             applied_floor = effective_floor;
 
+            // -------------------------------------------------------------
+            // CẬP NHẬT MÁY TRẠNG THÁI PARKING (TOF 1 Trái, TOF 3 Phải, IMU Heading)
+            // -------------------------------------------------------------
+            const bool is_left_blocked  = (tof_left > 0.0f && tof_left < PARK_TOF_BLOCKED_MM);
+            const bool is_right_blocked = (tof_right > 0.0f && tof_right < PARK_TOF_BLOCKED_MM);
+            const bool is_left_free     = (tof_left < 0.0f || tof_left >= PARK_TOF_BLOCKED_MM);
+            const bool is_right_free    = (tof_right < 0.0f || tof_right >= PARK_TOF_BLOCKED_MM);
+
+            if (parking_active) {
+                switch (park_state) {
+                    case ParkingState::APPROACH:
+                    case ParkingState::SLOT1_WAIT_BLOCKED: {
+                        // Xe tiếp tục đi đến khi 2 TOF hai bên nhận thấy đang bị block ở ô 1
+                        if (is_left_blocked && is_right_blocked) {
+                            slot1_confirm_cnt++;
+                            if (slot1_confirm_cnt >= 2) {
+                                slot1_tof_left  = tof_left;
+                                slot1_tof_right = tof_right;
+                                park_state = ParkingState::SLOT2_SEARCH_FREE;
+                                std::cout << "[PARK] >> SLOT 1: BOTH BLOCKED (L=" << tof_left
+                                          << "mm, R=" << tof_right << "mm) -> Advancing to search free slot...\n";
+                            }
+                        } else {
+                            slot1_confirm_cnt = 0;
+                        }
+                        break;
+                    }
+
+                    case ParkingState::SLOT2_SEARCH_FREE: {
+                        // Cho xe chạy tiếp đến khi TOF bên trái thấy đang free và bên phải đang bị block (hoặc ngược lại)
+                        if (is_left_free && is_right_blocked) {
+                            slot2_confirm_cnt++;
+                            if (slot2_confirm_cnt >= 2) {
+                                park_free_side = -1; // Bên TRÁI trống
+                                slot2_tof_left  = tof_left;
+                                slot2_tof_right = tof_right;
+                                park_state = ParkingState::SLOT3_WAIT_BLOCKED;
+                                std::cout << "[PARK] >> SLOT 2: LEFT FREE (L=" << tof_left
+                                          << "mm), RIGHT BLOCKED (R=" << tof_right
+                                          << "mm) -> SAVED FREE SIDE: LEFT. Continuing to Slot 3...\n";
+                            }
+                        } else if (is_right_free && is_left_blocked) {
+                            slot2_confirm_cnt++;
+                            if (slot2_confirm_cnt >= 2) {
+                                park_free_side = 1; // Bên PHẢI trống
+                                slot2_tof_left  = tof_left;
+                                slot2_tof_right = tof_right;
+                                park_state = ParkingState::SLOT3_WAIT_BLOCKED;
+                                std::cout << "[PARK] >> SLOT 2: RIGHT FREE (R=" << tof_right
+                                          << "mm), LEFT BLOCKED (L=" << tof_left
+                                          << "mm) -> SAVED FREE SIDE: RIGHT. Continuing to Slot 3...\n";
+                            }
+                        } else {
+                            slot2_confirm_cnt = 0;
+                        }
+                        break;
+                    }
+
+                    case ParkingState::SLOT3_WAIT_BLOCKED: {
+                        // Tiếp tục cho xe chạy đến khi thấy hai bên bị block tiếp thì dừng (mỗi bên có 3 ô)
+                        if (is_left_blocked && is_right_blocked) {
+                            slot3_confirm_cnt++;
+                            if (slot3_confirm_cnt >= 2) {
+                                slot3_tof_left  = tof_left;
+                                slot3_tof_right = tof_right;
+                                if (heading_ok) park_heading_0 = current_heading;
+                                park_dwell_time = 0.0;
+                                park_state = ParkingState::WAIT_FULL_STOP;
+                                std::cout << "[PARK] >> SLOT 3: BOTH BLOCKED (L=" << tof_left
+                                          << "mm, R=" << tof_right
+                                          << "mm) -> STOP! Saved Base Heading=" << park_heading_0 << " deg\n";
+                            }
+                        } else {
+                            slot3_confirm_cnt = 0;
+                        }
+                        break;
+                    }
+
+                    case ParkingState::WAIT_FULL_STOP: {
+                        park_dwell_time += dt_loop;
+                        if (heading_ok) park_heading_0 = current_heading;
+                        if (park_dwell_time >= PARK_STOP_DWELL_S) {
+                            park_state = ParkingState::REVERSE_1;
+                            park_reverse_elapsed = 0.0;
+                            std::cout << "[PARK] >> FULL STOP CONFIRMED (Heading_0=" << park_heading_0
+                                      << " deg) -> START REVERSE_1 (Steer max to "
+                                      << (park_free_side < 0 ? "LEFT" : "RIGHT") << ")\n";
+                        }
+                        break;
+                    }
+
+                    case ParkingState::REVERSE_1: {
+                        park_reverse_elapsed += dt_loop;
+                        // Bẻ lái tối đa về phía ô trống, lùi chậm cho đến khi heading lệch 45 độ so với heading_0
+                        float delta_h = std::abs(normalizeAngle(current_heading - park_heading_0));
+                        if (delta_h >= PARK_TARGET_DELTA_DEG || park_reverse_elapsed >= 7.0) {
+                            park_state = ParkingState::REVERSE_2;
+                            park_reverse_elapsed = 0.0;
+                            std::cout << "[PARK] >> REVERSE_1 COMPLETE (Delta=" << delta_h
+                                      << " deg >= 45 deg) -> START REVERSE_2 (Counter-steer opposite)\n";
+                        }
+                        break;
+                    }
+
+                    case ParkingState::REVERSE_2: {
+                        park_reverse_elapsed += dt_loop;
+                        // Bẻ lái ngược lại, lùi chậm cho đến khi heading trả về giá trị ban đầu +- 3 độ
+                        float delta_h = std::abs(normalizeAngle(current_heading - park_heading_0));
+                        if (delta_h <= PARK_ALIGN_TOL_DEG || park_reverse_elapsed >= 7.0) {
+                            park_state = ParkingState::DONE;
+                            std::cout << "[PARK] >> REVERSE_2 COMPLETE: ALIGNED (Delta=" << delta_h
+                                      << " deg <= 3 deg) -> PARKING COMPLETED! <<<\n";
+                        }
+                        break;
+                    }
+
+                    case ParkingState::DONE: {
+                        break;
+                    }
+
+                    default:
+                        break;
+                }
+            }
+
             out = follower.step(
-                mask,
+                active_mask,
                 effective_bias,
                 effective_is_turn,
                 applied_floor,
@@ -673,7 +949,24 @@ int main() {
                 handled_sign = "NONE";
             }
 
-            if (dec.emergency_stop) {
+            if (parking_active) {
+                if (park_state == ParkingState::WAIT_FULL_STOP || park_state == ParkingState::DONE) {
+                    speed = 0.0f;
+                    final_angle = MapWheelAngleToServoCmd(0.0, INVERT_STEER);
+                } else if (park_state == ParkingState::REVERSE_1) {
+                    speed = PARK_REVERSE_SPEED;
+                    double wheel_steer = (park_free_side < 0) ? -PARK_MAX_STEER_DEG : PARK_MAX_STEER_DEG;
+                    final_angle = MapWheelAngleToServoCmd(wheel_steer, INVERT_STEER);
+                } else if (park_state == ParkingState::REVERSE_2) {
+                    speed = PARK_REVERSE_SPEED;
+                    double wheel_steer = (park_free_side < 0) ? PARK_MAX_STEER_DEG : -PARK_MAX_STEER_DEG;
+                    final_angle = MapWheelAngleToServoCmd(wheel_steer, INVERT_STEER);
+                } else {
+                    // APPROACH, SLOT1_WAIT_BLOCKED, SLOT2_SEARCH_FREE, SLOT3_WAIT_BLOCKED:
+                    speed = PARK_APPROACH_SPEED;
+                    final_angle = MapWheelAngleToServoCmd(out.angle, INVERT_STEER);
+                }
+            } else if (dec.emergency_stop) {
                 speed = 0.0f;
                 final_angle = MapWheelAngleToServoCmd(0.0, INVERT_STEER);
             } else {
@@ -760,6 +1053,15 @@ int main() {
                 navBrain.GetTLMetrics().bot_brightness,
                 navBrain.GetTLMetrics().diff_brightness,
 
+                // --- PARKING TELEMETRY ---
+                ParkingStateStr(park_state),
+                park_free_side,
+                tof_left,
+                tof_right,
+                current_heading,
+                park_heading_0,
+                std::abs(normalizeAngle(current_heading - park_heading_0)),
+
                 ui_left_pts,
                 ui_right_pts
             );
@@ -786,6 +1088,16 @@ int main() {
                           << "/B" << navBrain.GetTLMetrics().bot_brightness
                           << " d" << navBrain.GetTLMetrics().diff_brightness << ")";
             }
+            if (parking_active) {
+                float delta_h = std::abs(normalizeAngle(current_heading - park_heading_0));
+                std::cout << " | PARK: " << ParkingStateStr(park_state)
+                          << "(Side:" << (park_free_side < 0 ? "L" : (park_free_side > 0 ? "R" : "-"))
+                          << " TOF L:" << std::fixed << std::setprecision(0) << tof_left
+                          << " R:" << tof_right
+                          << " Hdg:" << std::setprecision(1) << current_heading
+                          << " H0:" << park_heading_0
+                          << " dH:" << delta_h << "deg)";
+            }
             std::cout << " | P0(" << turn_res.p0.x << "," << turn_res.p0.y << ") "
                       << "P1(" << turn_res.p1.x << "," << turn_res.p1.y << ") "
                       << "P2(" << turn_res.p2.x << "," << turn_res.p2.y << ")\n";
@@ -798,6 +1110,22 @@ int main() {
                 cv::Mat blended;
                 cv::addWeighted(frame, 0.65, green, 0.35, 0, blended);
                 blended.copyTo(overlay, mask);
+
+                // ============================================================
+                // PARKING SCANLINES UI (2 scanline thẳng cố định giới hạn làn bãi đỗ)
+                // ============================================================
+                if (parking_active) {
+                    cv::line(overlay, cv::Point(PARK_SCANLINE_LEFT_X, 0), cv::Point(PARK_SCANLINE_LEFT_X, frame.rows - 1),
+                             cv::Scalar(0, 140, 255), 2, cv::LINE_AA);
+                    cv::line(overlay, cv::Point(PARK_SCANLINE_RIGHT_X, 0), cv::Point(PARK_SCANLINE_RIGHT_X, frame.rows - 1),
+                             cv::Scalar(0, 140, 255), 2, cv::LINE_AA);
+                    cv::putText(overlay, cv::format("PARK SCAN L (X=%d)", PARK_SCANLINE_LEFT_X),
+                                cv::Point(PARK_SCANLINE_LEFT_X + 5, 45),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 140, 255), 1, cv::LINE_AA);
+                    cv::putText(overlay, cv::format("PARK SCAN R (X=%d)", PARK_SCANLINE_RIGHT_X),
+                                cv::Point(PARK_SCANLINE_RIGHT_X - 150, 45),
+                                cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 140, 255), 1, cv::LINE_AA);
+                }
 
                 // ============================================================
                 // A. VẼ VÙNG QUÉT ĐO NGÃ RẼ (JUNCTION MEASUREMENT ZONE)
@@ -1021,6 +1349,20 @@ int main() {
                     draw_text(overlay, cv::format(">> WAITING GREEN TO TURN: %s <<", turn_controller.direction.c_str()),
                               cv::Point(15, 300), cv::Scalar(0, 255, 255));
                 }
+                if (parking_active) {
+                    float delta_h = std::abs(normalizeAngle(current_heading - park_heading_0));
+                    draw_text(overlay, cv::format("PARK: %s | Free: %s | Speed: %.1f cm/s",
+                              ParkingStateStr(park_state),
+                              (park_free_side < 0 ? "LEFT" : (park_free_side > 0 ? "RIGHT" : "NONE")),
+                              speed),
+                              cv::Point(15, 300), cv::Scalar(0, 255, 255));
+                    draw_text(overlay, cv::format("TOF1(L): %.0fmm | TOF3(R): %.0fmm (Blk<%.0f)",
+                              tof_left, tof_right, PARK_TOF_BLOCKED_MM),
+                              cv::Point(15, 325), cv::Scalar(0, 255, 255));
+                    draw_text(overlay, cv::format("Heading: %.1f | Base: %.1f | Delta: %.1f deg",
+                              current_heading, park_heading_0, delta_h),
+                              cv::Point(15, 350), cv::Scalar(0, 255, 255));
+                }
             }
 
             signDetector.Draw(overlay, cachedSigns);
@@ -1035,6 +1377,8 @@ int main() {
 
     motor.SetSpeedCms(0.0f);
     servo.SetAngle(MapWheelAngleToServoCmd(0.0, INVERT_STEER));
+    if (tof_ok) tof.Stop();
+    if (imu_ok) bno.close();
     if (SHOW_UI) cv::destroyAllWindows();
     std::cout << "\n[System] Stopped safely\n";
     return 0;
