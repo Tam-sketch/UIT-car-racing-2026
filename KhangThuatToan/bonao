@@ -262,9 +262,9 @@ public:
         dec.target_speed = currentSpeed;
         dec.active_sign = latched_sign_;
 
-        // Khi đang dừng hoặc đang tiến chậm lại gần đèn đỏ / người đi bộ:
-        // đóng băng thời gian giữ biển (latch_cooldown_frames_) để biển kế bên đèn không bao giờ bị hết hạn
-        if ((HazardStop() || ApproachingRedLight()) && latched_sign_ != "NONE") {
+        // Khi đang dừng hoặc đang tiến chậm lại gần đèn đỏ / người đi bộ / bãi đỗ xe:
+        // đóng băng thời gian giữ biển (latch_cooldown_frames_) để biển không bao giờ bị hết hạn
+        if ((HazardStop() || ApproachingRedLight() || latched_sign_ == "parking") && latched_sign_ != "NONE") {
             latch_cooldown_frames_ = LATCH_DURATION_FRAMES;
         } else if (latch_cooldown_frames_ > 0) {
             latch_cooldown_frames_--;
@@ -274,9 +274,9 @@ public:
         }
 
         if (dec.active_sign == "parking") {
-            dec.action = NavAction::STOP_PARKING;
-            dec.target_speed = 0.0f;
-            dec.emergency_stop = true;
+            dec.action = NavAction::FOLLOW_LANE;
+            dec.target_speed = 10.0f; // Tốc độ tiếp cận bãi đỗ
+            dec.emergency_stop = false;
             return dec;
         }
 
@@ -400,7 +400,7 @@ private:
     int  ped_seen_ = 0, ped_miss_ = 0;
 
     // Đèn giao thông (tiến lại gần đèn để nhận biển báo kế bên rồi mới dừng)
-    static constexpr float TL_CONF                  = 0.55f;
+    static constexpr float TL_CONF                  = 0.7f;
     static constexpr int   TL_CONFIRM_FRAMES        = 2;
     static constexpr int   TL_MIN_BRIGHTNESS        = 95;   // Độ sáng tối thiểu của chóa đèn khi bật
     static constexpr int   TL_MIN_CONTRAST_DIFF     = 18;   // Chênh lệch tối thiểu giữa chóa sáng nhất và chóa nhì
