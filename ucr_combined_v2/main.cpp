@@ -353,6 +353,34 @@ static float normalizeAngleP(float a) {
     return a;
 }
 
+// Return `angle` (deg) shifted by a multiple of 360 so that
+// `angle - ref` is in (-180, 180]. Used to make arithmetic
+// across the 0/360 boundary behave as if the sensor range were
+// continuous, not circular.
+static float unwrapNear(float ref, float angle) {
+    float d = angle - ref;
+    while (d >  180.0f) d -= 360.0f;
+    while (d < -180.0f) d += 360.0f;
+    return ref + d;
+}
+
+// Wrap-safe median of a set of headings in degrees. Each sample is
+// unwrapped relative to the FIRST sample before sorting, so a cluster
+// of samples near 0/360 does not split around the wrap and inflate the
+// median to ~180. Result is returned in [0, 360).
+static float medianHeadingDeg(const std::vector<float>& samples) {
+    if (samples.empty()) return 0.0f;
+    const float ref = samples.front();
+    std::vector<float> unwrapped;
+    unwrapped.reserve(samples.size());
+    for (float s : samples) unwrapped.push_back(unwrapNear(ref, s));
+    std::sort(unwrapped.begin(), unwrapped.end());
+    float median = unwrapped[unwrapped.size() / 2];
+    while (median <    0.0f) median += 360.0f;
+    while (median >= 360.0f) median -= 360.0f;
+    return median;
+}
+
 // ============================================================
 // SIGN COMMIT
 // ============================================================
@@ -838,9 +866,13 @@ int main() {
                         park_heading_buf.pop_front();
                 }
                 if ((int)park_heading_buf.size() >= PARK_HEADING_WINDOW) {
-                    std::vector<float> tmp(park_heading_buf.begin(), park_heading_buf.end());
-                    std::sort(tmp.begin(), tmp.end());
-                    park_ref_heading = tmp[tmp.size() / 2];
+                    std::vector<float> samples(park_heading_buf.begin(),
+                                               park_heading_buf.end());
+                    // Wrap-safe median: samples near 0/360 are unwrapped
+                    // around the first sample before sorting, so the
+                    // reference does not jump to ~180° when the true
+                    // heading is close to 0.
+                    park_ref_heading = medianHeadingDeg(samples);
                     park_state = ParkState::SLOT_SEARCH;
                     std::printf("[PARK] Reference captured: %.2f° → SLOT_SEARCH\n",
                                 park_ref_heading);
@@ -849,9 +881,9 @@ int main() {
                         std::printf("[PARK] CAPTURE timeout, no samples → ABORT\n");
                         park_state = ParkState::NONE;
                     } else {
-                        std::vector<float> tmp(park_heading_buf.begin(), park_heading_buf.end());
-                        std::sort(tmp.begin(), tmp.end());
-                        park_ref_heading = tmp[tmp.size() / 2];
+                        std::vector<float> samples(park_heading_buf.begin(),
+                                                   park_heading_buf.end());
+                        park_ref_heading = medianHeadingDeg(samples);
                         park_state = ParkState::SLOT_SEARCH;
                         std::printf("[PARK] CAPTURE timeout, using %zu samples: %.2f° → SLOT_SEARCH\n",
                                     park_heading_buf.size(), park_ref_heading);
