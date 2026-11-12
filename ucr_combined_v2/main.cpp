@@ -100,15 +100,28 @@ namespace sign_class {
 }
 
 // Traffic light HSV
+// Traffic light HSV
 namespace tl {
     inline constexpr int RED_H1_LO = 0,   RED_H1_HI = 10;
     inline constexpr int RED_H2_LO = 170, RED_H2_HI = 180;
     inline constexpr int YEL_H_LO  = 15,  YEL_H_HI  = 35;
     inline constexpr int GRN_H_LO  = 40,  GRN_H_HI  = 90;
-    inline constexpr int S_MIN     = 50;
-    inline constexpr int V_MIN     = 230;
+
+    // Saturation bounds for the saturated-color path.
+    // OpenCV 8-bit S is 0-255. 500 was a bug that matched ZERO pixels.
+    inline constexpr int S_MIN     = 150;
+    inline constexpr int S_MAX     = 255;
+    inline constexpr int V_MIN     = 220; // Slightly relaxed to catch dimmer lights
+
+    // Near-white (blown-out) path
+    // The center of a close light drops to S ~ 10-50 and V ~ 255.
+    inline constexpr int S_WHITE_MAX = 50;
+    inline constexpr int V_WHITE_MIN = 220;
+    inline constexpr int MIN_WHITE_PIXELS = 10;
+
     inline constexpr int MIN_LIT_PIXELS = 10;
     inline constexpr float ROI_EXPAND   = 1.05f;
+    inline constexpr bool TL_DEBUG      = false; // Set true to see HSV counts in console
 }
 
 static constexpr double PERSON_STOP_HANGOVER_S = 2.0;
@@ -410,11 +423,6 @@ static SignCommit MakeSignCommit(int committed) {
     return s;
 }
 
-// ============================================================
-// TRAFFIC LIGHT
-// ============================================================
-enum class LightColor { NONE, RED, YELLOW, GREEN };
-
 static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox) {
     using namespace tl;
     const int cx = bbox.x + bbox.width / 2;
@@ -430,27 +438,66 @@ static LightColor ClassifyTrafficLight(const cv::Mat& bgr, const cv::Rect& bbox)
     cv::Mat hsv;
     cv::cvtColor(bgr(cv::Rect(x1, y1, x2 - x1, y2 - y1)), hsv, cv::COLOR_BGR2HSV);
 
+    // =========================================================================
+    // PATH 1: WHOLE TRAFFIC LIGHT DETECTED (Tall bounding box)
+    // If the box is tall, it contains all 3 lights. We split it into 3 horizontal
+    // slices (Top=Red, Mid=Yellow, Bot=Green) and find the brightest one.
+    // This perfectly handles the blown-out white core: a lit bulb will have a
+    // massive V (brightness) value compared to the unlit bulbs.
+    // =========================================================================
+    if (h > w * 1.5) {
+        cv::Mat v_chan;
+        cv::extractChannel(hsv, v_chan, 2); // Extract V channel
+
+        int h_third = h / 3;
+        int top_lit = cv::countNonZero(v_chan(cv::Rect(0, 0, w, h_third)) > V_MIN);
+        int mid_lit = cv::countNonZero(v_chan(cv::Rect(0, h_third, w, h_third)) > V_MIN);
+        int bot_lit = cv::countNonZero(v_chan(cv::Rect(0, 2 * h_third, w, h_third)) > V_MIN);
+
+        if (TL_DEBUG) std::printf("[TL] SLICE r=%d y=%d g=%d\n", top_lit, mid_lit, bot_lit);
+
+        // Require the lit slice to be significantly brighter than the others
+        if (top_lit >= MIN_LIT_PIXELS && top_lit > mid_lit * 1.5 && top_lit > bot_lit * 1.5) return LightColor::RED;
+        if (mid_lit >= MIN_LIT_PIXELS && mid_lit > top_lit * 1.5 && mid_lit > bot_lit * 1.5) return LightColor::YELLOW;
+        if (bot_lit >= MIN_LIT_PIXELS && bot_lit > top_lit * 1.5 && bot_lit > mid_lit * 1.5) return LightColor::GREEN;
+        return LightColor::NONE;
+    }
+
+    // =========================================================================
+    // PATH 2: SINGLE LIGHT DETECTED (Square-ish bounding box)
+    // Counts saturated colors and blown-out white pixels. White pixels are
+    // added to the dominant color to boost the count.
+    // =========================================================================
     cv::Mat mRed1, mRed2, mRed;
-    cv::inRange(hsv, cv::Scalar(RED_H1_LO, S_MIN, V_MIN),
-                     cv::Scalar(RED_H1_HI, 255, 255), mRed1);
-    cv::inRange(hsv, cv::Scalar(RED_H2_LO, S_MIN, V_MIN),
-                     cv::Scalar(RED_H2_HI, 255, 255), mRed2);
+    cv::inRange(hsv, cv::Scalar(RED_H1_LO, S_MIN, V_MIN), cv::Scalar(RED_H1_HI, S_MAX, 255), mRed1);
+    cv::inRange(hsv, cv::Scalar(RED_H2_LO, S_MIN, V_MIN), cv::Scalar(RED_H2_HI, S_MAX, 255), mRed2);
     cv::bitwise_or(mRed1, mRed2, mRed);
     int nRed = cv::countNonZero(mRed);
 
     cv::Mat mYel;
-    cv::inRange(hsv, cv::Scalar(YEL_H_LO, S_MIN, V_MIN),
-                     cv::Scalar(YEL_H_HI, 255, 255), mYel);
+    cv::inRange(hsv, cv::Scalar(YEL_H_LO, S_MIN, V_MIN), cv::Scalar(YEL_H_HI, S_MAX, 255), mYel);
     int nYel = cv::countNonZero(mYel);
 
     cv::Mat mGrn;
-    cv::inRange(hsv, cv::Scalar(GRN_H_LO, S_MIN, V_MIN),
-                     cv::Scalar(GRN_H_HI, 255, 255), mGrn);
+    cv::inRange(hsv, cv::Scalar(GRN_H_LO, S_MIN, V_MIN), cv::Scalar(GRN_H_HI, S_MAX, 255), mGrn);
     int nGrn = cv::countNonZero(mGrn);
+
+    // Near-white (blown-out) pixels
+    cv::Mat mWhite;
+    cv::inRange(hsv, cv::Scalar(0, 0, V_WHITE_MIN), cv::Scalar(180, S_WHITE_MAX, 255), mWhite);
+    int nWhite = cv::countNonZero(mWhite);
+
+    // Add the white pixels to whichever color dominates the edges
+    if (nRed > 0 && nRed >= nYel && nRed >= nGrn) nRed += nWhite;
+    else if (nGrn > 0 && nGrn > nRed && nGrn >= nYel) nGrn += nWhite;
+    else if (nYel > 0 && nYel > nRed && nYel > nGrn) nYel += nWhite;
+
+    if (TL_DEBUG) std::printf("[TL] SINGLE r=%d y=%d g=%d (w=%d)\n", nRed, nYel, nGrn, nWhite);
 
     if (nRed >= MIN_LIT_PIXELS && nRed > nYel && nRed > nGrn) return LightColor::RED;
     if (nYel >= MIN_LIT_PIXELS && nYel > nRed && nYel > nGrn) return LightColor::YELLOW;
     if (nGrn >= MIN_LIT_PIXELS && nGrn > nRed && nGrn > nYel) return LightColor::GREEN;
+
     return LightColor::NONE;
 }
 
@@ -1309,6 +1356,7 @@ int main() {
                 SignName(voter.GetCommitted()),
                 voter.GetCommitted(),
                 RbStateName(rb_state),
+                rb_pass_count,
                 ParkStateName(park_state),
                 out.near_e, heading_now, park_ref_heading,
                 tof_left_mm, tof_right_mm,
