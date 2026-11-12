@@ -68,6 +68,12 @@ static constexpr float SERVO_RIGHT_OFFSET  = 2.5f;
 static constexpr float MAX_REAL_ANGLE_DEG  = 30.0f;
 static constexpr int   MAX_SERVO_CMD       = 55;
 
+// Rear-facing ToF sensor slots (matches RobotConfig.h TOF_IDX_*).
+// Slots 0 and 2 are not wired on this chassis — the working pair for
+// parking slot detection is the rear left (slot 1) + rear right (slot 3).
+static constexpr int TOF_IDX_REAR_LEFT  = 1;
+static constexpr int TOF_IDX_REAR_RIGHT = 3;
+
 // Sign class indices
 namespace sign_class {
     inline constexpr int CONSTRUCTION_AHEAD = 0;
@@ -744,7 +750,11 @@ int main() {
         if (imu_ok) {
             BNO055::Data imu_data;
             if (imu.read(imu_data)) {
-                heading_now = static_cast<float>(imu_data.eulerDeg.y);
+                // eulerDeg.x is the yaw axis on this mount (confirmed by
+                // test_bno055 + parking.cpp). eulerDeg.y is pitch/roll —
+                // it changes on every bump, so it must NOT be used for
+                // heading-hold or turn-release logic.
+                heading_now = HEADING_SIGN * static_cast<float>(imu_data.eulerDeg.x);
                 heading_ok  = true;
             }
         }
@@ -754,12 +764,19 @@ int main() {
             // Return value may be false on partial API errors; per-slot
             // 'valid' / 'distanceMm' are authoritative — ignore the bool.
             tof.Read(readings, std::chrono::milliseconds(50));
-            // TODO: verify which slot is physically LEFT vs RIGHT on this chassis.
-            // Convention assumed here: index 0 = left, index 1 = right.
-            if (readings[0].valid && readings[0].distanceMm > 0)
-                tof_left_mm  = static_cast<float>(readings[0].distanceMm);
-            if (readings[1].valid && readings[1].distanceMm > 0)
-                tof_right_mm = static_cast<float>(readings[1].distanceMm);
+            // Rear pair (RobotConfig.h):
+            //   slot 1 = rear left  (TOF_IDX_REAR_LEFT)
+            //   slot 3 = rear right (TOF_IDX_REAR_RIGHT)
+            // Rear sensors are the ones that see the parking slot during the
+            // reverse manoeuvre, so they drive SLOT_SEARCH / SLOT_FOUND.
+            if (readings[TOF_IDX_REAR_LEFT].valid &&
+                readings[TOF_IDX_REAR_LEFT].distanceMm > 0)
+                tof_left_mm  = static_cast<float>(
+                    readings[TOF_IDX_REAR_LEFT].distanceMm);
+            if (readings[TOF_IDX_REAR_RIGHT].valid &&
+                readings[TOF_IDX_REAR_RIGHT].distanceMm > 0)
+                tof_right_mm = static_cast<float>(
+                    readings[TOF_IDX_REAR_RIGHT].distanceMm);
         }
 
         // -----------------------------------------------------
