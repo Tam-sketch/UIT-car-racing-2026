@@ -1,7 +1,7 @@
 // ============================================================
 // NavigationBrain.h
 // ============================================================
-//3
+//4
 #pragma once
 
 #include <opencv2/opencv.hpp>
@@ -318,20 +318,18 @@ public:
 
 private:
     // =========================================================================
-    // PHÂN LOẠI MÀU ĐÈN GIAO THÔNG:
-    // Vì vỏ đèn luôn có sẵn 3 màu Đỏ - Vàng - Xanh kể cả khi tắt, nên không thể đếm màu thô.
-    // Thuật toán chia đèn thành 3 tầng chóa đứng (Top: Đỏ, Mid: Vàng, Bot: Xanh),
-    // đo độ sáng lõi trung tâm (top 20% pixel sáng nhất của chóa), và SO SÁNH TƯƠNG ĐỐI:
-    // - Chỉ khi chóa nào sáng vượt trội hơn hẳn 2 chóa còn lại (diff >= TL_MIN_CONTRAST_DIFF)
-    //   và đạt độ sáng tối thiểu (b_max >= TL_MIN_BRIGHTNESS) thì mới chốt đèn đó bật.
-    // - Nếu cả 3 chóa có độ sáng gần như nhau (diff < TL_MIN_CONTRAST_DIFF) -> NONE (đèn tắt / ánh sáng đều).
+    // PHÂN LOẠI MÀU ĐÈN GIAO THÔNG (KẾT HỢP ĐỘ SÁNG + MÀU SẮC THỰC HSV & BGR):
+    // Khắc phục triệt để lỗi ánh sáng mặt trời/đèn trần chiếu từ trên đỉnh làm chói trắng tầng Đỏ:
+    // - Chỉ khi chóa có màu sắc thực thụ (Đỏ: H<=14/H>=165 & S>=45 & R>G,B; Xanh: H 35-95 & S>=35 & G>R)
+    //   mới được tính điểm màu (Color Score). Ánh sáng chói trắng (S thấp, kênh RGB ngang nhau)
+    //   sẽ có điểm màu = 0 và bị loại bỏ hoàn toàn, không thể nhận nhầm thành Đỏ!
     // =========================================================================
     static std::string ClassifyLight(const cv::Mat& frame, const cv::Rect& box,
                                      int& out_top_b, int& out_mid_b, int& out_bot_b, int& out_diff) {
         out_top_b = 0; out_mid_b = 0; out_bot_b = 0; out_diff = 0;
         if (frame.empty()) return "NONE";
         cv::Rect r = box & cv::Rect(0, 0, frame.cols, frame.rows);
-        if (r.width < 6 || r.height < 12 || r.area() < 80) return "NONE";
+        if (r.width < 6 || r.height < 12 || r.area() < 60) return "NONE";
 
         cv::Mat roi = frame(r);
         cv::Mat hsv;
@@ -340,62 +338,123 @@ private:
         const int H = r.height;
         const int W = r.width;
 
-        // Cắt bớt 12% viền trái/phải để tập trung đúng vào chóa đèn tròn bên trong
-        const int x_start = static_cast<int>(W * 0.12);
-        const int x_end   = std::max(x_start + 1, static_cast<int>(W * 0.88));
+        // Cắt bớt 15% viền trái/phải để tập trung đúng vào chóa đèn tròn bên trong
+        const int x_start = static_cast<int>(W * 0.15);
+        const int x_end   = std::max(x_start + 1, static_cast<int>(W * 0.85));
 
-        // Hàm tính độ sáng chóa đèn: lấy trung bình top 20% pixel sáng nhất (bắt trọn điểm lóe sáng tâm bóng đèn)
-        auto get_slot_brightness = [&](int y_pct_start, int y_pct_end) -> int {
+        auto analyze_slot = [&](int y_pct_start, int y_pct_end, int slot_type,
+                                int& avg_brightness, int& color_pixels, float& color_score) {
             int y0 = std::clamp(static_cast<int>(H * y_pct_start / 100.0), 0, H - 1);
             int y1 = std::clamp(static_cast<int>(H * y_pct_end / 100.0), y0 + 1, H);
-            
-            std::vector<int> vals;
-            vals.reserve((y1 - y0) * (x_end - x_start));
+
+            std::vector<int> b_vals;
+            b_vals.reserve((y1 - y0) * (x_end - x_start));
+            color_pixels = 0;
+            color_score  = 0.0f;
 
             for (int y = y0; y < y1; ++y) {
-                const cv::Vec3b* ptr = hsv.ptr<cv::Vec3b>(y);
+                const cv::Vec3b* bgr_ptr = roi.ptr<cv::Vec3b>(y);
+                const cv::Vec3b* hsv_ptr = hsv.ptr<cv::Vec3b>(y);
                 for (int x = x_start; x < x_end; ++x) {
-                    vals.push_back(ptr[x][2]); // Giá trị V (độ sáng)
+                    int b   = bgr_ptr[x][0];
+                    int g   = bgr_ptr[x][1];
+                    int r_v = bgr_ptr[x][2];
+
+                    int h = hsv_ptr[x][0];
+                    int s = hsv_ptr[x][1];
+                    int v = hsv_ptr[x][2];
+
+                    b_vals.push_back(v);
+
+                    if (slot_type == 0) {
+                        // TẦNG ĐỎ (TOP):
+                        // Phải có màu đỏ thực thụ: H đỏ, Saturation >= 45 (chống chói trắng), và R vượt trội G, B
+                        bool is_red = (((h <= 14 || h >= 165) && s >= 45 && v >= 65) ||
+                                       (r_v >= 110 && r_v > g * 1.30 && r_v > b * 1.30));
+                        if (is_red) {
+                            color_pixels++;
+                            color_score += static_cast<float>(r_v - std::max(g, b));
+                        }
+                    } else if (slot_type == 1) {
+                        // TẦNG VÀNG (MID):
+                        bool is_yellow = (((h >= 15 && h <= 34) && s >= 45 && v >= 75) ||
+                                          (r_v >= 120 && g >= 110 && b < std::min(r_v, g) * 0.70));
+                        if (is_yellow) {
+                            color_pixels++;
+                            color_score += static_cast<float>((r_v + g) / 2 - b);
+                        }
+                    } else if (slot_type == 2) {
+                        // TẦNG XANH (BOT):
+                        // Màu xanh lá / xanh ngọc: H trong [35, 95], Saturation >= 35, và G vượt trội R
+                        bool is_green = (((h >= 35 && h <= 95) && s >= 35 && v >= 65) ||
+                                         (g >= 95 && g > r_v * 1.15 && (g > b * 0.88 || s >= 35)));
+                        if (is_green) {
+                            color_pixels++;
+                            color_score += static_cast<float>(g - r_v);
+                        }
+                    }
                 }
             }
 
-            if (vals.empty()) return 0;
-            std::sort(vals.begin(), vals.end(), std::greater<int>());
-
-            // Lấy trung bình của top 20% pixel sáng nhất trong chóa đèn
-            const size_t top_k = std::max<size_t>(1, vals.size() / 5);
+            if (b_vals.empty()) {
+                avg_brightness = 0;
+                return;
+            }
+            std::sort(b_vals.begin(), b_vals.end(), std::greater<int>());
+            const size_t top_k = std::max<size_t>(1, b_vals.size() / 5);
             long sum = 0;
-            for (size_t i = 0; i < top_k; ++i) sum += vals[i];
-            return static_cast<int>(sum / top_k);
+            for (size_t i = 0; i < top_k; ++i) sum += b_vals[i];
+            avg_brightness = static_cast<int>(sum / top_k);
         };
 
-        const int b_top = get_slot_brightness(4, 33);   // Tầng 1: Vỏ ĐỎ
-        const int b_mid = get_slot_brightness(35, 65);  // Tầng 2: Vỏ VÀNG
-        const int b_bot = get_slot_brightness(67, 96);  // Tầng 3: Vỏ XANH
+        int top_b = 0, mid_b = 0, bot_b = 0;
+        int red_px = 0, yel_px = 0, grn_px = 0;
+        float red_score = 0.0f, yel_score = 0.0f, grn_score = 0.0f;
 
-        out_top_b = b_top;
-        out_mid_b = b_mid;
-        out_bot_b = b_bot;
+        analyze_slot(4,  33, 0, top_b, red_px, red_score); // Tầng 1: ĐỎ
+        analyze_slot(35, 65, 1, mid_b, yel_px, yel_score); // Tầng 2: VÀNG
+        analyze_slot(67, 96, 2, bot_b, grn_px, grn_score); // Tầng 3: XANH
 
-        // Tìm chóa sáng nhất và chóa sáng nhì
-        int b_max = std::max({b_top, b_mid, b_bot});
-        int b_second = 0;
-        if (b_max == b_top)       b_second = std::max(b_mid, b_bot);
-        else if (b_max == b_mid)  b_second = std::max(b_top, b_bot);
-        else                      b_second = std::max(b_top, b_mid);
+        out_top_b = top_b;
+        out_mid_b = mid_b;
+        out_bot_b = bot_b;
+        out_diff  = std::abs(top_b - bot_b);
 
-        const int diff = b_max - b_second;
-        out_diff = diff;
+        // QUYẾT ĐỊNH MÀU SẮC ĐÈN:
+        // Ưu tiên điểm màu thực tế (Color Score) trước để loại bỏ hoàn toàn ánh sáng trắng chói từ trần/mặt trời!
+        const int MIN_COLOR_PX = 3;
+        const float MIN_COLOR_SCORE = 60.0f;
 
-        // Nếu cả 3 vỏ có độ sáng gần như nhau (diff < TL_MIN_CONTRAST_DIFF)
-        // hoặc chóa sáng nhất chưa đạt ngưỡng bật đèn (b_max < TL_MIN_BRIGHTNESS) -> NONE
-        if (diff < TL_MIN_CONTRAST_DIFF || b_max < TL_MIN_BRIGHTNESS) {
-            return "NONE";
+        // 1. Nếu tầng Xanh có màu xanh thực thụ vượt trội
+        if (grn_px >= MIN_COLOR_PX && grn_score >= MIN_COLOR_SCORE && grn_score > red_score * 1.25f) {
+            return "GREEN";
         }
 
-        if (b_max == b_top) return "RED";
-        if (b_max == b_mid) return "YELLOW";
-        return "GREEN";
+        // 2. Nếu tầng Đỏ có màu đỏ thực thụ vượt trội
+        if (red_px >= MIN_COLOR_PX && red_score >= MIN_COLOR_SCORE && red_score > grn_score * 1.25f) {
+            return "RED";
+        }
+
+        // 3. Nếu tầng Vàng có màu vàng thực thụ
+        if (yel_px >= MIN_COLOR_PX && yel_score >= MIN_COLOR_SCORE && yel_score > grn_score && yel_score > red_score) {
+            return "YELLOW";
+        }
+
+        // Nếu điểm màu chưa đủ mạnh, chỉ xét độ sáng chênh lệch khi tầng tương ứng có ít nhất một chút màu (không phải chói trắng thuần)
+        int b_max = std::max({top_b, mid_b, bot_b});
+        int b_second = 0;
+        if (b_max == top_b)       b_second = std::max(mid_b, bot_b);
+        else if (b_max == mid_b)  b_second = std::max(top_b, bot_b);
+        else                      b_second = std::max(top_b, mid_b);
+
+        const int b_diff = b_max - b_second;
+        if (b_diff >= TL_MIN_CONTRAST_DIFF && b_max >= TL_MIN_BRIGHTNESS) {
+            if (b_max == bot_b && grn_px >= 1) return "GREEN";
+            if (b_max == top_b && red_px >= 1) return "RED";
+            if (b_max == mid_b && yel_px >= 1) return "YELLOW";
+        }
+
+        return "NONE";
     }
 
     // Người đi bộ (chốt 3 frame không cần area, mất 5 frame mới đi tiếp)
@@ -406,7 +465,7 @@ private:
     int  ped_seen_ = 0, ped_miss_ = 0;
 
     // Đèn giao thông (tiến lại gần đèn để nhận biển báo kế bên rồi mới dừng)
-    static constexpr float TL_CONF                  = 0.7f;
+    static constexpr float TL_CONF                  = 0.45f;
     static constexpr int   TL_CONFIRM_FRAMES        = 2;
     static constexpr int   TL_MIN_BRIGHTNESS        = 95;   // Độ sáng tối thiểu của chóa đèn khi bật
     static constexpr int   TL_MIN_CONTRAST_DIFF     = 18;   // Chênh lệch tối thiểu giữa chóa sáng nhất và chóa nhì
