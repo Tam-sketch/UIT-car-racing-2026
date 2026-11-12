@@ -1,0 +1,427 @@
+// ============================================================
+// NavigationBrain.h
+// ============================================================
+#pragma once
+
+#include <opencv2/opencv.hpp>
+#include <string>
+#include <vector>
+#include <iostream>
+#include <algorithm>
+#include "SignDetector.h"
+
+enum class NavAction {
+    FOLLOW_LANE = 0,
+    FORCE_LEFT,
+    FORCE_RIGHT,
+    STOP_PARKING
+};
+
+struct NavDecision {
+    NavAction action = NavAction::FOLLOW_LANE;
+    float target_speed = 22.0f;
+    bool emergency_stop = false;
+    std::string active_sign = "NONE";
+};
+
+struct TrafficLightMetrics {
+    std::string raw_color = "NONE";
+    std::string confirmed_color = "NONE";
+    int top_brightness = 0;   // Chóa trên (ĐỎ)
+    int mid_brightness = 0;   // Chóa giữa (VÀNG)
+    int bot_brightness = 0;   // Chóa dưới (XANH)
+    int diff_brightness = 0;  // Độ chênh lệch giữa chóa sáng nhất và chóa nhì
+};
+
+class NavigationBrain {
+public:
+    NavigationBrain() = default;
+    void ClearLatchedSign() {
+        latched_sign_ = "NONE";
+        latch_cooldown_frames_ = 0;
+        candidate_sign_ = "NONE";
+        candidate_count_ = 0;
+        candidate_miss_ = 0;
+    }
+
+    void UpdateSign(const std::vector<SignObject>& signs) {
+        std::string best_sign = "NONE";
+        float best_conf = 0.0f;
+
+        for (const auto& s : signs) {
+            if (s.confidence >= 0.70f && s.box.area() >= 280) {
+                if (s.name == "traffic_light" || s.name == "walking_person") continue;
+                if (block_frames_ > 0 && s.name == blocked_sign_) continue; // biển vừa xử lý xong -> bỏ qua
+                if (s.confidence > best_conf) {
+                    best_conf = s.confidence;
+                    best_sign = s.name;
+                }
+            }
+        }
+
+        if (best_sign != "NONE") {
+            if (best_sign == candidate_sign_) {
+                candidate_count_++;
+                candidate_miss_ = 0;
+            } else {
+                candidate_sign_ = best_sign;
+                candidate_count_ = 1;
+                candidate_miss_ = 0;
+            }
+
+            // Chốt biển sau 5 frame xác nhận (parking chốt ở 3 frame để phanh kịp)
+            const int req_frames = (best_sign == "parking") ? 3 : SIGN_CONFIRM_FRAMES;
+            if (candidate_count_ >= req_frames) {
+                if (latched_sign_ != best_sign) {
+                    std::cout << "[NAV BRAIN] >> CONFIRMED (" << candidate_count_
+                              << " frames) & LATCHED SIGN: " << best_sign << "\n";
+                }
+                latched_sign_ = best_sign;
+                latch_cooldown_frames_ = LATCH_DURATION_FRAMES;
+            }
+        } else {
+            // Cho phép hụt tối đa 1 frame do nhòe chuyển động trước khi reset bộ đếm 5 frame
+            if (candidate_count_ > 0) {
+                candidate_miss_++;
+                if (candidate_miss_ > 1) {
+                    candidate_sign_ = "NONE";
+                    candidate_count_ = 0;
+                    candidate_miss_ = 0;
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------
+    // NGƯỜI ĐI BỘ + ĐÈN GIAO THÔNG (gọi mỗi frame, độc lập với chốt biển báo)
+    // - Pedestrian: không xét area, thấy đủ 3 frame -> dừng ngay;
+    //   còn thấy box là còn dừng; mất liên tiếp 5 frame -> tự đi tiếp.
+    //   Không ghi đè vào latched_sign_ nên không cần reset biển và không làm mất biển đang nhớ.
+    // - Traffic Light: Đỏ/Vàng -> dừng khi lại gần đèn (để kịp chốt biển kế bên đèn);
+    //   Xanh -> đi tiếp (và thực hiện lệnh rẽ của biển kế bên nếu có).
+    // ------------------------------------------------------------
+    void UpdateHazards(const cv::Mat& frame, const std::vector<SignObject>& objs, bool turn_already_armed = false) {
+        // ---- 1. NGƯỜI ĐI BỘ (PEDESTRIAN): không quan tâm area ----
+        bool ped_now = false;
+        for (const auto& o : objs) {
+            if (o.name == "walking_person" && o.confidence >= PED_CONF) {
+                ped_now = true;
+                break;
+            }
+        }
+
+        if (ped_now) {
+            ped_seen_++;
+            ped_miss_ = 0;
+            if (!ped_stop_ && ped_seen_ >= PED_CONFIRM_FRAMES) {
+                ped_stop_ = true;
+                std::cout << "[NAV BRAIN] >> PEDESTRIAN CONFIRMED (3 frames) -> STOP IMMEDIATELY!\n";
+            }
+        } else {
+            if (ped_stop_) {
+                // Đang dừng vì người đi bộ: phải mất box đủ 5 frame liên tiếp mới được đi tiếp
+                ped_miss_++;
+                if (ped_miss_ >= PED_CLEAR_FRAMES) {
+                    ped_stop_ = false;
+                    ped_seen_ = 0;
+                    ped_miss_ = 0;
+                    std::cout << "[NAV BRAIN] >> PEDESTRIAN CLEARED (5 frames) -> RESUME GO!\n";
+                }
+            } else {
+                // Chưa chốt đủ 3 frame mà mất box -> reset bộ đếm tiến tới 3 frame
+                ped_seen_ = 0;
+                ped_miss_ = 0;
+            }
+        }
+
+        // ---- 2. ĐÈN GIAO THÔNG (TRAFFIC LIGHT) ----
+        const SignObject* tl = nullptr;
+        for (const auto& o : objs) {
+            if (o.name == "traffic_light" && o.confidence >= TL_CONF &&
+                (!tl || o.box.area() > tl->box.area())) {
+                tl = &o;
+            }
+        }
+
+        if (!tl) {
+            tl_miss_++;
+            tl_red_cnt_ = 0;
+            tl_green_cnt_ = 0;
+            tl_none_cnt_  = 0;
+            tl_approaching_red_ = false;
+            if (tl_stop_ && tl_miss_ >= TL_LOST_RELEASE_FRAMES) {
+                tl_stop_ = false;
+                std::cout << "[NAV BRAIN] >> TRAFFIC LIGHT OUT OF VIEW -> GO\n";
+            }
+            if (tl_miss_ >= 5) {
+                tl_color_ = "NONE";
+                tl_metrics_ = TrafficLightMetrics{};
+            }
+            return;
+        }
+
+        tl_miss_ = 0;
+        int top_b = 0, mid_b = 0, bot_b = 0, diff = 0;
+        std::string detected_color = ClassifyLight(frame, tl->box, top_b, mid_b, bot_b, diff);
+        tl_metrics_.raw_color       = detected_color;
+        tl_metrics_.top_brightness  = top_b;
+        tl_metrics_.mid_brightness  = mid_b;
+        tl_metrics_.bot_brightness  = bot_b;
+        tl_metrics_.diff_brightness = diff;
+
+        // Máy trạng thái lọc xác nhận màu đèn qua các frame liên tiếp
+        if (detected_color == "RED" || detected_color == "YELLOW") {
+            tl_red_cnt_++;
+            tl_green_cnt_ = 0;
+            tl_none_cnt_  = 0;
+            if (tl_red_cnt_ >= TL_CONFIRM_FRAMES) {
+                tl_color_ = detected_color;
+            }
+        } else if (detected_color == "GREEN") {
+            tl_green_cnt_++;
+            tl_red_cnt_  = 0;
+            tl_none_cnt_ = 0;
+            if (tl_green_cnt_ >= TL_CONFIRM_FRAMES) {
+                tl_color_ = "GREEN";
+            }
+        } else { // "NONE" (cả 3 vỏ sáng/tối ngang nhau)
+            tl_none_cnt_++;
+            if (tl_none_cnt_ >= 4) {
+                tl_red_cnt_   = 0;
+                tl_green_cnt_ = 0;
+                // Nếu đang dừng đèn đỏ thì không tự ý nhả nếu đèn chỉ bị rung nhẹ chớp tắt
+                if (!tl_stop_) {
+                    tl_color_ = "NONE";
+                }
+            }
+        }
+        tl_metrics_.confirmed_color = tl_color_;
+
+        // Vị trí dừng: tiến lại gần đèn một chút để camera kịp chốt biển báo đặt kế bên đèn.
+        // Nếu đã chốt được biển kế bên (latched_sign_ != "NONE" hoặc turn_already_armed) thì dừng ở khoảng cách vừa phải,
+        // nếu chưa chốt được biển thì cho xe tiến sát hơn một chút để lấy trọn biển báo.
+        const int area = tl->box.area();
+        const int h_box = tl->box.height;
+        const bool has_sign_ready = (latched_sign_ != "NONE") || turn_already_armed;
+        const bool close_enough = has_sign_ready
+            ? (area >= TL_STOP_AREA_WITH_SIGN || h_box >= TL_STOP_HEIGHT_WITH_SIGN)
+            : (area >= TL_STOP_AREA_MAX       || h_box >= TL_STOP_HEIGHT_MAX);
+
+        if (tl_color_ == "RED" || tl_color_ == "YELLOW") {
+            tl_approaching_red_ = !close_enough;
+            if (!tl_stop_ && close_enough && tl_red_cnt_ >= TL_CONFIRM_FRAMES) {
+                tl_stop_ = true;
+                tl_approaching_red_ = false;
+                std::cout << "[NAV BRAIN] >> TRAFFIC LIGHT " << tl_color_
+                          << " [Top:" << top_b << " Mid:" << mid_b << " Bot:" << bot_b << " Diff:" << diff << "]"
+                          << " (area=" << area << ", sign=" << latched_sign_ << ") -> STOP!\n";
+            }
+        } else if (tl_color_ == "GREEN") {
+            tl_approaching_red_ = false;
+            if (tl_stop_ && tl_green_cnt_ >= TL_CONFIRM_FRAMES) {
+                tl_stop_ = false;
+                std::cout << "[NAV BRAIN] >> TRAFFIC LIGHT GREEN "
+                          << " [Top:" << top_b << " Mid:" << mid_b << " Bot:" << bot_b << " Diff:" << diff << "]"
+                          << " (sign=" << latched_sign_ << ") -> GO!\n";
+            }
+        }
+    }
+
+    bool HazardStop() const { return ped_stop_ || tl_stop_; }
+    bool PedestrianStop() const { return ped_stop_; }
+    bool TrafficLightStop() const { return tl_stop_; }
+    bool ApproachingRedLight() const { return tl_approaching_red_; }
+    const std::string& TrafficLightColor() const { return tl_color_; }
+    const TrafficLightMetrics& GetTLMetrics() const { return tl_metrics_; }
+
+    void BlockSign(const std::string& name, int frames) {
+        blocked_sign_ = name;
+        block_frames_ = frames;
+        if (latched_sign_ == name) ClearLatchedSign();
+    }
+
+
+    std::string GetTurnDirection() const {
+        // Nhóm rẽ trái
+        if (latched_sign_ == "turn_left" || 
+            latched_sign_ == "construction_ahead" || 
+            latched_sign_ == "no_right") {
+            return "LEFT";
+        }
+        // Nhóm rẽ phải
+        if (latched_sign_ == "turn_right" || 
+            latched_sign_ == "no_left") {
+            return "RIGHT";
+        }
+        return "NONE";
+    }
+
+    NavDecision Process(float currentSpeed) {
+        if (block_frames_ > 0) block_frames_--; 
+        NavDecision dec;
+        dec.target_speed = currentSpeed;
+        dec.active_sign = latched_sign_;
+
+        // Khi đang dừng hoặc đang tiến chậm lại gần đèn đỏ / người đi bộ:
+        // đóng băng thời gian giữ biển (latch_cooldown_frames_) để biển kế bên đèn không bao giờ bị hết hạn
+        if ((HazardStop() || ApproachingRedLight()) && latched_sign_ != "NONE") {
+            latch_cooldown_frames_ = LATCH_DURATION_FRAMES;
+        } else if (latch_cooldown_frames_ > 0) {
+            latch_cooldown_frames_--;
+        } else {
+            latched_sign_ = "NONE";
+            dec.active_sign = "NONE";
+        }
+
+        if (dec.active_sign == "parking") {
+            dec.action = NavAction::STOP_PARKING;
+            dec.target_speed = 0.0f;
+            dec.emergency_stop = true;
+            return dec;
+        }
+
+        std::string turn_direction = GetTurnDirection();
+
+        if (turn_direction == "LEFT") {
+            dec.action = NavAction::FORCE_LEFT;
+            dec.target_speed = 10.0f;
+        } else if (turn_direction == "RIGHT") {
+            dec.action = NavAction::FORCE_RIGHT;
+            dec.target_speed = 10.0f;
+        } else {
+            dec.action = NavAction::FOLLOW_LANE;
+        }
+
+        // Khi thấy đèn Đỏ/Vàng từ xa nhưng chưa đủ gần để dừng: giảm tốc xuống 10 cm/s để tiến lại gần đèn và chốt biển kế bên
+        if (ApproachingRedLight()) {
+            dec.target_speed = std::min(dec.target_speed, 10.0f);
+        }
+
+        // Dừng do người đi bộ / đèn đỏ-vàng: vẫn giữ nguyên dec.action & dec.active_sign theo biển báo
+        if (HazardStop()) {
+            dec.target_speed = 0.0f;
+            dec.emergency_stop = true;
+        }
+        return dec;
+    }
+
+    // Overload nhận thêm cv::Mat roadMask nếu file cpp nào đó truyền 2 tham số
+    NavDecision Process(const cv::Mat& /*roadMask*/, float currentSpeed) {
+        return Process(currentSpeed);
+    }
+
+private:
+    // =========================================================================
+    // PHÂN LOẠI MÀU ĐÈN GIAO THÔNG:
+    // Vì vỏ đèn luôn có sẵn 3 màu Đỏ - Vàng - Xanh kể cả khi tắt, nên không thể đếm màu thô.
+    // Thuật toán chia đèn thành 3 tầng chóa đứng (Top: Đỏ, Mid: Vàng, Bot: Xanh),
+    // đo độ sáng lõi trung tâm (top 20% pixel sáng nhất của chóa), và SO SÁNH TƯƠNG ĐỐI:
+    // - Chỉ khi chóa nào sáng vượt trội hơn hẳn 2 chóa còn lại (diff >= TL_MIN_CONTRAST_DIFF)
+    //   và đạt độ sáng tối thiểu (b_max >= TL_MIN_BRIGHTNESS) thì mới chốt đèn đó bật.
+    // - Nếu cả 3 chóa có độ sáng gần như nhau (diff < TL_MIN_CONTRAST_DIFF) -> NONE (đèn tắt / ánh sáng đều).
+    // =========================================================================
+    static std::string ClassifyLight(const cv::Mat& frame, const cv::Rect& box,
+                                     int& out_top_b, int& out_mid_b, int& out_bot_b, int& out_diff) {
+        out_top_b = 0; out_mid_b = 0; out_bot_b = 0; out_diff = 0;
+        if (frame.empty()) return "NONE";
+        cv::Rect r = box & cv::Rect(0, 0, frame.cols, frame.rows);
+        if (r.width < 6 || r.height < 12 || r.area() < 80) return "NONE";
+
+        cv::Mat roi = frame(r);
+        cv::Mat hsv;
+        cv::cvtColor(roi, hsv, cv::COLOR_BGR2HSV);
+
+        const int H = r.height;
+        const int W = r.width;
+
+        // Cắt bớt 12% viền trái/phải để tập trung đúng vào chóa đèn tròn bên trong
+        const int x_start = static_cast<int>(W * 0.12);
+        const int x_end   = std::max(x_start + 1, static_cast<int>(W * 0.88));
+
+        // Hàm tính độ sáng chóa đèn: lấy trung bình top 20% pixel sáng nhất (bắt trọn điểm lóe sáng tâm bóng đèn)
+        auto get_slot_brightness = [&](int y_pct_start, int y_pct_end) -> int {
+            int y0 = std::clamp(static_cast<int>(H * y_pct_start / 100.0), 0, H - 1);
+            int y1 = std::clamp(static_cast<int>(H * y_pct_end / 100.0), y0 + 1, H);
+            
+            std::vector<int> vals;
+            vals.reserve((y1 - y0) * (x_end - x_start));
+
+            for (int y = y0; y < y1; ++y) {
+                const cv::Vec3b* ptr = hsv.ptr<cv::Vec3b>(y);
+                for (int x = x_start; x < x_end; ++x) {
+                    vals.push_back(ptr[x][2]); // Giá trị V (độ sáng)
+                }
+            }
+
+            if (vals.empty()) return 0;
+            std::sort(vals.begin(), vals.end(), std::greater<int>());
+
+            // Lấy trung bình của top 20% pixel sáng nhất trong chóa đèn
+            const size_t top_k = std::max<size_t>(1, vals.size() / 5);
+            long sum = 0;
+            for (size_t i = 0; i < top_k; ++i) sum += vals[i];
+            return static_cast<int>(sum / top_k);
+        };
+
+        const int b_top = get_slot_brightness(4, 33);   // Tầng 1: Vỏ ĐỎ
+        const int b_mid = get_slot_brightness(35, 65);  // Tầng 2: Vỏ VÀNG
+        const int b_bot = get_slot_brightness(67, 96);  // Tầng 3: Vỏ XANH
+
+        out_top_b = b_top;
+        out_mid_b = b_mid;
+        out_bot_b = b_bot;
+
+        // Tìm chóa sáng nhất và chóa sáng nhì
+        int b_max = std::max({b_top, b_mid, b_bot});
+        int b_second = 0;
+        if (b_max == b_top)       b_second = std::max(b_mid, b_bot);
+        else if (b_max == b_mid)  b_second = std::max(b_top, b_bot);
+        else                      b_second = std::max(b_top, b_mid);
+
+        const int diff = b_max - b_second;
+        out_diff = diff;
+
+        // Nếu cả 3 vỏ có độ sáng gần như nhau (diff < TL_MIN_CONTRAST_DIFF)
+        // hoặc chóa sáng nhất chưa đạt ngưỡng bật đèn (b_max < TL_MIN_BRIGHTNESS) -> NONE
+        if (diff < TL_MIN_CONTRAST_DIFF || b_max < TL_MIN_BRIGHTNESS) {
+            return "NONE";
+        }
+
+        if (b_max == b_top) return "RED";
+        if (b_max == b_mid) return "YELLOW";
+        return "GREEN";
+    }
+
+    // Người đi bộ (chốt 3 frame không cần area, mất 5 frame mới đi tiếp)
+    static constexpr float PED_CONF           = 0.55f;
+    static constexpr int   PED_CONFIRM_FRAMES = 3;
+    static constexpr int   PED_CLEAR_FRAMES   = 5;
+    bool ped_stop_ = false;
+    int  ped_seen_ = 0, ped_miss_ = 0;
+
+    // Đèn giao thông (tiến lại gần đèn để nhận biển báo kế bên rồi mới dừng)
+    static constexpr float TL_CONF                  = 0.55f;
+    static constexpr int   TL_CONFIRM_FRAMES        = 2;
+    static constexpr int   TL_MIN_BRIGHTNESS        = 95;   // Độ sáng tối thiểu của chóa đèn khi bật
+    static constexpr int   TL_MIN_CONTRAST_DIFF     = 18;   // Chênh lệch tối thiểu giữa chóa sáng nhất và chóa nhì
+    static constexpr int   TL_STOP_AREA_WITH_SIGN   = 950;  // Khi đã chốt được biển kế bên đèn
+    static constexpr int   TL_STOP_HEIGHT_WITH_SIGN = 40;
+    static constexpr int   TL_STOP_AREA_MAX         = 1350; // Khi chưa chốt biển, tiến gần hơn chút nữa mới dừng
+    static constexpr int   TL_STOP_HEIGHT_MAX       = 50;
+    static constexpr int   TL_LOST_RELEASE_FRAMES   = 20;
+    bool tl_stop_ = false;
+    bool tl_approaching_red_ = false;
+    int  tl_red_cnt_ = 0, tl_green_cnt_ = 0, tl_none_cnt_ = 0, tl_miss_ = 0;
+    std::string tl_color_ = "NONE";
+    TrafficLightMetrics tl_metrics_;
+
+    std::string latched_sign_ = "NONE";
+    int latch_cooldown_frames_ = 0;
+    static constexpr int LATCH_DURATION_FRAMES = 50; 
+    static constexpr int SIGN_CONFIRM_FRAMES   = 5;  // Đủ 5 frame mới chốt biển
+    std::string candidate_sign_ = "NONE";
+    int candidate_count_ = 0;
+    int candidate_miss_  = 0;
+    std::string blocked_sign_ = "NONE";
+    int block_frames_ = 0;
+};
