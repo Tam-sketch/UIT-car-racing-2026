@@ -34,7 +34,7 @@
 // ============================================================
 // CONSTANTS
 // ============================================================
-static const std::string ENGINE_PATH      = "/home/car4/Downloads/road/kga2.engine";
+static const std::string ENGINE_PATH      = "/home/car4/Downloads/road/kga3.engine";
 static const std::string SIGN_ENGINE_PATH = "/home/car4/Downloads/sign/huy_sign.engine";
 
 // Speed / control
@@ -75,7 +75,7 @@ namespace tl {
     inline constexpr int RED_H2_LO = 170, RED_H2_HI = 180;
     inline constexpr int YEL_H_LO  = 15,  YEL_H_HI  = 35;
     inline constexpr int GRN_H_LO  = 40,  GRN_H_HI  = 90;
-    inline constexpr int S_MIN     = 160;
+    inline constexpr int S_MIN     = 500;
     inline constexpr int V_MIN     = 230;
     inline constexpr int MIN_LIT_PIXELS = 10;
     inline constexpr float ROI_EXPAND   = 1.05f;
@@ -974,8 +974,7 @@ int main() {
             turn_res = turn_controller.update(
                 left_pts, right_pts, dt_loop, previous_out.valid,
                 lx1, rx1, lx2, rx2, w,
-                signCommit.active,
-                previous_out.near_e, previous_out.mid_e, previous_out.far_e
+                signCommit.active
             );
 
             applied_floor = turn_res.steer_floor_deg;
