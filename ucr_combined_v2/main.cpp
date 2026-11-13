@@ -1,6 +1,7 @@
 // ============================================================
-// main_run.cpp — UCR2026 Full Integrated (Parking & Obstacle from chinh.cpp)
-// + Roundabout logic ported from roundabout.cpp (unconditional T-junction arm)
+// main_run.cpp — UCR2026 Full Integrated
+//  · Roundabout: SIGN_CONFIRM strict-visible from v25.cpp
+//  · Parking: TOF_MIN_VALID + 10ms read from chinh.cpp
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -111,26 +112,29 @@ static constexpr int SIGN_VOTER_TIMEOUT_DS      = 30;
 
 static constexpr double SIGN_BLOCK_SECONDS      = 4.0;
 
-// Roundabout timings (updated from roundabout.cpp)
-static constexpr float  RB_BIAS_PX_RIGHT         = 25.0f;
-static constexpr float  RB_BIAS_PX_LEFT          = 22.0f;
-static constexpr float  RB_BIAS_EMA              = 0.30f;
-static constexpr double RB_MISSING_SIGN_S        = 2.0;
-static constexpr double RB_CIRCLE_TIMEOUT_S      = 8.0;
-static constexpr double RB_EXIT_SEARCH_TIMEOUT_S = 15.0;
-static constexpr double RB_EXIT_FORCE_EXEC_S     = 1.5;
-static constexpr double RB_COOLDOWN_S            = 2.0;
-static constexpr float  RB_SPEED_MIN_CMS         = 20.0f;
-static constexpr float  RB_SPEED_MAX_CMS         = 30.0f;
+// Roundabout timings (from v25.cpp)
+static constexpr float  RB_BIAS_PX_RIGHT           = 25.0f;
+static constexpr float  RB_BIAS_PX_LEFT            = 24.0f;
+static constexpr float  RB_BIAS_EMA                = 0.30f;
+static constexpr double RB_MISSING_SIGN_S          = 1.5;
+static constexpr double RB_CIRCLE_TIMEOUT_S        = 8.0;
+static constexpr double RB_EXIT_SEARCH_TIMEOUT_S   = 15.0;
+static constexpr double RB_EXIT_FORCE_EXEC_S       = 5.0;
+static constexpr double RB_COOLDOWN_S              = 2.0;
+static constexpr double RB_APPROACH_DELAY_S        = 1.25;
+static constexpr double RB_SIGN_CONFIRM_TIMEOUT_S  = 15.0;
+static constexpr float  RB_SPEED_MIN_CMS           = 20.0f;
+static constexpr float  RB_SPEED_MAX_CMS           = 30.0f;
 
 // Roundabout exit turn params
 static constexpr float  RB_EXIT_TURN_FLOOR_DEG   = 26.0f;
 static constexpr float  RB_EXIT_TURN_BIAS_PX     = 30.0f;
 
 // ============================================================
-// PARKING & OBSTACLE CONFIGURATION (From chinh.cpp)
+// PARKING & OBSTACLE CONFIGURATION (from chinh.cpp)
 // ============================================================
-static constexpr float PARK_TOF_BLOCKED_MM          = 350.0f;
+static constexpr float PARK_TOF_MIN_VALID_MM        = 50.0f;   // < 50mm coi là invalid (out-of-range)
+static constexpr float PARK_TOF_BLOCKED_MM          = 350.0f;  // < 350mm coi là bị block
 static constexpr float PARK_APPROACH_SPEED          = 13.0f;
 static constexpr float PARK_REVERSE_SPEED           = -10.0f;
 static constexpr float PARK_MAX_STEER_DEG           = 45.0f;
@@ -354,17 +358,24 @@ private:
 // ROUNDABOUT STATE
 // ============================================================
 enum class RbState {
-    NONE, APPROACH, IN_CIRCLE, EXIT_PREP, EXIT_SEARCH, EXITING
+    NONE,
+    SIGN_CONFIRM,
+    APPROACH,
+    IN_CIRCLE,
+    EXIT_PREP,
+    EXIT_SEARCH,
+    EXITING
 };
 
 static const char* RbStateName(RbState s) {
     switch (s) {
-        case RbState::APPROACH:    return "APPROACH";
-        case RbState::IN_CIRCLE:   return "IN_CIRCLE";
-        case RbState::EXIT_PREP:   return "EXIT_PREP";
-        case RbState::EXIT_SEARCH: return "EXIT_SEARCH";
-        case RbState::EXITING:     return "EXITING";
-        default:                   return "NONE";
+        case RbState::SIGN_CONFIRM: return "SIGN_CONFIRM";
+        case RbState::APPROACH:     return "APPROACH";
+        case RbState::IN_CIRCLE:    return "IN_CIRCLE";
+        case RbState::EXIT_PREP:    return "EXIT_PREP";
+        case RbState::EXIT_SEARCH:  return "EXIT_SEARCH";
+        case RbState::EXITING:      return "EXITING";
+        default:                    return "NONE";
     }
 }
 
@@ -582,13 +593,15 @@ int main() {
     double   rb_cooldown_until     = 0.0;
     int      rb_missing_sign_ticks = 0;
     int      rb_pass_count         = 0;
+    double   rb_sign_confirm_start   = 0.0;
+    double   rb_sign_confirm_entered = 0.0;
 
     double   last_person_seen_time = -1e9;
     double   last_red_seen_time    = -1e9;
     double   sign_block_until_time = -1.0;
     int      active_turn_sign_class = -1;
 
-    // Parking State (From chinh.cpp)
+    // Parking State
     ParkingState park_state = ParkingState::IDLE;
     ParkingCorridor park_corridor;
     int park_free_side = -1;
@@ -620,6 +633,8 @@ int main() {
     std::vector<SignObject> cachedSigns;
 
     std::cout << "\n=== UCR2026: Auto Run (Full Integrated) ===\n";
+    std::cout << "[RB] SIGN_CONFIRM requires rb_visible_now every frame for "
+              << RB_APPROACH_DELAY_S << "s (strict).\n\n";
 
     while (!g_stopSignal) {
         camera.GetFrame(frame);
@@ -709,16 +724,54 @@ int main() {
                 if (rb_committed && elapsed_total >= rb_cooldown_until &&
                     turn_controller.state == v20::LaneTurnController::State::IDLE &&
                     !corner_assist.active()) {
-                    rb_pass_count++;
-                    if (rb_pass_count > 2) rb_pass_count = 2;
-                    rb_state = RbState::APPROACH;
-                    rb_missing_sign_ticks = 0;
-                    rb_bias_smoothed      = 0.0f;
+                    rb_state = RbState::SIGN_CONFIRM;
+                    rb_sign_confirm_start   = elapsed_total;
+                    rb_sign_confirm_entered = elapsed_total;
+                    rb_missing_sign_ticks   = 0;
+                    rb_bias_smoothed        = 0.0f;
                     turn_controller.waiting_for_tjunction   = false;
                     turn_controller.tjunction_cooldown      = 0.0;
                     turn_controller.tjunction_detect_frames = 0;
+                    std::printf("[RB] → SIGN_CONFIRM (need %.1fs continuous rb_visible)\n",
+                                RB_APPROACH_DELAY_S);
                 }
                 break;
+
+            case RbState::SIGN_CONFIRM:
+                // Safety timeout
+                if ((elapsed_total - rb_sign_confirm_entered) >= RB_SIGN_CONFIRM_TIMEOUT_S) {
+                    std::printf("[RB] SIGN_CONFIRM timeout %.1fs → ABORT\n",
+                                RB_SIGN_CONFIRM_TIMEOUT_S);
+                    rb_state = RbState::NONE;
+                    break;
+                }
+                // Voter mất commit
+                if (!rb_committed) {
+                    rb_state = RbState::NONE;
+                    break;
+                }
+                // Strict: miss 1 frame → reset timer
+                if (!rb_visible_now) {
+                    rb_sign_confirm_start = elapsed_total;
+                    break;
+                }
+                // Turn khác đang chạy → pause timer
+                if (turn_controller.state != v20::LaneTurnController::State::IDLE ||
+                    corner_assist.active()) {
+                    rb_sign_confirm_start = elapsed_total;
+                    break;
+                }
+                // Đủ thời gian → APPROACH
+                if ((elapsed_total - rb_sign_confirm_start) >= RB_APPROACH_DELAY_S) {
+                    rb_pass_count++;
+                    if (rb_pass_count > 2) rb_pass_count = 2;
+                    std::printf("[RB] SIGN_CONFIRM OK (%.2fs continuous) → APPROACH pass %d/2\n",
+                                RB_APPROACH_DELAY_S, rb_pass_count);
+                    rb_state = RbState::APPROACH;
+                    rb_missing_sign_ticks = 0;
+                }
+                break;
+
             case RbState::APPROACH:
                 if (rb_missing_sign_ticks * dt_loop >= RB_MISSING_SIGN_S) {
                     rb_state = RbState::IN_CIRCLE;
@@ -775,10 +828,6 @@ int main() {
                     rb_state = RbState::NONE;
                     rb_bias_smoothed = 0.0f;
 
-                    // [roundabout.cpp] Arm T-junction after BOTH rb1 and rb2 exits.
-                    //   rb1 exit → T-junction 1 (LEFT)
-                    //   rb2 exit → T-junction 2 (RIGHT)
-                    // turn_controller will fire it and return to IDLE → PID resumes.
                     turn_controller.waiting_for_tjunction = true;
                     turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
 
@@ -790,7 +839,7 @@ int main() {
             }
         }
 
-        // 3. Sensor reads
+        // 3. Sensor reads — PARKING from chinh.cpp (10ms read + MIN_VALID filter)
         heading_ok = false;
         if (imu_ok) {
             BNO055::Data imu_data;
@@ -804,11 +853,12 @@ int main() {
         tof_right = -1.0f;
         if (tof_ok) {
             sensor::TOFReadings readings;
-            tof.Read(readings, std::chrono::milliseconds(50));
-            if (readings[TOF_IDX_LEFT].valid && readings[TOF_IDX_LEFT].distanceMm > 0)
-                tof_left = static_cast<float>(readings[TOF_IDX_LEFT].distanceMm);
-            if (readings[TOF_IDX_RIGHT].valid && readings[TOF_IDX_RIGHT].distanceMm > 0)
-                tof_right = static_cast<float>(readings[TOF_IDX_RIGHT].distanceMm);
+            if (tof.Read(readings, std::chrono::milliseconds(10))) {
+                if (readings[TOF_IDX_LEFT].valid && readings[TOF_IDX_LEFT].distanceMm >= PARK_TOF_MIN_VALID_MM)
+                    tof_left = static_cast<float>(readings[TOF_IDX_LEFT].distanceMm);
+                if (readings[TOF_IDX_RIGHT].valid && readings[TOF_IDX_RIGHT].distanceMm >= PARK_TOF_MIN_VALID_MM)
+                    tof_right = static_cast<float>(readings[TOF_IDX_RIGHT].distanceMm);
+            }
         }
 
         // 4. Road inference & Core logic
@@ -875,7 +925,6 @@ int main() {
                 if (heading_ok) park_straight_heading = current_heading;
             }
 
-            // Mask out everything outside the corridor
             cv::Mat active_mask = mask;
             cv::Mat park_mask;
             if (parking_active && park_corridor.latched) {
@@ -1243,10 +1292,16 @@ int main() {
         static auto lastLog = std::chrono::steady_clock::now();
         auto tNow = std::chrono::steady_clock::now();
         if (tNow - lastLog >= std::chrono::seconds(1)) {
+            char rb_extra[64] = "";
+            if (rb_state == RbState::SIGN_CONFIRM) {
+                double prog = elapsed_total - rb_sign_confirm_start;
+                std::snprintf(rb_extra, sizeof(rb_extra), " vis=%d %.1f/%.2fs",
+                              rb_visible_now ? 1 : 0, prog, RB_APPROACH_DELAY_S);
+            }
             std::printf(
-                "[t=%ld] sign=%-11s rb=%-11s park=%-11s near=%6.1f hdg=%7.2f tofL=%5.1f tofR=%5.1f "
+                "[t=%ld] sign=%-11s rb=%-11s%s park=%-11s near=%6.1f hdg=%7.2f tofL=%5.1f tofR=%5.1f "
                 "spd=%.1f pid=%.1f srv=%d telem=%d(%s)\n",
-                tickIdx, SignName(voter.GetCommitted()), RbStateName(rb_state),
+                tickIdx, SignName(voter.GetCommitted()), RbStateName(rb_state), rb_extra,
                 ParkingStateStr(park_state), out.near_e, current_heading, tof_left, tof_right,
                 applied_speed, out.angle, final_angle, telem_ready ? telem.CurrentState() : -1,
                 telem_ready ? telemetry::VehicleStateName(telem.CurrentState()) : "OFF");
@@ -1289,6 +1344,18 @@ int main() {
                 for (size_t i = 0; i + 1 < ui_right_pts.size(); ++i)
                     cv::line(overlay, ui_right_pts[i], ui_right_pts[i + 1], cv::Scalar(255, 0, 0), 2);
 
+                // --- CENTERLINE (vàng) ---
+                if (out.proc_width > 0 && out.proc_height > 0 && !out.centerline_pts.empty()) {
+                    float sx = static_cast<float>(frame.cols) / out.proc_width;
+                    float sy = static_cast<float>(frame.rows) / out.proc_height;
+                    for (size_t i = 0; i < out.centerline_pts.size(); i += 4) {
+                        int cx = static_cast<int>(out.centerline_pts[i].first  * sx);
+                        int cy = static_cast<int>(out.centerline_pts[i].second * sy);
+                        if (cx < 0 || cx >= frame.cols || cy < 0 || cy >= frame.rows) continue;
+                        cv::circle(overlay, cv::Point(cx, cy), 2, cv::Scalar(0, 255, 255), -1);
+                    }
+                }
+
                 if (obstacle_controller.active()) {
                     if (obs_res.y_cut > 0) {
                         cv::line(overlay, cv::Point(0, obs_res.y_cut), cv::Point(frame.cols - 1, obs_res.y_cut),
@@ -1300,6 +1367,27 @@ int main() {
                                     cv::FONT_HERSHEY_SIMPLEX, 0.65, cv::Scalar(0, 165, 255), 2, cv::LINE_AA);
                     }
                 }
+            }
+
+            // --- SIGN BOUNDING BOXES ---
+            for (const auto& s : cachedSigns) {
+                cv::Rect r = s.box & cv::Rect(0, 0, overlay.cols, overlay.rows);
+                if (r.width < 2 || r.height < 2) continue;
+
+                const bool is_committed =
+                    (voter.GetCommitted() >= 0) && (s.class_id == voter.GetCommitted());
+                cv::Scalar color = is_committed ? cv::Scalar(0, 255, 0)   // green
+                                                : cv::Scalar(0, 255, 255); // yellow
+
+                cv::rectangle(overlay, r, color, 2);
+
+                char label[96];
+                std::snprintf(label, sizeof(label), "%s %.2f", s.name.c_str(), s.confidence);
+                int baseline = 0;
+                cv::Size tsz = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+                int ty = (r.y - 6 > tsz.height) ? (r.y - 6) : (r.y + r.height + tsz.height + 4);
+                cv::putText(overlay, label, cv::Point(r.x, ty),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
             }
 
             char t1[200], t2[200], t3[200], t4[200];
