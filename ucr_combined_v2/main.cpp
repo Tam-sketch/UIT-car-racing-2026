@@ -144,9 +144,9 @@ static constexpr double PARK_STOP_DWELL_S           = 0.5;
 
 static constexpr int   PARK_CORRIDOR_EXTRA_MARGIN_PX = 18;
 static constexpr float PARK_CORRIDOR_FAR_RATIO       = 0.68f;
-static constexpr float PARK_STEER_TRIM_DEG           = +2.5f;
-static constexpr float PARK_HEADING_KP               = 0.90f;
-static constexpr float PARK_HEADING_MAX_CORR_DEG     = 8.0f;
+static constexpr float PARK_STEER_TRIM_DEG           = 0.0f;
+static constexpr float PARK_HEADING_KP               = 0.0f;
+static constexpr float PARK_HEADING_MAX_CORR_DEG     = 0.0f;
 
 enum class ParkingState {
     IDLE = 0,
@@ -178,12 +178,12 @@ static const char* ParkingStateStr(ParkingState s) {
 struct ParkingCorridor {
     bool latched = false;
     int y_bot = 299;
-    int y_far = 135;
+    int y_far = 0;
 
-    int x_left_bot = 40;
-    int x_left_far = 85;
-    int x_right_bot = 440;
-    int x_right_far = 395;
+    int x_left_bot = 55;
+    int x_left_far = 115;
+    int x_right_bot = 425;
+    int x_right_far = 365;
 
     int get_left_x(int y) const {
         if (y_bot == y_far) return x_left_bot;
@@ -965,7 +965,7 @@ int main() {
                 park_corridor.x_left_far  = std::clamp(center_bot - half_w_far, 10, w / 2 - 15);
                 park_corridor.x_right_far = std::clamp(center_bot + half_w_far, w / 2 + 15, w - 11);
                 park_corridor.y_bot       = y_bottom;
-                park_corridor.y_far       = y1;
+                park_corridor.y_far       = 0;
                 park_corridor.latched     = true;
                 if (heading_ok) park_straight_heading = current_heading;
             }
@@ -1256,10 +1256,10 @@ int main() {
                     out.angle = 0.0f;
                 } else if (park_state == ParkingState::REVERSE_1) {
                     speed = PARK_REVERSE_SPEED;
-                    out.angle = (park_free_side < 0) ? PARK_MAX_STEER_DEG : -PARK_MAX_STEER_DEG;
+                    out.angle = (park_free_side < 0) ? -PARK_MAX_STEER_DEG : PARK_MAX_STEER_DEG;
                 } else if (park_state == ParkingState::REVERSE_2) {
                     speed = PARK_REVERSE_SPEED;
-                    out.angle = (park_free_side < 0) ? -PARK_MAX_STEER_DEG : PARK_MAX_STEER_DEG;
+                    out.angle = (park_free_side < 0) ? PARK_MAX_STEER_DEG : -PARK_MAX_STEER_DEG;
                 } else {
                     speed = PARK_APPROACH_SPEED;
                     float heading_corr = 0.0f;
