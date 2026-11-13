@@ -364,7 +364,8 @@ enum class RbState {
     IN_CIRCLE,
     EXIT_PREP,
     EXIT_SEARCH,
-    EXITING
+    EXITING,
+    LEFT_CURVE
 };
 
 static const char* RbStateName(RbState s) {
@@ -375,6 +376,7 @@ static const char* RbStateName(RbState s) {
         case RbState::EXIT_PREP:    return "EXIT_PREP";
         case RbState::EXIT_SEARCH:  return "EXIT_SEARCH";
         case RbState::EXITING:      return "EXITING";
+        case RbState::LEFT_CURVE:   return "LEFT_CURVE";
         default:                    return "NONE";
     }
 }
@@ -595,6 +597,8 @@ int main() {
     int      rb_pass_count         = 0;
     double   rb_sign_confirm_start   = 0.0;
     double   rb_sign_confirm_entered = 0.0;
+    double   rb_left_curve_start     = 0.0;
+    int      rb_left_curve_straight_frames = 0;
 
     double   last_person_seen_time = -1e9;
     double   last_red_seen_time    = -1e9;
@@ -815,7 +819,7 @@ int main() {
                 }
                 break;
             }
-            case RbState::EXITING: {
+                        case RbState::EXITING: {
                 const bool turn_done = turn_controller.state == v20::LaneTurnController::State::IDLE;
                 const bool safety_timeout = (elapsed_total - rb_exiting_start) >= RB_CIRCLE_TIMEOUT_S;
                 if (turn_done || safety_timeout) {
@@ -825,15 +829,44 @@ int main() {
                     }
                     turn_controller.TURN_STEER_DEG = DEFAULT_TURN_STEER_DEG;
                     turn_controller.TURN_BIAS_PX   = DEFAULT_TURN_BIAS_PX;
-                    rb_state = RbState::NONE;
                     rb_bias_smoothed = 0.0f;
 
-                    turn_controller.waiting_for_tjunction = true;
-                    turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
+                    // If we just finished Pass 2, we have a left curve before the T-junction.
+                    // Do not arm T-junction yet; transition to LEFT_CURVE.
+                    if (rb_pass_count == 2) {
+                        rb_state = RbState::LEFT_CURVE;
+                        rb_left_curve_start = elapsed_total;
+                        rb_left_curve_straight_frames = 0;
+                        turn_controller.waiting_for_tjunction = false;
+                        std::printf("[RB] Pass 2 done -> LEFT_CURVE (waiting for curve to finish)\n");
+                    } else {
+                        rb_state = RbState::NONE;
+                        turn_controller.waiting_for_tjunction = true;
+                        turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
+                        std::printf("[RB] Pass 1 done -> NONE (armed T-junction)\n");
+                    }
 
                     rb_cooldown_until = elapsed_total + RB_COOLDOWN_S;
                     voter.Reset();
                     active_turn_sign_class = -1;
+                }
+                break;
+            }
+            case RbState::LEFT_CURVE: {
+                // Use the previous frame's lane errors to determine if the car has straightened out
+                if (previous_out.valid && std::abs(previous_out.near_e) <= 6.0 && std::abs(previous_out.mid_e) <= 12.0) {
+                    rb_left_curve_straight_frames++;
+                } else {
+                    rb_left_curve_straight_frames = 0;
+                }
+
+                // Transition after 5 straight frames, or safety timeout of 6.0s
+                if (rb_left_curve_straight_frames >= 5 || (elapsed_total - rb_left_curve_start) >= 6.0) {
+                    rb_state = RbState::NONE;
+                    turn_controller.waiting_for_tjunction = true;
+                    turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
+                    std::printf("[RB] LEFT_CURVE done (straight=%d, t=%.1fs) -> armed T-junction #2\n",
+                                rb_left_curve_straight_frames, elapsed_total - rb_left_curve_start);
                 }
                 break;
             }
