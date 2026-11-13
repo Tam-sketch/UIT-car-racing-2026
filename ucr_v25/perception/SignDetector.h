@@ -1,214 +1,238 @@
 // ============================================================
-// perception/SignDetector.h
-//
-// YOLOv8/v5-style detection head.
-//   Input : (1, 3, 416, 416)  NCHW  RGB /255
-//   Output: (1, 4+8, 3549)    pixel coords, sigmoid'd class scores
-//   NMS   : class-agnostic, done here (engine has no NMS baked in)
-//
-// Class indices (8):
-//   0 construction_ahead, 1 no_left, 2 no_right, 3 parking,
-//   4 roundabout, 5 traffic_light, 6 turn_left, 7 turn_right
-//
-// Preprocessing is letterboxed (preserves aspect, zero-pads to square).
-// Coordinates are unletterboxed back to the original image frame.
+// SignDetector.h — TensorRT Traffic Sign Detector (YOLOv8 Engine)
+// 9-class engine: construction_ahead ... walking_person (idx 8)
 // ============================================================
 #pragma once
 
-#include "perception/TrtSession.h"
+#include <opencv2/opencv.hpp>
+#include <opencv2/dnn.hpp>
+#include <NvInfer.h>
+#include <cuda_runtime_api.h>
 
-#include <opencv2/core.hpp>
-#include <opencv2/imgproc.hpp>
-
-#include <algorithm>
-#include <cmath>
 #include <iostream>
-#include <numeric>
-#include <string>
+#include <fstream>
 #include <vector>
+#include <string>
+#include <cstring>
+#include <algorithm>
+#include <memory>
 
-namespace ucr {
-namespace perception {
+struct SignObject {
+    int class_id = -1;
+    std::string name;
+    float confidence = 0.0f;
+    cv::Rect box;
+};
 
 class SignDetector {
 public:
-    struct Detection {
-        cv::Rect2f bbox;       // in original-frame pixel coords
-        int        class_id;
-        float      confidence;
+    // NOTE: must match the class count baked into the .engine.
+    // The current engine (signv4.engine) is 9-class with walking_person at 8.
+    inline static const std::vector<std::string> CLASS_NAMES = {
+        "construction_ahead", "no_left", "no_right", "parking",
+        "roundabout", "traffic_light", "turn_left", "turn_right",
+        "walking_person"
     };
 
-    struct Config {
-        float conf_thresh = 0.5f;
-        float iou_thresh  = 0.45f;
-        int   input_size  = 416;
-        // If true (YOLO standard), coords are in input-pixel units; else normalized 0-1.
-        bool  coords_in_pixels = true;
-    };
+    SignDetector() = default;
 
-    bool Init(const std::string& enginePath) { return Init(enginePath, Config{}); }
-
-    bool Init(const std::string& enginePath, const Config& cfg) {
-        cfg_ = cfg;
-        if (!session_.Init(enginePath)) return false;
-
-        if (session_.NumInputs() < 1 || session_.NumOutputs() < 1) {
-            std::cerr << "[SignDetector] engine has no I/O\n";
-            return false;
-        }
-        const auto& inB  = session_.InputBinding(0);
-        const auto& outB = session_.OutputBinding(0);
-
-        if (inB.dims.nbDims != 4 || inB.dims.d[1] != 3) {
-            std::cerr << "[SignDetector] expected NCHW input with 3 ch\n";
-            return false;
-        }
-        if (outB.dims.nbDims != 3) {
-            std::cerr << "[SignDetector] expected 3D output [1,C,N]\n";
-            return false;
-        }
-        inH_  = inB.dims.d[2];
-        inW_  = inB.dims.d[3];
-        outC_ = outB.dims.d[1];   // 12 expected
-        outN_ = outB.dims.d[2];   // 3549 expected
-
-        if (inH_ != cfg_.input_size || inW_ != cfg_.input_size) {
-            std::cerr << "[SignDetector] engine input " << inW_ << "x" << inH_
-                      << " != requested " << cfg_.input_size << "\n";
-            return false;
-        }
-        if (outC_ < 5 || outC_ > 32) {
-            std::cerr << "[SignDetector] unexpected output C=" << outC_ << "\n";
-            return false;
-        }
-        num_classes_ = outC_ - 4;
-
-        inBuf_.resize(static_cast<size_t>(3) * inW_ * inH_);
-        outBuf_.resize(static_cast<size_t>(outC_) * outN_);
-
-        std::cout << "[SignDetector] in " << inW_ << "x" << inH_
-                  << " out (" << outC_ << "," << outN_ << ") classes="
-                  << num_classes_ << "\n";
-        return true;
+    ~SignDetector() {
+        Cleanup();
     }
 
-    bool IsReady() const { return session_.IsReady(); }
-    int  NumClasses() const { return num_classes_; }
+    bool Init(const std::string& enginePath) {
+        try {
+            std::cout << "[SignDetector] Loading Engine: " << enginePath << "\n";
+            std::ifstream file(enginePath, std::ios::binary);
+            if (!file) {
+                std::cerr << "[SignDetector] Cannot open engine file: " << enginePath << "\n";
+                return false;
+            }
 
-    // Populates `out`. Clears `out` on entry. Returns false on inference error.
-    bool Detect(const cv::Mat& bgr, std::vector<Detection>& out) {
-        out.clear();
-        if (!IsReady() || bgr.empty()) return false;
+            file.seekg(0, std::ios::end);
+            size_t size = file.tellg();
+            file.seekg(0, std::ios::beg);
+            std::vector<char> buffer(size);
+            file.read(buffer.data(), size);
 
-        // --- Letterbox to square ---
-        const int W = bgr.cols, H = bgr.rows;
-        const float scale = std::min((float)inW_ / W, (float)inH_ / H);
-        const int   newW  = (int)std::lround(W * scale);
-        const int   newH  = (int)std::lround(H * scale);
-        const int   padX  = (inW_ - newW) / 2;
-        const int   padY  = (inH_ - newH) / 2;
+            runtime_ = nvinfer1::createInferRuntime(logger_);
+            if (!runtime_) return false;
 
-        cv::Mat canvas(inH_, inW_, CV_8UC3, cv::Scalar(0, 0, 0));
-        cv::Mat resized;
-        cv::resize(bgr, resized, cv::Size(newW, newH), 0, 0, cv::INTER_LINEAR);
-        resized.copyTo(canvas(cv::Rect(padX, padY, newW, newH)));
+            engine_ = runtime_->deserializeCudaEngine(buffer.data(), buffer.size());
+            if (!engine_) return false;
 
-        // BGR→RGB, /255, NCHW
-        cv::Mat rgb;
-        cv::cvtColor(canvas, rgb, cv::COLOR_BGR2RGB);
-        cv::Mat f;
-        rgb.convertTo(f, CV_32FC3, 1.0 / 255.0);
+            context_ = engine_->createExecutionContext();
+            if (!context_) return false;
 
-        const size_t plane = static_cast<size_t>(inW_) * inH_;
-        const float* src   = f.ptr<float>();
-        for (size_t i = 0; i < plane; ++i) {
-            inBuf_[i]             = src[i * 3 + 0];
-            inBuf_[i + plane]     = src[i * 3 + 1];
-            inBuf_[i + 2 * plane] = src[i * 3 + 2];
+            int nbBindings = engine_->getNbBindings();
+            buffers_.assign(nbBindings, nullptr);
+
+            for (int i = 0; i < nbBindings; ++i) {
+                nvinfer1::Dims dims = engine_->getBindingDimensions(i);
+                size_t total_elements = 1;
+                for (int j = 0; j < dims.nbDims; ++j) {
+                    total_elements *= dims.d[j];
+                }
+
+                cudaMalloc(&buffers_[i], total_elements * sizeof(float));
+
+                if (engine_->bindingIsInput(i)) {
+                    inputIndex_ = i;
+                    inputHeight_ = dims.d[2];
+                    inputWidth_  = dims.d[3];
+                    inputData_.resize(total_elements);
+                } else {
+                    outputIndex_ = i;
+                    outputData_.resize(total_elements);
+                }
+            }
+
+            cudaStreamCreate(&stream_);
+
+            // Sanity check: engine class count vs CLASS_NAMES
+            const int engine_classes = static_cast<int>(
+                outputData_.size() / std::max(1, static_cast<int>(engine_->getBindingDimensions(outputIndex_).d[2]))
+            ) - 4;
+            std::cout << "[SignDetector] Engine Ready! Input size: "
+                      << inputWidth_ << "x" << inputHeight_
+                      << " | engine classes=" << engine_classes
+                      << " | CLASS_NAMES=" << CLASS_NAMES.size()
+                      << (engine_classes == (int)CLASS_NAMES.size() ? " [OK]" : " [MISMATCH]")
+                      << "\n";
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "[SignDetector Error] " << e.what() << "\n";
+            Cleanup();
+            return false;
+        }
+    }
+
+    std::vector<SignObject> Detect(const cv::Mat& frame, float confThresh = 0.70f, float nmsThresh = 0.45f) {
+        std::vector<SignObject> results;
+        if (frame.empty() || !context_ || !stream_) return results;
+
+        // 1. Preprocess
+        cv::Mat blob;
+        cv::dnn::blobFromImage(frame, blob, 1.0 / 255.0,
+                               cv::Size(inputWidth_, inputHeight_),
+                               cv::Scalar(), true, false);
+        std::memcpy(inputData_.data(), blob.ptr<float>(), inputData_.size() * sizeof(float));
+
+        // 2. Inference
+        cudaMemcpyAsync(buffers_[inputIndex_], inputData_.data(),
+                        inputData_.size() * sizeof(float), cudaMemcpyHostToDevice, stream_);
+        context_->enqueueV2(buffers_.data(), stream_, nullptr);
+        cudaMemcpyAsync(outputData_.data(), buffers_[outputIndex_],
+                        outputData_.size() * sizeof(float), cudaMemcpyDeviceToHost, stream_);
+        cudaStreamSynchronize(stream_);
+
+        // 3. Postprocess: [1, 4 + num_classes, num_boxes]
+        int num_classes = static_cast<int>(CLASS_NAMES.size());   // 9
+        int num_boxes   = static_cast<int>(outputData_.size()) / (4 + num_classes); // 3549
+
+        std::vector<cv::Rect> boxes;
+        std::vector<float> confidences;
+        std::vector<int> class_ids;
+
+        float x_scale = static_cast<float>(frame.cols) / inputWidth_;
+        float y_scale = static_cast<float>(frame.rows) / inputHeight_;
+
+        for (int i = 0; i < num_boxes; ++i) {
+            float max_score = 0.0f;
+            int best_cls = -1;
+
+            for (int c = 0; c < num_classes; ++c) {
+                float score = outputData_[(4 + c) * num_boxes + i];
+                if (score > max_score) {
+                    max_score = score;
+                    best_cls = c;
+                }
+            }
+
+            if (max_score >= confThresh && best_cls != -1) {
+                float cx = outputData_[0 * num_boxes + i];
+                float cy = outputData_[1 * num_boxes + i];
+                float w  = outputData_[2 * num_boxes + i];
+                float h  = outputData_[3 * num_boxes + i];
+
+                int left = static_cast<int>((cx - w / 2.0f) * x_scale);
+                int top  = static_cast<int>((cy - h / 2.0f) * y_scale);
+                int bw   = static_cast<int>(w * x_scale);
+                int bh   = static_cast<int>(h * y_scale);
+
+                left = std::clamp(left, 0, frame.cols - 1);
+                top  = std::clamp(top, 0, frame.rows - 1);
+                bw   = std::clamp(bw, 1, frame.cols - left);
+                bh   = std::clamp(bh, 1, frame.rows - top);
+
+                boxes.push_back(cv::Rect(left, top, bw, bh));
+                confidences.push_back(max_score);
+                class_ids.push_back(best_cls);
+            }
         }
 
-        if (!session_.Run(inBuf_, outBuf_)) return false;
+        // 4. NMS
+        std::vector<int> indices;
+        cv::dnn::NMSBoxes(boxes, confidences, confThresh, nmsThresh, indices);
 
-        // --- Parse raw detections ---
-        std::vector<Detection> raw;
-        raw.reserve(64);
-        const float* d = outBuf_.data();
-
-        for (int i = 0; i < outN_; ++i) {
-            // Bbox: outBuf_[c*outN_ + i] for c in {0,1,2,3}
-            float cx = d[0 * outN_ + i];
-            float cy = d[1 * outN_ + i];
-            float bw = d[2 * outN_ + i];
-            float bh = d[3 * outN_ + i];
-            if (!cfg_.coords_in_pixels) {
-                cx *= inW_; cy *= inH_; bw *= inW_; bh *= inH_;
-            }
-            // Class scores
-            int bestCls = -1;
-            float bestSc = 0.f;
-            for (int c = 0; c < num_classes_; ++c) {
-                const float s = d[(4 + c) * outN_ + i];
-                if (s > bestSc) { bestSc = s; bestCls = c; }
-            }
-            if (bestSc < cfg_.conf_thresh) continue;
-
-            // Unletterbox
-            float x1 = (cx - bw * 0.5f - padX) / scale;
-            float y1 = (cy - bh * 0.5f - padY) / scale;
-            float x2 = (cx + bw * 0.5f - padX) / scale;
-            float y2 = (cy + bh * 0.5f - padY) / scale;
-            x1 = std::clamp(x1, 0.0f, (float)W);
-            y1 = std::clamp(y1, 0.0f, (float)H);
-            x2 = std::clamp(x2, 0.0f, (float)W);
-            y2 = std::clamp(y2, 0.0f, (float)H);
-            if (x2 <= x1 || y2 <= y1) continue;
-
-            raw.push_back({ cv::Rect2f(x1, y1, x2 - x1, y2 - y1), bestCls, bestSc });
+        for (int idx : indices) {
+            SignObject obj;
+            obj.class_id = class_ids[idx];
+            obj.name = CLASS_NAMES[class_ids[idx]];
+            obj.confidence = confidences[idx];
+            obj.box = boxes[idx];
+            results.push_back(obj);
         }
 
-        // --- Class-agnostic NMS ---
-        NMS(raw, cfg_.iou_thresh, out);
-        return true;
+        return results;
+    }
+
+    void Draw(cv::Mat& frame, const std::vector<SignObject>& signs) {
+        for (const auto& s : signs) {
+            cv::rectangle(frame, s.box, cv::Scalar(0, 255, 0), 2);
+            std::string text = s.name + " " + std::to_string(s.confidence).substr(0, 4);
+            int baseline = 0;
+            cv::Size sz = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+            int y_text = std::max(s.box.y, sz.height + 5);
+            cv::rectangle(frame, cv::Point(s.box.x, y_text - sz.height - 5),
+                          cv::Point(s.box.x + sz.width, y_text), cv::Scalar(0, 255, 0), cv::FILLED);
+            cv::putText(frame, text, cv::Point(s.box.x, y_text - 3),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 0, 0), 1);
+        }
     }
 
 private:
-    static float IoU(const cv::Rect2f& a, const cv::Rect2f& b) {
-        const float x1 = std::max(a.x, b.x);
-        const float y1 = std::max(a.y, b.y);
-        const float x2 = std::min(a.x + a.width,  b.x + b.width);
-        const float y2 = std::min(a.y + a.height, b.y + b.height);
-        const float inter = std::max(0.0f, x2 - x1) * std::max(0.0f, y2 - y1);
-        const float uni = a.width * a.height + b.width * b.height - inter;
-        return (uni > 0.f) ? inter / uni : 0.f;
+    void Cleanup() {
+        if (stream_) {
+            cudaStreamSynchronize(stream_);
+            cudaStreamDestroy(stream_);
+            stream_ = nullptr;
+        }
+        for (void*& b : buffers_) {
+            if (b) { cudaFree(b); b = nullptr; }
+        }
+        buffers_.clear();
+        if (context_) { delete context_; context_ = nullptr; }
+        if (engine_)  { delete engine_; engine_ = nullptr; }
+        if (runtime_) { delete runtime_; runtime_ = nullptr; }
     }
 
-    static void NMS(std::vector<Detection>& dets, float iouThr,
-                    std::vector<Detection>& keep) {
-        if (dets.empty()) return;
-        std::vector<int> ord(dets.size());
-        std::iota(ord.begin(), ord.end(), 0);
-        std::sort(ord.begin(), ord.end(), [&](int a, int b) {
-            return dets[a].confidence > dets[b].confidence;
-        });
-        std::vector<char> gone(dets.size(), 0);
-        for (size_t i = 0; i < ord.size(); ++i) {
-            const int a = ord[i];
-            if (gone[a]) continue;
-            keep.push_back(dets[a]);
-            for (size_t j = i + 1; j < ord.size(); ++j) {
-                const int b = ord[j];
-                if (gone[b]) continue;
-                if (IoU(dets[a].bbox, dets[b].bbox) > iouThr) gone[b] = 1;
+    class Logger : public nvinfer1::ILogger {
+    public:
+        void log(Severity severity, const char* msg) noexcept override {
+            if (severity <= Severity::kWARNING) {
+                std::cerr << "[TRT-Sign] " << msg << "\n";
             }
         }
-    }
+    } logger_;
 
-    TrtSession         session_;
-    Config             cfg_;
-    int                inW_ = 0, inH_ = 0;
-    int                outC_ = 0, outN_ = 0, num_classes_ = 0;
-    std::vector<float> inBuf_, outBuf_;
+    nvinfer1::IRuntime* runtime_ = nullptr;
+    nvinfer1::ICudaEngine* engine_ = nullptr;
+    nvinfer1::IExecutionContext* context_ = nullptr;
+    cudaStream_t stream_ = nullptr;
+
+    std::vector<void*> buffers_;
+    std::vector<float> inputData_, outputData_;
+    int inputIndex_ = -1, outputIndex_ = -1;
+    int inputWidth_ = 0, inputHeight_ = 0;
 };
-
-}  // namespace perception
-}  // namespace ucr
