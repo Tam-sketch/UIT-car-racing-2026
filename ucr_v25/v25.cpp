@@ -1,9 +1,8 @@
 // ============================================================
-// main_run.cpp — UCR2026 Full Integrated (Parking & Obstacle from chinh.cpp)
-// + Roundabout logic ported from roundabout.cpp (unconditional T-junction arm)
-// + RB_APPROACH_DELAY_S timer state (SIGN_CONFIRM)
-// + SIGN_CONFIRM: yêu cầu THẤY BIỂN roundabout LIÊN TỤC 2s (rb_visible_now mỗi frame)
-// + UI: centerline dots + sign bounding boxes
+// main_run.cpp — UCR2026 Full Integrated
+//  · Roundabout: SIGN_CONFIRM strict-visible + LEFT_CURVE
+//  · Parking: TOF_TRICK + NUDGE_1/2 + Debounce Latch Corridor
+//  · FIX: Parking KHÔNG được kích hoạt trong bất kỳ state nào của Roundabout
 // ============================================================
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
@@ -115,16 +114,16 @@ static constexpr int SIGN_VOTER_TIMEOUT_DS      = 30;
 static constexpr double SIGN_BLOCK_SECONDS      = 4.0;
 
 // Roundabout timings
-static constexpr float  RB_BIAS_PX_RIGHT           = 25.0f;
-static constexpr float  RB_BIAS_PX_LEFT            = 24.0f;
+static constexpr float  RB_BIAS_PX_RIGHT           = 23.0f;
+static constexpr float  RB_BIAS_PX_LEFT            = 30.0f;
 static constexpr float  RB_BIAS_EMA                = 0.30f;
-static constexpr double RB_MISSING_SIGN_S          = 1.5;
-static constexpr double RB_CIRCLE_TIMEOUT_S        = 8.0;
+static constexpr double RB_MISSING_SIGN_S          = 1.0;
+static constexpr double RB_CIRCLE_TIMEOUT_S        = 5.0;
 static constexpr double RB_EXIT_SEARCH_TIMEOUT_S   = 15.0;
-static constexpr double RB_EXIT_FORCE_EXEC_S       = 5.0;  // deepseek bip vai lon
+static constexpr double RB_EXIT_FORCE_EXEC_S       = 5.0;
 static constexpr double RB_COOLDOWN_S              = 2.0;
-static constexpr double RB_APPROACH_DELAY_S        = 1.25;   // Phải THẤY biển liên tục 2s
-static constexpr double RB_SIGN_CONFIRM_TIMEOUT_S  = 15.0;  // Safety: stuck quá 15s ở SIGN_CONFIRM → abort
+static constexpr double RB_APPROACH_DELAY_S        = 1.0;
+static constexpr double RB_SIGN_CONFIRM_TIMEOUT_S  = 15.0;
 static constexpr float  RB_SPEED_MIN_CMS           = 20.0f;
 static constexpr float  RB_SPEED_MAX_CMS           = 30.0f;
 
@@ -133,21 +132,30 @@ static constexpr float  RB_EXIT_TURN_FLOOR_DEG   = 26.0f;
 static constexpr float  RB_EXIT_TURN_BIAS_PX     = 30.0f;
 
 // ============================================================
-// PARKING & OBSTACLE CONFIGURATION (From chinh.cpp)
+// PARKING & OBSTACLE CONFIGURATION (NEW from chinh.cpp)
 // ============================================================
-static constexpr float PARK_TOF_BLOCKED_MM          = 350.0f;
+static constexpr float PARK_TOF_MIN_VALID_MM        = 50.0f;   
+static constexpr float PARK_TOF_BLOCKED_MM          = 250.0f;  
 static constexpr float PARK_APPROACH_SPEED          = 13.0f;
-static constexpr float PARK_REVERSE_SPEED           = -10.0f;
+static constexpr float PARK_REVERSE_SPEED           = -13.0f;
 static constexpr float PARK_MAX_STEER_DEG           = 45.0f;
-static constexpr float PARK_TARGET_DELTA_DEG        = 50.0f;
+static constexpr float PARK_TARGET_DELTA_DEG        = 48.0f;
 static constexpr float PARK_ALIGN_TOL_DEG           = 3.0f;
 static constexpr double PARK_STOP_DWELL_S           = 0.5;
 
-static constexpr int   PARK_CORRIDOR_EXTRA_MARGIN_PX = 18;
-static constexpr float PARK_CORRIDOR_FAR_RATIO       = 0.68f;
-static constexpr float PARK_STEER_TRIM_DEG           = +2.5f;
-static constexpr float PARK_HEADING_KP               = 0.90f;
-static constexpr float PARK_HEADING_MAX_CORR_DEG     = 8.0f;
+// Nudge forward & align parameters (nhích lên nhẹ và bẻ lái căn gọn vào vị trí đỗ sau REVERSE_2)
+static constexpr float  PARK_NUDGE_SPEED            = 12.0f;   
+static constexpr float  PARK_NUDGE_STEER_DEG        = 3.5f;    
+static constexpr double PARK_NUDGE_TIME_S           = 0.70;    
+
+static constexpr float PARK_SIGN_MIN_BOX_H          = 38.0f;   
+static constexpr int   PARK_SIGN_CONFIRM_FRAMES     = 3;       
+static constexpr double PARK_LATCH_TIMEOUT_S        = 3.0;     
+static constexpr int   PARK_CORRIDOR_EXTRA_MARGIN_PX = 25;     
+static constexpr float PARK_CORRIDOR_FAR_RATIO       = 0.58f;
+static constexpr float PARK_STEER_TRIM_DEG           = 0.0f;    
+static constexpr float PARK_HEADING_KP               = 0.0f;    
+static constexpr float PARK_HEADING_MAX_CORR_DEG     = 0.0f;
 
 enum class ParkingState {
     IDLE = 0,
@@ -158,6 +166,8 @@ enum class ParkingState {
     WAIT_FULL_STOP,
     REVERSE_1,
     REVERSE_2,
+    NUDGE_1,
+    NUDGE_2,
     DONE
 };
 
@@ -171,6 +181,8 @@ static const char* ParkingStateStr(ParkingState s) {
         case ParkingState::WAIT_FULL_STOP:     return "WAIT_STOP";
         case ParkingState::REVERSE_1:          return "REVERSE_1_TURN45";
         case ParkingState::REVERSE_2:          return "REVERSE_2_ALIGN";
+        case ParkingState::NUDGE_1:            return "NUDGE_1_RIGHT";
+        case ParkingState::NUDGE_2:            return "NUDGE_2_LEFT";
         case ParkingState::DONE:               return "DONE";
         default:                               return "UNKNOWN";
     }
@@ -179,7 +191,7 @@ static const char* ParkingStateStr(ParkingState s) {
 struct ParkingCorridor {
     bool latched = false;
     int y_bot = 299;
-    int y_far = 135;
+    int y_far = 0; 
 
     int x_left_bot = 40;
     int x_left_far = 85;
@@ -360,12 +372,13 @@ private:
 // ============================================================
 enum class RbState {
     NONE,
-    SIGN_CONFIRM,   // chờ xác nhận biển (phải THẤY liên tục 2s) trước khi áp bias phải
+    SIGN_CONFIRM,
     APPROACH,
     IN_CIRCLE,
     EXIT_PREP,
     EXIT_SEARCH,
-    EXITING
+    EXITING,
+    LEFT_CURVE
 };
 
 static const char* RbStateName(RbState s) {
@@ -376,6 +389,7 @@ static const char* RbStateName(RbState s) {
         case RbState::EXIT_PREP:    return "EXIT_PREP";
         case RbState::EXIT_SEARCH:  return "EXIT_SEARCH";
         case RbState::EXITING:      return "EXITING";
+        case RbState::LEFT_CURVE:   return "LEFT_CURVE";
         default:                    return "NONE";
     }
 }
@@ -594,15 +608,17 @@ int main() {
     double   rb_cooldown_until     = 0.0;
     int      rb_missing_sign_ticks = 0;
     int      rb_pass_count         = 0;
-    double   rb_sign_confirm_start   = 0.0;   // Timer đếm 2s liên tục thấy biển
-    double   rb_sign_confirm_entered = 0.0;   // Mốc vào SIGN_CONFIRM (safety timeout)
+    double   rb_sign_confirm_start   = 0.0;
+    double   rb_sign_confirm_entered = 0.0;
+    double   rb_left_curve_start     = 0.0;
+    int      rb_left_curve_straight_frames = 0;
 
     double   last_person_seen_time = -1e9;
     double   last_red_seen_time    = -1e9;
     double   sign_block_until_time = -1.0;
     int      active_turn_sign_class = -1;
 
-    // Parking State (From chinh.cpp)
+    // Parking State
     ParkingState park_state = ParkingState::IDLE;
     ParkingCorridor park_corridor;
     int park_free_side = -1;
@@ -610,6 +626,9 @@ int main() {
     float park_straight_heading = 0.0f;
     double park_dwell_time = 0.0;
     double park_reverse_elapsed = 0.0;
+    double park_nudge_elapsed = 0.0;
+    double park_approach_start_time = 0.0;
+    int park_near_confirm_cnt = 0;
     int slot1_confirm_cnt = 0;
     int slot2_confirm_cnt = 0;
     int slot3_confirm_cnt = 0;
@@ -703,13 +722,18 @@ int main() {
             voter.Update(classIds, ds);
         }
 
-        // 2. RbState progression
+        // 2. RbState & Parking progression checks
         bool rb_visible_now = false;
+        float park_sign_h_now = 0.0f;
         for (const auto& d : cachedSigns) {
-            if ((d.name == "roundabout" || d.class_id == sign_class::ROUNDABOUT) &&
-                d.confidence >= SIGN_CONF_THRESH) {
+            if (d.confidence < SIGN_CONF_THRESH) continue;
+            if (d.name == "roundabout" || d.class_id == sign_class::ROUNDABOUT) {
                 rb_visible_now = true;
-                break;
+            }
+            if (d.name == "parking" || d.class_id == sign_class::PARKING) {
+                if (static_cast<float>(d.box.height) > park_sign_h_now) {
+                    park_sign_h_now = static_cast<float>(d.box.height);
+                }
             }
         }
 
@@ -722,10 +746,10 @@ int main() {
 
         switch (rb_state) {
             case RbState::NONE:
-                if (rb_committed && elapsed_total >= rb_cooldown_until &&
+                if (rb_pass_count < 2 &&
+                    rb_committed && elapsed_total >= rb_cooldown_until &&
                     turn_controller.state == v20::LaneTurnController::State::IDLE &&
                     !corner_assist.active()) {
-                    // Voter commit → vào SIGN_CONFIRM, CHƯA áp bias
                     rb_state = RbState::SIGN_CONFIRM;
                     rb_sign_confirm_start   = elapsed_total;
                     rb_sign_confirm_entered = elapsed_total;
@@ -740,34 +764,33 @@ int main() {
                 break;
 
             case RbState::SIGN_CONFIRM:
-                // [1] Safety: stuck quá lâu → abort (tránh kẹt nếu biển flicker mãi)
+                if (rb_pass_count >= 2) {
+                    rb_state = RbState::NONE;
+                    break;
+                }
                 if ((elapsed_total - rb_sign_confirm_entered) >= RB_SIGN_CONFIRM_TIMEOUT_S) {
                     std::printf("[RB] SIGN_CONFIRM timeout %.1fs → ABORT\n",
                                 RB_SIGN_CONFIRM_TIMEOUT_S);
                     rb_state = RbState::NONE;
                     break;
                 }
-                // [2] Voter mất commit hẳn (grace 3s hết) → không còn roundabout
                 if (!rb_committed) {
                     rb_state = RbState::NONE;
                     break;
                 }
-                // [3] BẮT BUỘC THẤY BIỂN MỖI FRAME. Miss 1 frame → reset timer về 0.
                 if (!rb_visible_now) {
                     rb_sign_confirm_start = elapsed_total;
                     break;
                 }
-                // [4] Turn khác đang chạy → tạm dừng đồng hồ (không tính thời gian này)
                 if (turn_controller.state != v20::LaneTurnController::State::IDLE ||
                     corner_assist.active()) {
                     rb_sign_confirm_start = elapsed_total;
                     break;
                 }
-                // [5] Đủ 2s LIÊN TỤC thấy biển → APPROACH
                 if ((elapsed_total - rb_sign_confirm_start) >= RB_APPROACH_DELAY_S) {
                     rb_pass_count++;
                     if (rb_pass_count > 2) rb_pass_count = 2;
-                    std::printf("[RB] SIGN_CONFIRM OK (%.1fs continuous) → APPROACH pass %d/2\n",
+                    std::printf("[RB] SIGN_CONFIRM OK (%.2fs continuous) → APPROACH pass %d/2\n",
                                 RB_APPROACH_DELAY_S, rb_pass_count);
                     rb_state = RbState::APPROACH;
                     rb_missing_sign_ticks = 0;
@@ -827,12 +850,20 @@ int main() {
                     }
                     turn_controller.TURN_STEER_DEG = DEFAULT_TURN_STEER_DEG;
                     turn_controller.TURN_BIAS_PX   = DEFAULT_TURN_BIAS_PX;
-                    rb_state = RbState::NONE;
                     rb_bias_smoothed = 0.0f;
 
-                    // Arm T-junction after BOTH rb1 and rb2 exits.
-                    turn_controller.waiting_for_tjunction = true;
-                    turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
+                    if (rb_pass_count == 2) {
+                        rb_state = RbState::LEFT_CURVE;
+                        rb_left_curve_start = elapsed_total;
+                        rb_left_curve_straight_frames = 0;
+                        turn_controller.waiting_for_tjunction = false;
+                        std::printf("[RB] Pass 2 done -> LEFT_CURVE (waiting for curve to finish)\n");
+                    } else {
+                        rb_state = RbState::NONE;
+                        turn_controller.waiting_for_tjunction = true;
+                        turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
+                        std::printf("[RB] Pass 1 done -> NONE (armed T-junction)\n");
+                    }
 
                     rb_cooldown_until = elapsed_total + RB_COOLDOWN_S;
                     voter.Reset();
@@ -840,9 +871,25 @@ int main() {
                 }
                 break;
             }
+            case RbState::LEFT_CURVE: {
+                if (previous_out.valid && std::abs(previous_out.near_e) <= 6.0 && std::abs(previous_out.mid_e) <= 12.0) {
+                    rb_left_curve_straight_frames++;
+                } else {
+                    rb_left_curve_straight_frames = 0;
+                }
+
+                if (rb_left_curve_straight_frames >= 3 || (elapsed_total - rb_left_curve_start) >= 6.0) {
+                    rb_state = RbState::NONE;
+                    turn_controller.waiting_for_tjunction = true;
+                    turn_controller.tjunction_cooldown = 0.0;
+                    std::printf("[RB] LEFT_CURVE done (straight=%d, t=%.1fs) -> armed T-junction #2 (cooldown=0)\n",
+                                rb_left_curve_straight_frames, elapsed_total - rb_left_curve_start);
+                }
+                break;
+            }
         }
 
-        // 3. Sensor reads
+        // 3. Sensor reads — PARKING from chinh.cpp (10ms read + MIN_VALID filter)
         heading_ok = false;
         if (imu_ok) {
             BNO055::Data imu_data;
@@ -856,11 +903,12 @@ int main() {
         tof_right = -1.0f;
         if (tof_ok) {
             sensor::TOFReadings readings;
-            tof.Read(readings, std::chrono::milliseconds(50));
-            if (readings[TOF_IDX_LEFT].valid && readings[TOF_IDX_LEFT].distanceMm > 0)
-                tof_left = static_cast<float>(readings[TOF_IDX_LEFT].distanceMm);
-            if (readings[TOF_IDX_RIGHT].valid && readings[TOF_IDX_RIGHT].distanceMm > 0)
-                tof_right = static_cast<float>(readings[TOF_IDX_RIGHT].distanceMm);
+            if (tof.Read(readings, std::chrono::milliseconds(10))) {
+                if (readings[TOF_IDX_LEFT].valid && readings[TOF_IDX_LEFT].distanceMm >= PARK_TOF_MIN_VALID_MM)
+                    tof_left = static_cast<float>(readings[TOF_IDX_LEFT].distanceMm);
+                if (readings[TOF_IDX_RIGHT].valid && readings[TOF_IDX_RIGHT].distanceMm >= PARK_TOF_MIN_VALID_MM)
+                    tof_right = static_cast<float>(readings[TOF_IDX_RIGHT].distanceMm);
+            }
         }
 
         // 4. Road inference & Core logic
@@ -883,13 +931,30 @@ int main() {
             int y_bottom = h - 1;
 
             // --- PARKING: INIT & CORRIDOR LATCH ---
-            if (voter.GetCommitted() == sign_class::PARKING && park_state == ParkingState::IDLE) {
+            // FIX: Thêm điều kiện rb_state == RbState::NONE để không kích hoạt parking trong roundabout
+            if (voter.GetCommitted() == sign_class::PARKING && park_state == ParkingState::IDLE && rb_state == RbState::NONE) {
                 park_state = ParkingState::APPROACH;
+                park_approach_start_time = elapsed_total;
+                park_near_confirm_cnt = 0;
                 slot1_confirm_cnt = 0; slot2_confirm_cnt = 0; slot3_confirm_cnt = 0;
                 if (heading_ok) park_straight_heading = current_heading;
+                std::printf("[PARK] Sign detected. Starting APPROACH.\n");
             }
 
+            // Debounce: Phải thấy biển to liên tục đủ PARK_SIGN_CONFIRM_FRAMES frames mới xác nhận
             if (parking_active && !park_corridor.latched) {
+                if (park_sign_h_now >= PARK_SIGN_MIN_BOX_H) {
+                    park_near_confirm_cnt++;
+                } else {
+                    park_near_confirm_cnt = 0;
+                }
+            }
+
+            const bool park_near_sign = (park_near_confirm_cnt >= PARK_SIGN_CONFIRM_FRAMES);
+            const bool park_latch_timed_out = ((elapsed_total - park_approach_start_time) >= PARK_LATCH_TIMEOUT_S);
+            const bool should_latch_corridor = parking_active && !park_corridor.latched && (park_near_sign || park_latch_timed_out);
+
+            if (should_latch_corridor) {
                 auto get_raw_bounds = [&](const cv::Mat& m, int y_row, int& lx, int& rx) {
                     lx = -1; rx = -1;
                     if (m.empty() || y_row < 0 || y_row >= m.rows) return;
@@ -914,20 +979,22 @@ int main() {
                 int crx_bot = (raw_rx_bot > w / 2 + 10 && raw_rx_bot < w - 6) ? raw_rx_bot : (w - 51);
 
                 int center_bot = (clx_bot + crx_bot) / 2;
+                int center_far = (raw_lx1 > 0 && raw_rx1 > raw_lx1) ? (raw_lx1 + raw_rx1) / 2 : (w / 2);
                 int half_w_bot = std::max((crx_bot - clx_bot) / 2 + PARK_CORRIDOR_EXTRA_MARGIN_PX, 185);
                 int half_w_far = static_cast<int>(half_w_bot * PARK_CORRIDOR_FAR_RATIO);
 
                 park_corridor.x_left_bot  = std::clamp(center_bot - half_w_bot, 5, w / 2 - 25);
                 park_corridor.x_right_bot = std::clamp(center_bot + half_w_bot, w / 2 + 25, w - 6);
-                park_corridor.x_left_far  = std::clamp(center_bot - half_w_far, 10, w / 2 - 15);
-                park_corridor.x_right_far = std::clamp(center_bot + half_w_far, w / 2 + 15, w - 11);
+                park_corridor.x_left_far  = std::clamp(center_far - half_w_far, 5, w / 2 - 15);
+                park_corridor.x_right_far = std::clamp(center_far + half_w_far, w / 2 + 15, w - 6);
                 park_corridor.y_bot       = y_bottom;
-                park_corridor.y_far       = y1;
+                park_corridor.y_far       = 0; // Kéo đến hết đỉnh khung hình (y = 0) để near, mid, far đều bị kẹp trong mask
                 park_corridor.latched     = true;
                 if (heading_ok) park_straight_heading = current_heading;
+                std::printf("[PARK] LATCHED CORRIDOR: sign_h=%.1f (min=%.1f) timed_out=%d center_bot=%d center_far=%d\n",
+                            park_sign_h_now, PARK_SIGN_MIN_BOX_H, (int)park_latch_timed_out, center_bot, center_far);
             }
 
-            // Mask out everything outside the corridor
             cv::Mat active_mask = mask;
             cv::Mat park_mask;
             if (parking_active && park_corridor.latched) {
@@ -1070,7 +1137,7 @@ int main() {
                     case RbState::IN_CIRCLE:   rb_bias_px = -RB_BIAS_PX_LEFT;  break;
                     case RbState::EXIT_PREP:   rb_bias_px = +RB_BIAS_PX_RIGHT; break;
                     case RbState::EXIT_SEARCH: rb_bias_px = 0.0f;              break;
-                    default:                   rb_bias_px = 0.0f;              break;   // SIGN_CONFIRM → 0
+                    default:                   rb_bias_px = 0.0f;              break;
                 }
                 rb_bias_smoothed = (1.0f - RB_BIAS_EMA) * rb_bias_smoothed + RB_BIAS_EMA * rb_bias_px;
             } else {
@@ -1107,21 +1174,37 @@ int main() {
             }
             applied_floor = effective_floor;
 
-            // --- PARKING STATE MACHINE UPDATE ---
-            const bool is_left_blocked  = (tof_left > 0.0f && tof_left < PARK_TOF_BLOCKED_MM);
-            const bool is_right_blocked = (tof_right > 0.0f && tof_right < PARK_TOF_BLOCKED_MM);
-            const bool is_left_free     = (tof_left < 0.0f || tof_left >= PARK_TOF_BLOCKED_MM);
-            const bool is_right_free    = (tof_right < 0.0f || tof_right >= PARK_TOF_BLOCKED_MM);
+            // --- PARKING STATE MACHINE UPDATE (ÁP DỤNG NGƯỠNG MIN TOF 50mm + TRICK LỎ) ---
+            float eff_tof_left  = tof_left;
+            float eff_tof_right = tof_right;
 
-            if (parking_active) {
+            if (parking_active && park_corridor.latched) {
+                // Trick lỏ: Bên phải tất cả các slot 1, 2, 3 đều ép thành BLOCKED
+                if (eff_tof_right < PARK_TOF_MIN_VALID_MM || eff_tof_right >= PARK_TOF_BLOCKED_MM) {
+                    eff_tof_right = 150.0f;
+                }
+
+                // Trick lỏ: Slot 2 bên trái (ở giữa) luôn coi là FREE
+                if (park_state == ParkingState::SLOT2_SEARCH_FREE) {
+                    eff_tof_left = -1.0f;
+                }
+            }
+
+            const bool is_left_blocked  = (eff_tof_left >= PARK_TOF_MIN_VALID_MM && eff_tof_left < PARK_TOF_BLOCKED_MM);
+            const bool is_right_blocked = (eff_tof_right >= PARK_TOF_MIN_VALID_MM && eff_tof_right < PARK_TOF_BLOCKED_MM);
+            const bool is_left_free     = (eff_tof_left < 0.0f || eff_tof_left >= PARK_TOF_BLOCKED_MM);
+            const bool is_right_free    = (eff_tof_right < 0.0f || eff_tof_right >= PARK_TOF_BLOCKED_MM);
+
+            // Chỉ kích hoạt tìm slot sau khi đã chốt corridor (đã tới sát biển parking)
+            if (parking_active && park_corridor.latched) {
                 switch (park_state) {
                     case ParkingState::APPROACH:
                     case ParkingState::SLOT1_WAIT_BLOCKED: {
                         if (is_left_blocked && is_right_blocked) {
                             slot1_confirm_cnt++;
-                            if (slot1_confirm_cnt >= 2) {
-                                slot1_tof_left  = tof_left;
-                                slot1_tof_right = tof_right;
+                            if (slot1_confirm_cnt >= 3) {
+                                slot1_tof_left  = eff_tof_left;
+                                slot1_tof_right = eff_tof_right;
                                 park_state = ParkingState::SLOT2_SEARCH_FREE;
                             }
                         } else slot1_confirm_cnt = 0;
@@ -1130,16 +1213,16 @@ int main() {
                     case ParkingState::SLOT2_SEARCH_FREE: {
                         if (is_left_free && is_right_blocked) {
                             slot2_confirm_cnt++;
-                            if (slot2_confirm_cnt >= 2) {
+                            if (slot2_confirm_cnt >= 3) {
                                 park_free_side = -1;
-                                slot2_tof_left = tof_left; slot2_tof_right = tof_right;
+                                slot2_tof_left = eff_tof_left; slot2_tof_right = eff_tof_right;
                                 park_state = ParkingState::SLOT3_WAIT_BLOCKED;
                             }
                         } else if (is_right_free && is_left_blocked) {
                             slot2_confirm_cnt++;
-                            if (slot2_confirm_cnt >= 2) {
+                            if (slot2_confirm_cnt >= 3) {
                                 park_free_side = 1;
-                                slot2_tof_left = tof_left; slot2_tof_right = tof_right;
+                                slot2_tof_left = eff_tof_left; slot2_tof_right = eff_tof_right;
                                 park_state = ParkingState::SLOT3_WAIT_BLOCKED;
                             }
                         } else slot2_confirm_cnt = 0;
@@ -1148,9 +1231,9 @@ int main() {
                     case ParkingState::SLOT3_WAIT_BLOCKED: {
                         if (is_left_blocked && is_right_blocked) {
                             slot3_confirm_cnt++;
-                            if (slot3_confirm_cnt >= 2) {
-                                slot3_tof_left  = tof_left;
-                                slot3_tof_right = tof_right;
+                            if (slot3_confirm_cnt >= 3) {
+                                slot3_tof_left  = eff_tof_left;
+                                slot3_tof_right = eff_tof_right;
                                 if (heading_ok) park_heading_0 = current_heading;
                                 park_dwell_time = 0.0;
                                 park_state = ParkingState::WAIT_FULL_STOP;
@@ -1180,7 +1263,28 @@ int main() {
                         park_reverse_elapsed += dt_loop;
                         float delta_h = std::abs(normalizeAngleP(current_heading - park_heading_0));
                         if (delta_h <= PARK_ALIGN_TOL_DEG || park_reverse_elapsed >= 7.0) {
+                            park_state = ParkingState::NUDGE_1;
+                            park_nudge_elapsed = 0.0;
+                            std::printf("[PARK] REVERSE_2 complete (delta_h=%.2f) -> NUDGE_1 (steer right %.1f deg)\n",
+                                        delta_h, PARK_NUDGE_STEER_DEG);
+                        }
+                        break;
+                    }
+                    case ParkingState::NUDGE_1: {
+                        park_nudge_elapsed += dt_loop;
+                        if (park_nudge_elapsed >= PARK_NUDGE_TIME_S) {
+                            park_state = ParkingState::NUDGE_2;
+                            park_nudge_elapsed = 0.0;
+                            std::printf("[PARK] NUDGE_1 complete -> NUDGE_2 (steer left %.1f deg to align straight)\n",
+                                        PARK_NUDGE_STEER_DEG);
+                        }
+                        break;
+                    }
+                    case ParkingState::NUDGE_2: {
+                        park_nudge_elapsed += dt_loop;
+                        if (park_nudge_elapsed >= PARK_NUDGE_TIME_S) {
                             park_state = ParkingState::DONE;
+                            std::printf("[PARK] Parking maneuver FULLY COMPLETED (DONE)!\n");
                         }
                         break;
                     }
@@ -1218,10 +1322,16 @@ int main() {
                 } else if (park_state == ParkingState::REVERSE_2) {
                     speed = PARK_REVERSE_SPEED;
                     out.angle = (park_free_side < 0) ? PARK_MAX_STEER_DEG : -PARK_MAX_STEER_DEG;
+                } else if (park_state == ParkingState::NUDGE_1) {
+                    speed = PARK_NUDGE_SPEED;
+                    out.angle = (park_free_side < 0) ? PARK_NUDGE_STEER_DEG : -PARK_NUDGE_STEER_DEG;
+                } else if (park_state == ParkingState::NUDGE_2) {
+                    speed = PARK_NUDGE_SPEED;
+                    out.angle = (park_free_side < 0) ? -PARK_NUDGE_STEER_DEG : PARK_NUDGE_STEER_DEG;
                 } else {
-                    speed = PARK_APPROACH_SPEED;
+                    speed = park_corridor.latched ? PARK_APPROACH_SPEED : 20.0f;
                     float heading_corr = 0.0f;
-                    if (heading_ok) {
+                    if (heading_ok && std::abs(PARK_HEADING_KP) > 1e-4f) {
                         float h_err = normalizeAngleP(current_heading - park_straight_heading);
                         heading_corr = std::clamp(-PARK_HEADING_KP * h_err, -PARK_HEADING_MAX_CORR_DEG, PARK_HEADING_MAX_CORR_DEG);
                     }
@@ -1295,11 +1405,10 @@ int main() {
         static auto lastLog = std::chrono::steady_clock::now();
         auto tNow = std::chrono::steady_clock::now();
         if (tNow - lastLog >= std::chrono::seconds(1)) {
-            // Progress của SIGN_CONFIRM (nếu đang trong state đó)
             char rb_extra[64] = "";
             if (rb_state == RbState::SIGN_CONFIRM) {
                 double prog = elapsed_total - rb_sign_confirm_start;
-                std::snprintf(rb_extra, sizeof(rb_extra), " vis=%d %.1f/%.1fs",
+                std::snprintf(rb_extra, sizeof(rb_extra), " vis=%d %.1f/%.2fs",
                               rb_visible_now ? 1 : 0, prog, RB_APPROACH_DELAY_S);
             }
             std::printf(
@@ -1373,15 +1482,15 @@ int main() {
                 }
             }
 
-            // --- SIGN BOUNDING BOXES — vẽ ngoài roadOK vì detection độc lập ---
+            // --- SIGN BOUNDING BOXES ---
             for (const auto& s : cachedSigns) {
                 cv::Rect r = s.box & cv::Rect(0, 0, overlay.cols, overlay.rows);
                 if (r.width < 2 || r.height < 2) continue;
 
                 const bool is_committed =
                     (voter.GetCommitted() >= 0) && (s.class_id == voter.GetCommitted());
-                cv::Scalar color = is_committed ? cv::Scalar(0, 255, 0)   // green: committed
-                                                : cv::Scalar(0, 255, 255); // yellow: detected
+                cv::Scalar color = is_committed ? cv::Scalar(0, 255, 0)   // green
+                                                : cv::Scalar(0, 255, 255); // yellow
 
                 cv::rectangle(overlay, r, color, 2);
 
@@ -1396,7 +1505,7 @@ int main() {
 
             char t1[200], t2[200], t3[200], t4[200];
             std::snprintf(t1, sizeof(t1), "FPS %.1f | spd %.1f/%.1f | pid %.1f | srv %d", currentFps, applied_speed, speed, out.angle, final_angle);
-            std::snprintf(t2, sizeof(t2), "sign %s | rb %s | park %s", SignName(voter.GetCommitted()), RbStateName(rb_state), ParkingStateStr(park_state));
+            std::snprintf(t2, sizeof(t2), "sign %s | rb %s | park %s%s (h=%.0f c=%d)", SignName(voter.GetCommitted()), RbStateName(rb_state), ParkingStateStr(park_state), park_corridor.latched ? "[LATCH]" : "", park_sign_h_now, park_near_confirm_cnt);
             std::snprintf(t3, sizeof(t3), "hdg %.2f | tof L=%.0f R=%.0f", current_heading, tof_left, tof_right);
             std::snprintf(t4, sizeof(t4), "near %.1f | obs %s", out.near_e, obstacle_controller.active() ? obs_res.state_str.c_str() : "NONE");
 
