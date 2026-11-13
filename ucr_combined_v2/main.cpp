@@ -671,6 +671,17 @@ int main() {
             for (auto& d : cachedSigns) {
                 if (d.confidence < SIGN_CONF_THRESH) continue;
 
+                // --- ROUNDABOUT LOCKOUT FILTER ---
+                // If we are anywhere inside the roundabout state machine 
+                // (including EXITING and LEFT_CURVE), ignore every sign 
+                // EXCEPT the roundabout sign itself.
+                if (rb_state != RbState::NONE) {
+                    if (d.name == "roundabout" || d.class_id == sign_class::ROUNDABOUT) {
+                        classIds.push_back(sign_class::ROUNDABOUT);
+                    }
+                    continue; // Skip parking, person, traffic light, and turn signs
+                }
+
                 if (d.name == "walking_person" || d.class_id == sign_class::WALKING_PERSON) {
                     last_person_seen_time  = elapsed_total;
                     person_seen_this_frame = true;
