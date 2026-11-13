@@ -134,14 +134,19 @@ static constexpr float  RB_EXIT_TURN_BIAS_PX     = 30.0f;
 // ============================================================
 // PARKING & OBSTACLE CONFIGURATION (from chinh.cpp)
 // ============================================================
-static constexpr float PARK_TOF_MIN_VALID_MM        = 100.0f;   // < 50mm coi là invalid (out-of-range)
+static constexpr float PARK_TOF_MIN_VALID_MM        = 50.0f;   // < 50mm coi là invalid (out-of-range)
 static constexpr float PARK_TOF_BLOCKED_MM          = 250.0f;  // < 350mm coi là bị block
 static constexpr float PARK_APPROACH_SPEED          = 13.0f;
-static constexpr float PARK_REVERSE_SPEED           = -15.0f;
-static constexpr float PARK_MAX_STEER_DEG           = 48.0f;
-static constexpr float PARK_TARGET_DELTA_DEG        = 50.0f;
+static constexpr float PARK_REVERSE_SPEED           = -13.0f;
+static constexpr float PARK_MAX_STEER_DEG           = 45.0f;
+static constexpr float PARK_TARGET_DELTA_DEG        = 48.0f;
 static constexpr float PARK_ALIGN_TOL_DEG           = 3.0f;
 static constexpr double PARK_STOP_DWELL_S           = 0.5;
+
+// Nudge forward & align parameters (nhích lên nhẹ và bẻ lái căn gọn vào vị trí đỗ sau REVERSE_2)
+static constexpr float  PARK_NUDGE_SPEED            = 12.0f;   // Tốc độ nhích lên nhẹ (cm/s)
+static constexpr float  PARK_NUDGE_STEER_DEG        = 3.5f;    // Bẻ bánh 3.5 độ (tầm 3-4 độ)
+static constexpr double PARK_NUDGE_TIME_S           = 0.70;    // Thời gian mỗi pha 0.5s -> tổng thời gian 2 pha ~ 1.0s
 
 static constexpr float PARK_SIGN_MIN_BOX_H          = 38.0f;   // Biển parking cao >= 38px mới tính là tới gần để chốt corridor
 static constexpr int   PARK_SIGN_CONFIRM_FRAMES     = 3;       // Debounce: cần thấy biển to liên tục 3 frame
@@ -161,6 +166,8 @@ enum class ParkingState {
     WAIT_FULL_STOP,
     REVERSE_1,
     REVERSE_2,
+    NUDGE_1,
+    NUDGE_2,
     DONE
 };
 
@@ -174,6 +181,8 @@ static const char* ParkingStateStr(ParkingState s) {
         case ParkingState::WAIT_FULL_STOP:     return "WAIT_STOP";
         case ParkingState::REVERSE_1:          return "REVERSE_1_TURN45";
         case ParkingState::REVERSE_2:          return "REVERSE_2_ALIGN";
+        case ParkingState::NUDGE_1:            return "NUDGE_1_RIGHT";
+        case ParkingState::NUDGE_2:            return "NUDGE_2_LEFT";
         case ParkingState::DONE:               return "DONE";
         default:                               return "UNKNOWN";
     }
@@ -182,7 +191,7 @@ static const char* ParkingStateStr(ParkingState s) {
 struct ParkingCorridor {
     bool latched = false;
     int y_bot = 299;
-    int y_far = 135;
+    int y_far = 0; // Kéo đến hết khung hình (y = 0)
 
     int x_left_bot = 40;
     int x_left_far = 85;
@@ -613,6 +622,7 @@ int main() {
     float park_straight_heading = 0.0f;
     double park_dwell_time = 0.0;
     double park_reverse_elapsed = 0.0;
+    double park_nudge_elapsed = 0.0;
     double park_approach_start_time = 0.0;
     int park_near_confirm_cnt = 0;
     int slot1_confirm_cnt = 0;
@@ -944,10 +954,10 @@ int main() {
 
                 park_corridor.x_left_bot  = std::clamp(center_bot - half_w_bot, 5, w / 2 - 25);
                 park_corridor.x_right_bot = std::clamp(center_bot + half_w_bot, w / 2 + 25, w - 6);
-                park_corridor.x_left_far  = std::clamp(center_far - half_w_far, 10, w / 2 - 15);
-                park_corridor.x_right_far = std::clamp(center_far + half_w_far, w / 2 + 15, w - 11);
+                park_corridor.x_left_far  = std::clamp(center_far - half_w_far, 5, w / 2 - 15);
+                park_corridor.x_right_far = std::clamp(center_far + half_w_far, w / 2 + 15, w - 6);
                 park_corridor.y_bot       = y_bottom;
-                park_corridor.y_far       = y1;
+                park_corridor.y_far       = 0; // Kéo đến hết đỉnh khung hình (y = 0) để near, mid, far đều bị kẹp trong mask
                 park_corridor.latched     = true;
                 if (heading_ok) park_straight_heading = current_heading;
                 std::printf("[PARK] LATCHED CORRIDOR: sign_h=%.1f (min=%.1f) timed_out=%d center_bot=%d center_far=%d\n",
@@ -1133,11 +1143,28 @@ int main() {
             }
             applied_floor = effective_floor;
 
-            // --- PARKING STATE MACHINE UPDATE (ÁP DỤNG NGƯỠNG MIN TOF 50mm) ---
-            const bool is_left_blocked  = (tof_left >= PARK_TOF_MIN_VALID_MM && tof_left < PARK_TOF_BLOCKED_MM);
-            const bool is_right_blocked = (tof_right >= PARK_TOF_MIN_VALID_MM && tof_right < PARK_TOF_BLOCKED_MM);
-            const bool is_left_free     = (tof_left < 0.0f || tof_left >= PARK_TOF_BLOCKED_MM);
-            const bool is_right_free    = (tof_right < 0.0f || tof_right >= PARK_TOF_BLOCKED_MM);
+            // --- PARKING STATE MACHINE UPDATE (ÁP DỤNG NGƯỠNG MIN TOF 50mm + TRICK LỎ) ---
+            float eff_tof_left  = tof_left;
+            float eff_tof_right = tof_right;
+
+            if (parking_active && park_corridor.latched) {
+                // Trick lỏ: Bên phải tất cả các slot 1, 2, 3 đều ép thành BLOCKED
+                // Nếu bên phải ra -1 hoặc out-of-range (>= PARK_TOF_BLOCKED_MM) thì chỉnh lên thành giá trị block (150mm)
+                if (eff_tof_right < PARK_TOF_MIN_VALID_MM || eff_tof_right >= PARK_TOF_BLOCKED_MM) {
+                    eff_tof_right = 150.0f;
+                }
+
+                // Trick lỏ: Slot 2 bên trái (ở giữa) luôn coi là FREE
+                // Nếu ra -1 giữ nguyên -1; nếu ra giá trị block thì ép về -1 để coi là free
+                if (park_state == ParkingState::SLOT2_SEARCH_FREE) {
+                    eff_tof_left = -1.0f;
+                }
+            }
+
+            const bool is_left_blocked  = (eff_tof_left >= PARK_TOF_MIN_VALID_MM && eff_tof_left < PARK_TOF_BLOCKED_MM);
+            const bool is_right_blocked = (eff_tof_right >= PARK_TOF_MIN_VALID_MM && eff_tof_right < PARK_TOF_BLOCKED_MM);
+            const bool is_left_free     = (eff_tof_left < 0.0f || eff_tof_left >= PARK_TOF_BLOCKED_MM);
+            const bool is_right_free    = (eff_tof_right < 0.0f || eff_tof_right >= PARK_TOF_BLOCKED_MM);
 
             // Chỉ kích hoạt tìm slot sau khi đã chốt corridor (đã tới sát biển parking)
             if (parking_active && park_corridor.latched) {
@@ -1147,8 +1174,8 @@ int main() {
                         if (is_left_blocked && is_right_blocked) {
                             slot1_confirm_cnt++;
                             if (slot1_confirm_cnt >= 3) {
-                                slot1_tof_left  = tof_left;
-                                slot1_tof_right = tof_right;
+                                slot1_tof_left  = eff_tof_left;
+                                slot1_tof_right = eff_tof_right;
                                 park_state = ParkingState::SLOT2_SEARCH_FREE;
                             }
                         } else slot1_confirm_cnt = 0;
@@ -1159,14 +1186,14 @@ int main() {
                             slot2_confirm_cnt++;
                             if (slot2_confirm_cnt >= 3) {
                                 park_free_side = -1;
-                                slot2_tof_left = tof_left; slot2_tof_right = tof_right;
+                                slot2_tof_left = eff_tof_left; slot2_tof_right = eff_tof_right;
                                 park_state = ParkingState::SLOT3_WAIT_BLOCKED;
                             }
                         } else if (is_right_free && is_left_blocked) {
                             slot2_confirm_cnt++;
                             if (slot2_confirm_cnt >= 3) {
                                 park_free_side = 1;
-                                slot2_tof_left = tof_left; slot2_tof_right = tof_right;
+                                slot2_tof_left = eff_tof_left; slot2_tof_right = eff_tof_right;
                                 park_state = ParkingState::SLOT3_WAIT_BLOCKED;
                             }
                         } else slot2_confirm_cnt = 0;
@@ -1176,8 +1203,8 @@ int main() {
                         if (is_left_blocked && is_right_blocked) {
                             slot3_confirm_cnt++;
                             if (slot3_confirm_cnt >= 3) {
-                                slot3_tof_left  = tof_left;
-                                slot3_tof_right = tof_right;
+                                slot3_tof_left  = eff_tof_left;
+                                slot3_tof_right = eff_tof_right;
                                 if (heading_ok) park_heading_0 = current_heading;
                                 park_dwell_time = 0.0;
                                 park_state = ParkingState::WAIT_FULL_STOP;
@@ -1207,7 +1234,28 @@ int main() {
                         park_reverse_elapsed += dt_loop;
                         float delta_h = std::abs(normalizeAngleP(current_heading - park_heading_0));
                         if (delta_h <= PARK_ALIGN_TOL_DEG || park_reverse_elapsed >= 7.0) {
+                            park_state = ParkingState::NUDGE_1;
+                            park_nudge_elapsed = 0.0;
+                            std::printf("[PARK] REVERSE_2 complete (delta_h=%.2f) -> NUDGE_1 (steer right %.1f deg)\n",
+                                        delta_h, PARK_NUDGE_STEER_DEG);
+                        }
+                        break;
+                    }
+                    case ParkingState::NUDGE_1: {
+                        park_nudge_elapsed += dt_loop;
+                        if (park_nudge_elapsed >= PARK_NUDGE_TIME_S) {
+                            park_state = ParkingState::NUDGE_2;
+                            park_nudge_elapsed = 0.0;
+                            std::printf("[PARK] NUDGE_1 complete -> NUDGE_2 (steer left %.1f deg to align straight)\n",
+                                        PARK_NUDGE_STEER_DEG);
+                        }
+                        break;
+                    }
+                    case ParkingState::NUDGE_2: {
+                        park_nudge_elapsed += dt_loop;
+                        if (park_nudge_elapsed >= PARK_NUDGE_TIME_S) {
                             park_state = ParkingState::DONE;
+                            std::printf("[PARK] Parking maneuver FULLY COMPLETED (DONE)!\n");
                         }
                         break;
                     }
@@ -1245,6 +1293,12 @@ int main() {
                 } else if (park_state == ParkingState::REVERSE_2) {
                     speed = PARK_REVERSE_SPEED;
                     out.angle = (park_free_side < 0) ? PARK_MAX_STEER_DEG : -PARK_MAX_STEER_DEG;
+                } else if (park_state == ParkingState::NUDGE_1) {
+                    speed = PARK_NUDGE_SPEED;
+                    out.angle = (park_free_side < 0) ? PARK_NUDGE_STEER_DEG : -PARK_NUDGE_STEER_DEG;
+                } else if (park_state == ParkingState::NUDGE_2) {
+                    speed = PARK_NUDGE_SPEED;
+                    out.angle = (park_free_side < 0) ? -PARK_NUDGE_STEER_DEG : PARK_NUDGE_STEER_DEG;
                 } else {
                     speed = park_corridor.latched ? PARK_APPROACH_SPEED : 20.0f;
                     float heading_corr = 0.0f;
