@@ -979,7 +979,7 @@ public:
                 straight_frames = 0;
             }
 
-            const int req_straight = 3;
+            const int req_straight = 4;
 
             if (straight_frames >= req_straight) {
                 if (is_unmarked_tjunction) {
