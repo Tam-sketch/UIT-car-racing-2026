@@ -671,17 +671,6 @@ int main() {
             for (auto& d : cachedSigns) {
                 if (d.confidence < SIGN_CONF_THRESH) continue;
 
-                // --- ROUNDABOUT LOCKOUT FILTER ---
-                // If we are anywhere inside the roundabout state machine 
-                // (including EXITING and LEFT_CURVE), ignore every sign 
-                // EXCEPT the roundabout sign itself.
-                if (rb_state != RbState::NONE) {
-                    if (d.name == "roundabout" || d.class_id == sign_class::ROUNDABOUT) {
-                        classIds.push_back(sign_class::ROUNDABOUT);
-                    }
-                    continue; // Skip parking, person, traffic light, and turn signs
-                }
-
                 if (d.name == "walking_person" || d.class_id == sign_class::WALKING_PERSON) {
                     last_person_seen_time  = elapsed_total;
                     person_seen_this_frame = true;
@@ -1267,10 +1256,10 @@ int main() {
                     out.angle = 0.0f;
                 } else if (park_state == ParkingState::REVERSE_1) {
                     speed = PARK_REVERSE_SPEED;
-                    out.angle = (park_free_side < 0) ? -PARK_MAX_STEER_DEG : PARK_MAX_STEER_DEG;
+                    out.angle = (park_free_side < 0) ? PARK_MAX_STEER_DEG : -PARK_MAX_STEER_DEG;
                 } else if (park_state == ParkingState::REVERSE_2) {
                     speed = PARK_REVERSE_SPEED;
-                    out.angle = (park_free_side < 0) ? PARK_MAX_STEER_DEG : -PARK_MAX_STEER_DEG;
+                    out.angle = (park_free_side < 0) ? -PARK_MAX_STEER_DEG : PARK_MAX_STEER_DEG;
                 } else {
                     speed = PARK_APPROACH_SPEED;
                     float heading_corr = 0.0f;
