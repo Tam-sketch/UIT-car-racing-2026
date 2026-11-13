@@ -136,7 +136,7 @@ static constexpr float  RB_EXIT_TURN_BIAS_PX     = 30.0f;
 // ============================================================
 static constexpr float PARK_TOF_MIN_VALID_MM        = 50.0f;   // < 50mm coi là invalid (out-of-range)
 static constexpr float PARK_TOF_BLOCKED_MM          = 350.0f;  // < 350mm coi là bị block
-static constexpr float PARK_APPROACH_SPEED          = 13.0f;
+static constexpr float PARK_APPROACH_SPEED          = 15.0f;
 static constexpr float PARK_REVERSE_SPEED           = -10.0f;
 static constexpr float PARK_MAX_STEER_DEG           = 45.0f;
 static constexpr float PARK_TARGET_DELTA_DEG        = 50.0f;
