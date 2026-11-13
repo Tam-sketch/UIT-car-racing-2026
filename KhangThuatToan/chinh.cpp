@@ -1,7 +1,7 @@
 // ============================================================
 // main_run.cpp — UCR2026 Full Integrated (LaneFollower + SignDetector + NavigationBrain)
 // ============================================================
-//4
+//5
 #include "hardware/Camera.h"
 #include "hardware/Motor.h"
 #include "hardware/Servo.h"
@@ -109,7 +109,7 @@ static constexpr double RB_MISSING_SIGN_S        = 2.0;
 static constexpr double RB_CIRCLE_TIMEOUT_S      = 12.0;
 static constexpr double RB_EXIT_SEARCH_TIMEOUT_S = 15.0;
 static constexpr double RB_EXIT_FORCE_EXEC_S     = 1.5;
-static constexpr double RB_COOLDOWN_S            = 2.0;
+static constexpr double RB_COOLDOWN_S            = 35.0; // Cooldown 35s chống nhận diện lại biển từ xa khi lên/xuống dốc cầu
 static constexpr float  RB_SPEED_MIN_CMS         = 20.0f;
 static constexpr float  RB_SPEED_MAX_CMS         = 30.0f;
 static constexpr float  RB_EXIT_TURN_FLOOR_DEG   = 16.0f;
@@ -175,6 +175,7 @@ struct ParkingCorridor {
     }
 };
 
+static constexpr float PARK_TOF_MIN_VALID_MM        = 50.0f;  // Ngưỡng min 5cm (50mm), dưới 50mm coi là out-of-range / infinity
 static constexpr float PARK_TOF_BLOCKED_MM          = 350.0f; // Ngưỡng mm (< 350mm coi là bị block)
 static constexpr float PARK_APPROACH_SPEED          = 13.0f;  // Tốc độ tiến trong bãi đỗ (cm/s)
 static constexpr float PARK_REVERSE_SPEED           = -10.0f;  // Tốc độ lùi chậm (cm/s)
@@ -668,10 +669,10 @@ int main() {
         tof_left = -1.0f;
         tof_right = -1.0f;
         if (tof_ok && tof.Read(tof_readings, std::chrono::milliseconds(10))) {
-            if (tof_readings[TOF_IDX_LEFT].valid && tof_readings[TOF_IDX_LEFT].distanceMm > 0) {
+            if (tof_readings[TOF_IDX_LEFT].valid && tof_readings[TOF_IDX_LEFT].distanceMm >= PARK_TOF_MIN_VALID_MM) {
                 tof_left = static_cast<float>(tof_readings[TOF_IDX_LEFT].distanceMm);
             }
-            if (tof_readings[TOF_IDX_RIGHT].valid && tof_readings[TOF_IDX_RIGHT].distanceMm > 0) {
+            if (tof_readings[TOF_IDX_RIGHT].valid && tof_readings[TOF_IDX_RIGHT].distanceMm >= PARK_TOF_MIN_VALID_MM) {
                 tof_right = static_cast<float>(tof_readings[TOF_IDX_RIGHT].distanceMm);
             }
         }
@@ -691,6 +692,14 @@ int main() {
             signObs.reserve(cachedSigns.size());
             for (const auto& d : cachedSigns) {
                 if (d.confidence < 0.30f) continue;
+                // BỎ QUA traffic_light và walking_person: hai loại này là chướng ngại vật tức thời,
+                // được xử lý độc lập trong navBrain.UpdateHazards(), TUYỆT ĐỐI KHÔNG đưa vào SignVoter
+                // để tránh chiếm quyền hoặc cướp mất biển điều hướng (turn_left, turn_right, roundabout)!
+                if (d.class_id == sign_class::TRAFFIC_LIGHT || d.name == "traffic_light" ||
+                    d.class_id == sign_class::WALKING_PERSON || d.name == "walking_person") {
+                    continue;
+                }
+
                 // Nới lỏng bộ lọc: chỉ lọc nhiễu hạt bụi cực nhỏ (< 100px)
                 if (d.box.width < 10 || d.box.height < 10 || d.box.area() < 100) continue;
 
@@ -698,8 +707,9 @@ int main() {
                 if (d.box.area() < 180 && (d.box.y + d.box.height) < 45) continue;
 
                 // Riêng biển roundabout: chống nhận diện từ trên dốc cầu nhìn xa sang đảo
+                // Yêu cầu diện tích >= 600px và đáy biển ở nửa dưới ảnh (y+h >= 105px)
                 if (d.class_id == sign_class::ROUNDABOUT || d.name == "roundabout") {
-                    if (d.box.area() < 350 || (d.box.y + d.box.height) < 75) continue;
+                    if (d.box.area() < 600 || (d.box.y + d.box.height) < 105) continue;
                 }
 
                 int cls = d.class_id;
@@ -970,7 +980,8 @@ int main() {
                         elapsed_total >= sign_block_until_time &&
                         !parking_active &&
                         turn_controller.state == v20::LaneTurnController::State::IDLE &&
-                        !corner_assist.active()) {
+                        !corner_assist.active() &&
+                        std::abs(previous_out.angle) <= 14.0) { // Xe phải đang chạy thẳng hướng tới đảo, không phải đang ôm cua gắt chân cầu!
 
                         rb_pass_count++;
                         if (rb_pass_count > 2) rb_pass_count = 2;
@@ -1051,6 +1062,13 @@ int main() {
                             turn_controller = v20::LaneTurnController{};
                             corner_assist.reset();
                         }
+                        // Khôi phục ngay lập tức các thông số bẻ lái chuẩn của LaneTurnController
+                        // để các biển báo rẽ sau (turn_right, no_right, no_left) đánh lái đủ lực cực đại
+                        turn_controller.TURN_STEER_DEG = v20::LaneTurnController::DEFAULT_TURN_STEER_DEG;
+                        turn_controller.TURN_BIAS_PX   = v20::LaneTurnController::DEFAULT_TURN_BIAS_PX;
+                        turn_controller.TURN_INIT_DEG  = v20::LaneTurnController::DEFAULT_TURN_INIT_DEG;
+                        turn_controller.TURN_RAMP_DEG_PER_S = 120.0;
+
                         rb_state = RbState::NONE;
                         rb_bias_smoothed = 0.0f;
 
@@ -1086,6 +1104,12 @@ int main() {
                    turn_controller.state == v20::LaneTurnController::State::WAIT_STRAIGHT) &&
                   dec.active_sign != handled_sign));
             if (can_accept_sign) {
+                // Đảm bảo luôn nạp lực bẻ lái cực đại (floor 35°, bias 40px)
+                turn_controller.TURN_STEER_DEG = v20::LaneTurnController::DEFAULT_TURN_STEER_DEG;
+                turn_controller.TURN_BIAS_PX   = v20::LaneTurnController::DEFAULT_TURN_BIAS_PX;
+                turn_controller.TURN_INIT_DEG  = v20::LaneTurnController::DEFAULT_TURN_INIT_DEG;
+                turn_controller.TURN_RAMP_DEG_PER_S = 120.0;
+
                 if (dec.action == NavAction::FORCE_LEFT) {
                     turn_controller.start_turn("LEFT", false);
                     handled_sign = dec.active_sign;
