@@ -725,7 +725,11 @@ int main() {
 
         switch (rb_state) {
             case RbState::NONE:
-                if (rb_committed && elapsed_total >= rb_cooldown_until &&
+                // Guard: once both passes of the roundabout are done, never
+                // re-enter — otherwise a still-visible roundabout sign will
+                // re-trigger Pass 2 forever and T-junction #2 is never reached.
+                if (rb_pass_count < 2 &&
+                    rb_committed && elapsed_total >= rb_cooldown_until &&
                     turn_controller.state == v20::LaneTurnController::State::IDLE &&
                     !corner_assist.active()) {
                     rb_state = RbState::SIGN_CONFIRM;
@@ -742,6 +746,11 @@ int main() {
                 break;
 
             case RbState::SIGN_CONFIRM:
+                // Guard: if we somehow entered with rb_pass_count >= 2, abort.
+                if (rb_pass_count >= 2) {
+                    rb_state = RbState::NONE;
+                    break;
+                }
                 // Safety timeout
                 if ((elapsed_total - rb_sign_confirm_entered) >= RB_SIGN_CONFIRM_TIMEOUT_S) {
                     std::printf("[RB] SIGN_CONFIRM timeout %.1fs → ABORT\n",
@@ -861,11 +870,14 @@ int main() {
                 }
 
                 // Transition after 5 straight frames, or safety timeout of 6.0s
-                if (rb_left_curve_straight_frames >= 5 || (elapsed_total - rb_left_curve_start) >= 6.0) {
+                if (rb_left_curve_straight_frames >= 3 || (elapsed_total - rb_left_curve_start) >= 6.0) {
                     rb_state = RbState::NONE;
                     turn_controller.waiting_for_tjunction = true;
-                    turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
-                    std::printf("[RB] LEFT_CURVE done (straight=%d, t=%.1fs) -> armed T-junction #2\n",
+                    // No cooldown: the curve already consumed the "skip the exit curve"
+                    // budget. Re-arming 1.5 s here puts T-junction detection 33+ cm
+                    // past the straight start, often past the actual T-junction.
+                    turn_controller.tjunction_cooldown = 0.0;
+                    std::printf("[RB] LEFT_CURVE done (straight=%d, t=%.1fs) -> armed T-junction #2 (cooldown=0)\n",
                                 rb_left_curve_straight_frames, elapsed_total - rb_left_curve_start);
                 }
                 break;
