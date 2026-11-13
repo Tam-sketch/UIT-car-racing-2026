@@ -2,6 +2,7 @@
 // main_run.cpp — UCR2026 Full Integrated (Parking & Obstacle from chinh.cpp)
 // + Roundabout logic ported from roundabout.cpp (unconditional T-junction arm)
 // + RB_APPROACH_DELAY_S timer state (SIGN_CONFIRM)
+// + SIGN_CONFIRM: yêu cầu THẤY BIỂN roundabout LIÊN TỤC 2s (rb_visible_now mỗi frame)
 // + UI: centerline dots + sign bounding boxes
 // ============================================================
 #include "hardware/Camera.h"
@@ -114,17 +115,18 @@ static constexpr int SIGN_VOTER_TIMEOUT_DS      = 30;
 static constexpr double SIGN_BLOCK_SECONDS      = 4.0;
 
 // Roundabout timings
-static constexpr float  RB_BIAS_PX_RIGHT         = 25.0f;
-static constexpr float  RB_BIAS_PX_LEFT          = 22.0f;
-static constexpr float  RB_BIAS_EMA              = 0.30f;
-static constexpr double RB_MISSING_SIGN_S        = 2.0;
-static constexpr double RB_CIRCLE_TIMEOUT_S      = 8.0;
-static constexpr double RB_EXIT_SEARCH_TIMEOUT_S = 15.0;
-static constexpr double RB_EXIT_FORCE_EXEC_S     = 1.5;
-static constexpr double RB_COOLDOWN_S            = 2.0;
-static constexpr double RB_APPROACH_DELAY_S      = 2.0;   // Delay sau khi commit biển trước APPROACH
-static constexpr float  RB_SPEED_MIN_CMS         = 20.0f;
-static constexpr float  RB_SPEED_MAX_CMS         = 30.0f;
+static constexpr float  RB_BIAS_PX_RIGHT           = 25.0f;
+static constexpr float  RB_BIAS_PX_LEFT            = 22.0f;
+static constexpr float  RB_BIAS_EMA                = 0.30f;
+static constexpr double RB_MISSING_SIGN_S          = 2.0;
+static constexpr double RB_CIRCLE_TIMEOUT_S        = 8.0;
+static constexpr double RB_EXIT_SEARCH_TIMEOUT_S   = 15.0;
+static constexpr double RB_EXIT_FORCE_EXEC_S       = 1.5;
+static constexpr double RB_COOLDOWN_S              = 2.0;
+static constexpr double RB_APPROACH_DELAY_S        = 2.0;   // Phải THẤY biển liên tục 2s
+static constexpr double RB_SIGN_CONFIRM_TIMEOUT_S  = 15.0;  // Safety: stuck quá 15s ở SIGN_CONFIRM → abort
+static constexpr float  RB_SPEED_MIN_CMS           = 20.0f;
+static constexpr float  RB_SPEED_MAX_CMS           = 30.0f;
 
 // Roundabout exit turn params
 static constexpr float  RB_EXIT_TURN_FLOOR_DEG   = 26.0f;
@@ -358,7 +360,7 @@ private:
 // ============================================================
 enum class RbState {
     NONE,
-    SIGN_CONFIRM,   // chờ xác nhận biển trước khi áp bias phải
+    SIGN_CONFIRM,   // chờ xác nhận biển (phải THẤY liên tục 2s) trước khi áp bias phải
     APPROACH,
     IN_CIRCLE,
     EXIT_PREP,
@@ -592,7 +594,8 @@ int main() {
     double   rb_cooldown_until     = 0.0;
     int      rb_missing_sign_ticks = 0;
     int      rb_pass_count         = 0;
-    double   rb_sign_confirm_start = 0.0;   // Timer cho SIGN_CONFIRM
+    double   rb_sign_confirm_start   = 0.0;   // Timer đếm 2s liên tục thấy biển
+    double   rb_sign_confirm_entered = 0.0;   // Mốc vào SIGN_CONFIRM (safety timeout)
 
     double   last_person_seen_time = -1e9;
     double   last_red_seen_time    = -1e9;
@@ -631,6 +634,8 @@ int main() {
     std::vector<SignObject> cachedSigns;
 
     std::cout << "\n=== UCR2026: Auto Run (Full Integrated) ===\n";
+    std::cout << "[RB] SIGN_CONFIRM requires rb_visible_now every frame for "
+              << RB_APPROACH_DELAY_S << "s (strict).\n\n";
 
     while (!g_stopSignal) {
         camera.GetFrame(frame);
@@ -720,34 +725,50 @@ int main() {
                 if (rb_committed && elapsed_total >= rb_cooldown_until &&
                     turn_controller.state == v20::LaneTurnController::State::IDLE &&
                     !corner_assist.active()) {
-                    // Biển commit → bắt đầu đếm giờ, CHƯA áp bias
+                    // Voter commit → vào SIGN_CONFIRM, CHƯA áp bias
                     rb_state = RbState::SIGN_CONFIRM;
-                    rb_sign_confirm_start = elapsed_total;
-                    rb_missing_sign_ticks = 0;
-                    rb_bias_smoothed      = 0.0f;
-                    // Reset T-junction armed state để detector không fire trong SIGN_CONFIRM
+                    rb_sign_confirm_start   = elapsed_total;
+                    rb_sign_confirm_entered = elapsed_total;
+                    rb_missing_sign_ticks   = 0;
+                    rb_bias_smoothed        = 0.0f;
                     turn_controller.waiting_for_tjunction   = false;
                     turn_controller.tjunction_cooldown      = 0.0;
                     turn_controller.tjunction_detect_frames = 0;
+                    std::printf("[RB] → SIGN_CONFIRM (need %.1fs continuous rb_visible)\n",
+                                RB_APPROACH_DELAY_S);
                 }
                 break;
 
             case RbState::SIGN_CONFIRM:
-                // Voter mất commit → huỷ, quay về NONE
+                // [1] Safety: stuck quá lâu → abort (tránh kẹt nếu biển flicker mãi)
+                if ((elapsed_total - rb_sign_confirm_entered) >= RB_SIGN_CONFIRM_TIMEOUT_S) {
+                    std::printf("[RB] SIGN_CONFIRM timeout %.1fs → ABORT\n",
+                                RB_SIGN_CONFIRM_TIMEOUT_S);
+                    rb_state = RbState::NONE;
+                    break;
+                }
+                // [2] Voter mất commit hẳn (grace 3s hết) → không còn roundabout
                 if (!rb_committed) {
                     rb_state = RbState::NONE;
                     break;
                 }
-                // Turn khác đang chạy → tạm dừng đồng hồ (đẩy mốc về hiện tại)
+                // [3] BẮT BUỘC THẤY BIỂN MỖI FRAME. Miss 1 frame → reset timer về 0.
+                if (!rb_visible_now) {
+                    rb_sign_confirm_start = elapsed_total;
+                    break;
+                }
+                // [4] Turn khác đang chạy → tạm dừng đồng hồ (không tính thời gian này)
                 if (turn_controller.state != v20::LaneTurnController::State::IDLE ||
                     corner_assist.active()) {
                     rb_sign_confirm_start = elapsed_total;
                     break;
                 }
-                // Hết delay → chính thức vào APPROACH
+                // [5] Đủ 2s LIÊN TỤC thấy biển → APPROACH
                 if ((elapsed_total - rb_sign_confirm_start) >= RB_APPROACH_DELAY_S) {
                     rb_pass_count++;
                     if (rb_pass_count > 2) rb_pass_count = 2;
+                    std::printf("[RB] SIGN_CONFIRM OK (%.1fs continuous) → APPROACH pass %d/2\n",
+                                RB_APPROACH_DELAY_S, rb_pass_count);
                     rb_state = RbState::APPROACH;
                     rb_missing_sign_ticks = 0;
                 }
@@ -1274,10 +1295,17 @@ int main() {
         static auto lastLog = std::chrono::steady_clock::now();
         auto tNow = std::chrono::steady_clock::now();
         if (tNow - lastLog >= std::chrono::seconds(1)) {
+            // Progress của SIGN_CONFIRM (nếu đang trong state đó)
+            char rb_extra[64] = "";
+            if (rb_state == RbState::SIGN_CONFIRM) {
+                double prog = elapsed_total - rb_sign_confirm_start;
+                std::snprintf(rb_extra, sizeof(rb_extra), " vis=%d %.1f/%.1fs",
+                              rb_visible_now ? 1 : 0, prog, RB_APPROACH_DELAY_S);
+            }
             std::printf(
-                "[t=%ld] sign=%-11s rb=%-11s park=%-11s near=%6.1f hdg=%7.2f tofL=%5.1f tofR=%5.1f "
+                "[t=%ld] sign=%-11s rb=%-11s%s park=%-11s near=%6.1f hdg=%7.2f tofL=%5.1f tofR=%5.1f "
                 "spd=%.1f pid=%.1f srv=%d telem=%d(%s)\n",
-                tickIdx, SignName(voter.GetCommitted()), RbStateName(rb_state),
+                tickIdx, SignName(voter.GetCommitted()), RbStateName(rb_state), rb_extra,
                 ParkingStateStr(park_state), out.near_e, current_heading, tof_left, tof_right,
                 applied_speed, out.angle, final_angle, telem_ready ? telem.CurrentState() : -1,
                 telem_ready ? telemetry::VehicleStateName(telem.CurrentState()) : "OFF");
@@ -1345,12 +1373,11 @@ int main() {
                 }
             }
 
-            // --- SIGN BOUNDING BOXES (vàng) — vẽ ngoài roadOK vì detection độc lập ---
+            // --- SIGN BOUNDING BOXES — vẽ ngoài roadOK vì detection độc lập ---
             for (const auto& s : cachedSigns) {
                 cv::Rect r = s.box & cv::Rect(0, 0, overlay.cols, overlay.rows);
                 if (r.width < 2 || r.height < 2) continue;
 
-                // Màu theo mức độ: xanh lá nếu committed, vàng nếu chỉ detected
                 const bool is_committed =
                     (voter.GetCommitted() >= 0) && (s.class_id == voter.GetCommitted());
                 cv::Scalar color = is_committed ? cv::Scalar(0, 255, 0)   // green: committed
