@@ -780,7 +780,7 @@ int main() {
                     //   rb2 exit → T-junction 2 (RIGHT)
                     // turn_controller will fire it and return to IDLE → PID resumes.
                     turn_controller.waiting_for_tjunction = true;
-                    turn_controller.tjunction_cooldown = 8.0;
+                    turn_controller.tjunction_cooldown = turn_controller.TJUNCTION_COOLDOWN_S;
 
                     rb_cooldown_until = elapsed_total + RB_COOLDOWN_S;
                     voter.Reset();
