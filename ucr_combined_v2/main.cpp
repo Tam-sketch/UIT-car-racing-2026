@@ -113,15 +113,15 @@ static constexpr int SIGN_VOTER_TIMEOUT_DS      = 30;
 static constexpr double SIGN_BLOCK_SECONDS      = 4.0;
 
 // Roundabout timings (from v25.cpp)
-static constexpr float  RB_BIAS_PX_RIGHT           = 25.0f;
-static constexpr float  RB_BIAS_PX_LEFT            = 24.0f;
+static constexpr float  RB_BIAS_PX_RIGHT           = 23.0f;
+static constexpr float  RB_BIAS_PX_LEFT            = 30.0f;
 static constexpr float  RB_BIAS_EMA                = 0.30f;
-static constexpr double RB_MISSING_SIGN_S          = 1.5;
-static constexpr double RB_CIRCLE_TIMEOUT_S        = 8.0;
+static constexpr double RB_MISSING_SIGN_S          = 1.0;
+static constexpr double RB_CIRCLE_TIMEOUT_S        = 5.0;
 static constexpr double RB_EXIT_SEARCH_TIMEOUT_S   = 15.0;
 static constexpr double RB_EXIT_FORCE_EXEC_S       = 5.0;
 static constexpr double RB_COOLDOWN_S              = 2.0;
-static constexpr double RB_APPROACH_DELAY_S        = 1.25;
+static constexpr double RB_APPROACH_DELAY_S        = 1.0;
 static constexpr double RB_SIGN_CONFIRM_TIMEOUT_S  = 15.0;
 static constexpr float  RB_SPEED_MIN_CMS           = 20.0f;
 static constexpr float  RB_SPEED_MAX_CMS           = 30.0f;
