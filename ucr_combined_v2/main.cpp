@@ -182,9 +182,9 @@ struct ParkingCorridor {
     int y_far = 0;
 
     int x_left_bot = 55;
-    int x_left_far = 115;
+    int x_left_far = 100;
     int x_right_bot = 425;
-    int x_right_far = 365;
+    int x_right_far = 380;
 
     int get_left_x(int y) const {
         if (y_bot == y_far) return x_left_bot;
