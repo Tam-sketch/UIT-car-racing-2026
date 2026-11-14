@@ -957,7 +957,8 @@ int main() {
                 int clx_bot = (raw_lx_bot > 5 && raw_lx_bot < w / 2 - 10) ? raw_lx_bot : 50;
                 int crx_bot = (raw_rx_bot > w / 2 + 10 && raw_rx_bot < w - 6) ? raw_rx_bot : (w - 51);
 
-                int center_bot = (clx_bot + crx_bot) / 2;
+                int center_bot = w / 2;
+                //int center_bot = (clx_bot + crx_bot) / 2;
                 int half_w_bot = std::max((crx_bot - clx_bot) / 2 + PARK_CORRIDOR_EXTRA_MARGIN_PX, 185);
                 int half_w_far = static_cast<int>(half_w_bot * PARK_CORRIDOR_FAR_RATIO);
 
